@@ -5,6 +5,7 @@
 - **状态**：Draft / 可进入 PoC
 - **目标**：参考商业隧道代理 Pro 模式，设计“一级代理 + 二级代理”多级转发系统，支持通过 `username` 指定二级节点、TLS 指纹透传、eBPF 监控、etcd 自动服务发现。
 - **v0.2 变更**：补上 v0.1 的链路缺口。L1 用第二次 HTTP `CONNECT` 把目标 `host:port` 交给 L2；L2 定为 gost v3 的 HTTP 正向代理，不再使用 HAProxy / Envoy 的纯 TCP 模式。对比与理由见附录 A。
+- **已确认**：v1 的 L2 就是 gost v3，3proxy 与锁死配置的 Envoy 只作为同接口替换项。出口拒绝范围只有环回和链路本地，不含 RFC1918。L1→L2 使用客户端登录 L1 的那一份共享口令，不轮换。
 
 ---
 
@@ -34,7 +35,7 @@
 
 ### 2.1 功能需求
 
-- 认证：支持 `BasicAuth`/`Proxy-Authorization`。终端用户凭据只在 L1 校验。
+- 认证：支持 `BasicAuth`/`Proxy-Authorization`。全系统一份共享口令，不轮换。客户端用它登录 L1；L1 校验后把同一组用户名和密码写进发往 L2 的 `Proxy-Authorization`。用户名仍是 `user@node_id`，供 L1 选路。v1 接受由此带来的暴露面：任一 L2 都能看到这把钥匙，泄露后它对 L1 和全部 L2 继续有效，也不能按调用方吊销。
 - 路由：从 `username` 解析二级节点 ID（如：`user@node-az01-003`），再从本地路由表得到该节点的 L2 监听地址。
 - 转发：L1 向选中的 L2 发送 HTTP `CONNECT host:port`，L2 返回 `200` 后，双向原样转发隧道字节。
 - 协议：支持 HTTP 请求代理 + HTTPS CONNECT 隧道。本版把 CONNECT 隧道的目标传递定下来；明文 HTTP 仍是独立数据面。
@@ -63,7 +64,7 @@ L1 与 L2 的职责不同，不能拿同一类软件硬套。
    - 这一跳的稳定接口是 HTTP `CONNECT`。L2 进程可以替换，L1 不用改。
 
 2. **二级候选（动态正向代理，而不是固定后端的 L4 负载均衡）**
-   - **gost v3**（本版选用）：HTTP handler 默认就是 `CONNECT` 之后双向转发。
+   - **gost v3**（v1 已确认）：HTTP handler 默认就是 `CONNECT` 之后双向转发。
    - **3proxy**：同一 CONNECT 接口下，C + Linux `splice`，连接密度更高。
    - **Envoy dynamic forward proxy**：能终止 `CONNECT` 并原始 TCP 转发，指标与热重启最好；安全配置与官方 HTTP 示例相反，容易配成重新发起 TLS。
    - **不采用 HAProxy / Nginx stream 的纯 TCP 模式**：它们把连接转到预先配置的后端，L1 的裸 TCP 里没有目标地址，L2 无法知道该连哪台源站。
@@ -72,36 +73,45 @@ L1 与 L2 的职责不同，不能拿同一类软件硬套。
 
 - **一级代理（需二开）**：Go 自研网关（借鉴/嵌入高性能开源网络库能力，例如 `gnet`/`fasthttp`/标准库 netpoll 方案）。
 - **L1→L2 目标传递**：第二次 HTTP `CONNECT`（代理链）。请求目标使用客户端原始 authority（`host:port`），DNS 在 L2 做。
-- **二级代理（开箱即用）**：gost v3，`handler: http` + `listener: tcp`。关闭 sniffing、MITM 与压缩。
-- **跳级认证**：L2 要求独立的 `Proxy-Authorization`。终端用户的 `user@node_id` 密码不下发到 L2。
+- **二级代理（开箱即用）**：gost v3，`handler: http` + `listener: tcp`。关闭 sniffing、MITM 与压缩。这是 v1 的确定选择。
+- **认证**：一份共享口令。L2 的 `auth.username` 写成客户端访问本节点时使用的用户名（含 `@node_id`），`auth.password` 与客户端登录 L1 的密码相同。L1 转发这同一组凭据。L2 只校验它，不从用户名里做选路。
+- **出口拒绝**：L2 在解析之后、拨号之前拒绝环回与链路本地。RFC1918 及其他私网地址本版放行，此范围以后可以再收紧。见附录 A.5。
 - **服务发现**：etcd。注册地址是该实例的 HTTP `CONNECT` 监听地址。
 - **监控**：eBPF + Prometheus + Grafana。
-- **同接口替换项**（不改变 L1）：要更高连接密度用 3proxy；要 Envoy 级指标或 L1↔L2 的 HTTP/2 多路复用时，用锁死配置的 Envoy DFP。红线见附录 A.5，替换条件见附录 A.6。
+- **同接口替换项**（不改变 L1 的 CONNECT）：要更高连接密度用 3proxy；要 Envoy 级指标或 L1↔L2 的 HTTP/2 多路复用时，用锁死配置的 Envoy DFP。二者都不是 v1 的 L2。红线见附录 A.5，替换条件见附录 A.6。
 
-gost 的安全配置形态：
+gost 的配置形态：
 
 ```yaml
 services:
   - name: l2
     addr: ":8080"
+    bypass: egress-deny
     handler:
       type: http
       auth:
-        username: l1hop
-        password: <hop-secret>
+        username: appuser@node-az01-003
+        password: <shared-secret>
       metadata:
         sniffing: false
     listener:
       type: tcp
+bypasses:
+  - name: egress-deny
+    matchers:
+      - 127.0.0.0/8
+      - 169.254.0.0/16
+      - ::1/128
+      - fe80::/10
 ```
 
-`listener` 保持 `tcp`。`http+tls` / `https` 监听会终结的是 L1↔L2 这一跳的外层 TLS，不是客户端到源站的 TLS；外层加密不在本文件决定。`mitm.certFile` / `mitm.keyFile` 不应出现。
+`listener` 保持 `tcp`。`http+tls` / `https` 监听会终结的是 L1↔L2 这一跳的外层 TLS，不是客户端到源站的 TLS；外层加密不在本文件决定。`mitm.certFile` / `mitm.keyFile` 不应出现。上面的 `bypass` 是黑名单，只比请求里的主机字符串；域名解析进这些网段时不会命中。拨号前还要对解析结果做一次同样的网段判断，见附录 A.5。
 
 ### 3.3 选择理由
 
 - 一级要实现“用户名 -> 二级节点 ID -> 强定向转发”，逻辑定制性高，自研（基于 Go）效率最高。选路在拨号之前完成，L2 不解析 `node_id`。
 - v0.1 把 L2 做成纯 TCP 透传时，链路上没有任何字段携带源站 `host:port`，二级无法拨号。HAProxy 也没有“按 CONNECT 目标动态拨号”的正向代理模式。
-- 第二次 `CONNECT` 用一次往返把目标、端口和跳级认证放进同一条标准请求；L2 连上源站后再回 `200`。SOCKS5 能表达同样的目标，但握手往返更多，而且 Envoy 不能作为现成的 SOCKS 服务端接入。PROXY protocol 传递的是本跳的源/目的地址，不是正向代理的拨号目标。
+- 第二次 `CONNECT` 用一次往返把目标、端口和同一份共享口令放进同一条标准请求；L2 连上源站后再回 `200`。SOCKS5 能表达同样的目标，但握手往返更多，而且 Envoy 不能作为现成的 SOCKS 服务端接入。PROXY protocol 传递的是本跳的源/目的地址，不是正向代理的拨号目标。
 - TLS 指纹要保持，靠的是 `200` 之后原样转发客户端已经写出的 TLS 记录，而不是“随便找一个 L4 代理”。gost 的默认数据面就是这条隧道；Envoy 必须额外写对 `connect_config`，并且不能配置上游 TLS。
 - 单节点万级连接落在 gost 可运行的范围内。默认临时端口约 2.8 万（`32768–60999`），一条 L1 源地址到一个 L2 地址的 HTTP/1.1 隧道数量与此同一量级，覆盖本版“万级”目标。
 
@@ -138,10 +148,10 @@ flowchart LR
 
 ### 4.2 关键模块
 
-- **AuthParser**：解析客户端 `Proxy-Authorization`、提取 username，并在进入转发前完成认证。
+- **AuthParser**：解析客户端 `Proxy-Authorization`，用全系统共享口令完成认证，并保留用户名与密码供转发。
 - **RouteResolver**：解析 `username` 中 node_id 并在本地路由表匹配。
 - **EtcdWatcher**：维护 `node_id -> upstream_addr[]` 的本地缓存。`upstream_addr` 是 gost 的 HTTP 监听地址。
-- **TunnelForwarder**：向选定 L2 写 `CONNECT host:port`（附带跳级 Basic 认证），确认 `200` 后与客户端双向原样转发。不在这条路径上 `tls.Dial`，也不把客户端的 `Proxy-Authorization` 转给 L2。
+- **TunnelForwarder**：向选定 L2 写 `CONNECT host:port`，`Proxy-Authorization` 使用客户端刚刚提交的同一组用户名和密码。确认 `200` 后与客户端双向原样转发。不在这条路径上 `tls.Dial`。
 - **Metrics/Trace**：暴露 Prometheus 指标，关联 eBPF 内核维度数据。
 
 ---
@@ -158,12 +168,13 @@ sequenceDiagram
     participant L2 as L2 gost
     participant T as Target
 
-    U->>L1: CONNECT target:443 + Proxy-Authorization
-    L1->>L1: 认证并解析 username -> node_id
+    U->>L1: CONNECT target:443 + Proxy-Authorization（共享口令）
+    L1->>L1: 校验共享口令并解析 username -> node_id
     L1->>E: (本地缓存失效时) 查询 node_id 可用地址
     E-->>L1: 返回 L2 的 HTTP 监听地址
-    L1->>L2: CONNECT target:443 + 跳级 Proxy-Authorization
-    L2->>T: 在 L2 解析域名并完成 TCP 握手
+    L1->>L2: CONNECT target:443 + 同一份 Proxy-Authorization
+    L2->>L2: 校验同一口令；解析目标；拒绝环回与链路本地
+    L2->>T: TCP 握手
     L2-->>L1: 200 Connection Established
     L1-->>U: 200 Connection Established
     U->>L1: TLS ClientHello（客户端原始字节）
@@ -294,7 +305,7 @@ flowchart TD
 
 ## 10. Go 使用示例（一级代理核心逻辑）
 
-下面是 L1 在终端用户认证通过之后的 CONNECT 数据面。它向 L2 发第二次 `CONNECT`，确认 `200` 后才应答客户端，并以字节方式拼接两侧连接。示例不包含 etcd 与终端用户认证实现。涉及 `bufio`、`fmt`、`net`、`net/http`、`encoding/base64`、`io`、`strconv`、`strings`、`time`。
+下面是 L1 在共享口令校验通过之后的 CONNECT 数据面。它向 L2 发第二次 `CONNECT`，`Proxy-Authorization` 使用客户端提交的同一组用户名和密码，确认 `200` 后才应答客户端，并以字节方式拼接两侧连接。出口网段拒绝在 L2 解析之后做，不在本函数里。示例不包含 etcd。涉及 `bufio`、`fmt`、`net`、`net/http`、`encoding/base64`、`io`、`strconv`、`strings`、`time`。
 
 ```go
 type Resolver interface {
@@ -311,8 +322,8 @@ func parseNodeID(username string) (user string, nodeID string, err error) {
 }
 
 // target 为客户端 CONNECT 的 authority，形如 host:port；IPv6 字面量保留方括号。
-// hopUser/hopPass 是 L1 访问 L2 的凭据，与终端用户密码不是同一份。
-func handleConnect(clientConn net.Conn, username, target, hopUser, hopPass string, resolver Resolver) error {
+// password 与客户端登录 L1 的密码是同一份共享口令，不轮换。
+func handleConnect(clientConn net.Conn, username, password, target string, resolver Resolver) error {
     defer clientConn.Close()
 
     host, port, err := net.SplitHostPort(target)
@@ -321,6 +332,9 @@ func handleConnect(clientConn net.Conn, username, target, hopUser, hopPass strin
     }
     if _, err := strconv.Atoi(port); err != nil {
         return fmt.Errorf("invalid connect target")
+    }
+    if password == "" || strings.ContainsAny(username, "\r\n") || strings.ContainsAny(password, "\r\n") {
+        return fmt.Errorf("invalid credential")
     }
     _, nodeID, err := parseNodeID(username)
     if err != nil {
@@ -337,7 +351,7 @@ func handleConnect(clientConn net.Conn, username, target, hopUser, hopPass strin
     }
     defer upstreamConn.Close()
 
-    token := base64.StdEncoding.EncodeToString([]byte(hopUser + ":" + hopPass))
+    token := base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
     req := "CONNECT " + target + " HTTP/1.1\r\n" +
         "Host: " + target + "\r\n" +
         "Proxy-Authorization: Basic " + token + "\r\n\r\n"
@@ -422,8 +436,10 @@ func readConnectStatus(r *bufio.Reader) (int, error) {
    - 对策：ulimit、`net.ipv4.ip_local_port_range`、按出口拆分 L2。单源地址到单 L2 的 HTTP/1.1 并发大约受临时端口数量限制；超出后再评估 Envoy 的 HTTP/2 `CONNECT` 多路复用。
 3. **风险：TLS 指纹透传被链路设备或错误的 L2 配置破坏**
    - 对策：分层抓包比对；发布配置时拒绝 MITM、上游 TLS 与 sniffing。变更流程加回归用例。
-4. **风险：L2 作为正向代理访问元数据地址或内网（confused deputy）**
-   - 对策：L2 默认拒绝环回、链路本地和云元数据地址。更宽的内网网段策略见附录 A.7。
+4. **风险：L2 作为正向代理访问本机或云元数据地址**
+   - 对策：L2 在拨号前拒绝 `127.0.0.0/8`、`::1`、`169.254.0.0/16`（含 `169.254.169.254`）和 `fe80::/10`。RFC1918 等私网本版放行，以后可以再收紧。比对的是解析后的地址，见附录 A.5。
+5. **风险：共享口令从任一 L2 泄露后，可以用来登录 L1 和全部 L2**
+   - 已接受：v1 就用这一份口令，不轮换，也不另设跳级口令。更换口令会同时更换客户端、L1 和全部 L2。
 
 ---
 
@@ -475,53 +491,55 @@ L1↔L2 若以后另加外层加密，加密的是这一跳的隧道，源站仍
 
 | 方案 | 能否表达源站 host:port | 正确性 | 性能 | 运维与排障 | username 选路 | ClientHello |
 | --- | --- | --- | --- | --- | --- | --- |
-| 第二次 HTTP `CONNECT` | 能。请求目标就是 authority，`Host` 与之一致 | L2 在出口侧 DNS，TCP 成功后回 `200`；失败有状态码。L1 在此之后才应答客户端 | L1↔L2 一次往返，Basic 认证在同一组头部里。之后是字节转发 | `curl -x`、访问日志里的目标主机、标准 502/504 | 选路在 L1 拨号前完成。跳级凭据用另一份 `Proxy-Authorization`，L2 不必理解 `user@node_id` | `200` 之后不解析。是否保持指纹取决于 L2 是否原样转发 |
+| 第二次 HTTP `CONNECT` | 能。请求目标就是 authority，`Host` 与之一致 | L2 在出口侧 DNS，TCP 成功后回 `200`；失败有状态码。L1 在此之后才应答客户端 | L1↔L2 一次往返，Basic 认证在同一组头部里。之后是字节转发 | `curl -x`、访问日志里的目标主机、标准 502/504 | 选路在 L1 拨号前完成。发往 L2 的是客户端刚刚提交的同一组用户名和密码；L2 只校验这份口令，不解析 `node_id` | `200` 之后不解析。是否保持指纹取决于 L2 是否原样转发 |
 | SOCKS5 `CONNECT`（ATYP=0x03） | 能。域名最长 255 字节，另带端口，由 L2 解析 | 与 `CONNECT` 一样是远程解析的 TCP 隧道 | 无认证 2 次往返；RFC 1929 用户名密码再加 1 次。跨地域出口上这是可见的额外时延 | 要用 SOCKS 客户端才能复现这一跳 | 选路仍在 L1。跳级认证能做，但塞不进“先选节点”这个动作 | 成功应答后同样是字节转发 |
 | PROXY protocol v1 | 不能 | 文本头只有双方 IP 和端口。目的地址是本跳接入地址，没有域名，也没有“请拨到该主机”的语义 | 不适用 | 头一旦被写进源站连接，TLS 直接失败 | 无认证，不参与选路 | 只有定制接收方先剥头再拨号才有可能保持 |
 | PROXY protocol v2，含 TLV | 不能按规范表达拨号目标 | `PP2_TYPE_AUTHORITY`（0x02）是客户端在**这条连接**上给出的主机名（定义上常为 SNI），不含端口。L1 上的客户端连接是 HTTP，不是 TLS，此时还没有 SNI。自定义 TLV（0xE0–0xEF）可以私自塞 `host:port`，但接收方必须自己实现拨号 | 头部本身很短 | HAProxy `accept-proxy` 与 Envoy 的 proxy protocol listener filter 只恢复源地址、做 ACL/日志，不会向任意 authority 新开连接 | 无标准认证 | 剥头不完整时，头字节会成为源站看到的“ClientHello” |
 
-选用第二次 HTTP `CONNECT`。它和客户端已经在用的语义相同，一次往返同时完成目标、端口和跳级认证，gost、3proxy、Envoy、Squid 都能接。SOCKS5 是正确的备选，但往返更多，而且把 Envoy 排除在现成实现之外。PROXY protocol 解决的是反向代理丢失客户端源地址，不是正向代理的目的地址。
+选用第二次 HTTP `CONNECT`。它和客户端已经在用的语义相同，一次往返同时完成目标、端口和口令校验，gost、3proxy、Envoy、Squid 都能接。SOCKS5 是正确的备选，但往返更多，而且把 Envoy 排除在现成实现之外。PROXY protocol 解决的是反向代理丢失客户端源地址，不是正向代理的目的地址。
 
 ### A.3 L2 组件
 
-共同前提：L1 已经选定实例。L2 只负责认证这一跳、按 `CONNECT` 拨号、原样转发。用户名里的 node_id 不进入 L2。
+共同前提：L1 已经选定实例。L2 校验同一份共享口令、按 `CONNECT` 拨号、原样转发。用户名里的 `node_id` 会随这份凭据到达 L2，L2 不用它选路。
 
-| 组件 | 动态拨号 | 性能与连接规模 | 运维 | 跳级认证 | TLS 字节 |
+| 组件 | 动态拨号 | 性能与连接规模 | 运维 | 共享口令 | TLS 字节 |
 | --- | --- | --- | --- | --- | --- |
-| **gost v3 HTTP**（选用） | 原生 `CONNECT`，出口侧 DNS | Go 运行时。万级连接在放宽 fd 之后可达到；每连接内存和 GC 高于 C。M1 为 HTTP/1.1，每条隧道一条 L1↔L2 TCP | 单二进制、短 YAML、自带 Basic 认证。有 metrics/observer。功能面很宽，配置要钉死 | 原生 username/password | 默认就是隧道拷贝。MITM 与 sniffing 是显式开关，本版关闭 |
+| **gost v3 HTTP**（v1 已确认） | 原生 `CONNECT`，出口侧 DNS | Go 运行时。万级连接在放宽 fd 之后可达到；每连接内存和 GC 高于 C。M1 为 HTTP/1.1，每条隧道一条 L1↔L2 TCP | 单二进制、短 YAML、自带 Basic 认证。有 metrics/observer。功能面很宽，配置要钉死 | 原生 username/password，配成客户端的同一组 | 默认就是隧道拷贝。MITM 与 sniffing 是显式开关，本版关闭 |
 | **3proxy** `proxy` | 原生 `CONNECT`，`mapsocket` 双向转发 | C，Linux 上可用 `splice`。相同机器上连接密度和 CPU 通常更好，适合作为性能替换项 | 配置方言老、无内建 Prometheus，要靠日志或节点级 eBPF。行为稳定 | `auth strong` + `users` / `allow` | 默认不碰 TLS。`ssl_mitm` 与 `ssl_cli` 必须保持关闭 |
-| **Envoy DFP** | 可以。路由匹配 `connect_matcher`，`upgrade_configs` 使用 `CONNECT` 且带 `connect_config: {}`，集群类型为 dynamic forward proxy，DNS 缓存两边一致 | 上限最高，热重启和统计最全。二进制和配置都更重 | 官方 DFP 页面的示例带上游 TLS，那是 Envoy 自己去握手。过滤器链也容易改写隧道 body。跳级 Basic 认证需要额外 filter 或 ext_authz | 能做，配置比 gost/3proxy 长 | 只有 A.5 的锁死配置才是字节转发。2020 年 #11197 起，终止 `CONNECT` 时在上游 TCP 建立后就回 `200`，不等源站先发数据，因此不会和“客户端等 200 再发 ClientHello”死锁。升级概述里“等上游第一个字节再合成 200”描述的是更早的行为 |
+| **Envoy DFP** | 可以。路由匹配 `connect_matcher`，`upgrade_configs` 使用 `CONNECT` 且带 `connect_config: {}`，集群类型为 dynamic forward proxy，DNS 缓存两边一致 | 上限最高，热重启和统计最全。二进制和配置都更重 | 官方 DFP 页面的示例带上游 TLS，那是 Envoy 自己去握手。过滤器链也容易改写隧道 body。校验同一份 Basic 口令需要额外 filter 或 ext_authz | 能做，配置比 gost/3proxy 长 | 只有 A.5 的锁死配置才是字节转发。2020 年 #11197 起，终止 `CONNECT` 时在上游 TCP 建立后就回 `200`，不等源站先发数据，因此不会和“客户端等 200 再发 ClientHello”死锁。升级概述里“等上游第一个字节再合成 200”描述的是更早的行为 |
 | **Squid** | 原生 `CONNECT`，默认把隧道当 TCP 铲数据 | 进程模型更重，不是本版的性能选项目标 | 文档成熟，配置体积大 | ACL 成熟 | 端口未开 `ssl-bump`，或动作为 `splice` 时字节保持。`bump` 会解密并重新握手 |
 | **sing-box** `http` 入站 + `direct` 出站 | 能接 `CONNECT` 并直连 | Go，与 gost 同一量级 | 发布节奏快，但产品方向包含主动改指纹的传输 | `users` 列表 | 纯 `direct` 且关闭 sniff 时应当原样转发。uTLS / reality 一类出站会故意换 ClientHello，和本目标相反。社区也报告过 sniff 打开时直连 TLS 失败的案例 |
 | **HAProxy TCP、Nginx stream** | 不能按请求动态拨号 | L4 性能很好，用错了地方 | 适合做 L1 前面的负载均衡，不适合做 L2 | 不承载这层选路 | 到固定后端时字节可以不变，但后端不是客户端指定的源站 |
 | **microsocks / Dante** | 仅 SOCKS | 很小或足够 | 只在选择 SOCKS5 时有意义 | SOCKS 认证 | 默认是字节转发 |
 
-gost 的取舍：正确的隧道是默认路径，HTTP `CONNECT` 又是 L1 的稳定接口，所以 3proxy 和 Envoy 都可以以后换上来。3proxy 更省资源，但指标与配置体验弱于本文件已经假设的代理运维方式。Envoy 的上限和可观测性更好，却要靠一份与官方 TLS 示例相反的配置才能保住指纹，不适合作为第一台出口节点的默认值。
+gost 的取舍：正确的隧道是默认路径，HTTP `CONNECT` 又是 L1 的稳定接口。v1 已确定用 gost。3proxy 和锁死配置的 Envoy 留作以后替换：3proxy 更省资源，Envoy 的上限和可观测性更好，但要靠一份与官方 TLS 示例相反的配置才能保住指纹。
 
 ### A.4 与 username 路由的配合
 
-1. 客户端对 L1：`CONNECT example.com:443`，`Proxy-Authorization` 的用户名是 `appuser@node-az01-003`。
-2. L1 认证终端用户，取出 `node-az01-003`，从 etcd 缓存得到 `l2-az01-003.internal:8080`。
-3. L1 对这个地址发 `CONNECT example.com:443`，`Proxy-Authorization` 使用跳级账号，不转发终端用户的密码。
-4. L2 校验跳级账号，解析 `example.com`，TCP 连接成功后回 `200`。
+1. 客户端对 L1：`CONNECT example.com:443`，`Proxy-Authorization` 的用户名是 `appuser@node-az01-003`，密码是全系统那一份共享口令。
+2. L1 校验这份口令，取出 `node-az01-003`，从 etcd 缓存得到 `l2-az01-003.internal:8080`。
+3. L1 对这个地址发 `CONNECT example.com:443`，`Proxy-Authorization` 仍是 `appuser@node-az01-003` 和同一份密码。
+4. L2 校验同一组用户名和密码，解析 `example.com`。解析结果落在环回或链路本地时拒绝拨号；否则 TCP 连接成功后回 `200`。
 5. L1 向客户端回 `200`，双向拷贝。客户端的 SNI 在 ClientHello 内部，L1 不读、不改。`CONNECT` 里的主机名按客户端原样交给 L2，L1 不先解析成 IP。
+
+v1 接受这个认证取舍：L2 持有客户端登录 L1 的口令，全系统只有这一份，而且不轮换。任一出口泄露后，这把钥匙对 L1 和其他 L2 仍然有效，也不能按调用方单独吊销。更换时要同时改客户端、L1 和全部 L2。
 
 出口侧 DNS 让源站看到的地址属于出口地域。L1 若先解析再把 IP 写进第二次 `CONNECT`，虚拟主机仍可能靠 SNI 工作，但会丢掉出口侧 DNS，也会让 L1 变成 DNS 出口。
 
 ### A.5 配置红线
 
-gost（本版）：
+gost（v1）：
 
 - `listener.type` 为 `tcp`，`handler.type` 为 `http`。
-- 配置跳级 `auth`。不把监听暴露成无认证的开放代理。
+- `auth.username` 等于客户端访问该节点的用户名，`auth.password` 等于那份共享口令。监听保持认证开启。
 - `sniffing` 为 false；不设置 `mitm.certFile`、`mitm.keyFile`、`compression`。
 
-3proxy（替换项）：
+3proxy（替换项，口令与上面相同）：
 
 ```
 auth strong
-users l1hop:CL:<hop-secret>
-allow l1hop
+users appuser@node-az01-003:CL:<shared-secret>
+allow appuser@node-az01-003
 proxy -p8080
 ```
 
@@ -533,18 +551,19 @@ Envoy DFP（替换项）必须同时满足：
 - `upgrade_configs` 为 `upgrade_type: CONNECT` 且存在 `connect_config: {}`，用于在本地终止 `CONNECT`，把载荷当原始 TCP 送出。
 - 集群为 `envoy.clusters.dynamic_forward_proxy`，与 HTTP 过滤器共用同一份 DNS cache；不配置 `transport_socket`。
 - 升级过滤器链里只有路由器，不放 compressor / buffer。
-- 用跳级认证或网络策略限制调用方。并按 Envoy 文档处理 confused deputy：从这台机器能路由到的地址，调用方就可能尝试去连。
+- 用与客户端相同的 Basic 口令限制调用方。从这台机器能路由到的地址，调用方就可能尝试去连，因此下面的出口拒绝同样适用。
 
-任意一种 L2 都拒绝环回、链路本地和云元数据地址。客户端 `CONNECT` 缺少端口时直接拒绝，L1 不替它补端口。
+出口拒绝（当前决定，以后可以再收紧）：
+
+- 拒绝：`127.0.0.0/8`、`::1`、`169.254.0.0/16`（含云元数据 `169.254.169.254`）、`fe80::/10`。
+- 放行：RFC1918（`10.0.0.0/8`、`172.16.0.0/12`、`192.168.0.0/16`）以及其他私网地址。
+- 判断发生在 L2 解析之后、TCP 拨号之前，对象是即将连接的 IP。IPv4-mapped IPv6（`::ffff:a.b.c.d`）先还原成 IPv4 再比。
+- gost 服务级 `bypass` 黑名单能拒绝请求行里直接写出的这些 IP。它的 CIDR 规则不解析域名：`example.com` 解析到 `169.254.169.254` 时不会命中。v1 还要在解析结果上做同一次判断（例如 `gost-geo-plugin` 黑名单，或 L2 侧等价检查）。只贴上面的 `bypass` 名单不够。
+
+客户端 `CONNECT` 缺少端口时直接拒绝，L1 不替它补端口。
 
 ### A.6 什么时候换掉 gost
 
 - 单机内存或 GC 先于带宽打满：换成 3proxy，L1 仍发 HTTP `CONNECT`。
 - 单条 L1 源地址到单个 L2 的并发超过临时端口，或需要 Envoy 的热重启与内建指标：换成 A.5 的 Envoy 配置。HTTP/2 `CONNECT` 可以在一条连接上复用多条隧道，从而避开源端口上限。
-- 两种替换都要先重跑 A.1 的 ClientHello 字节比对，再灰度。
-
-### A.7 待所有者确认
-
-1. 是否接受 gost v3 作为第一版 L2。若更看重单机连接密度，可以从第一天使用 3proxy；若团队已经标准化 Envoy，并愿意维护 A.5 的锁死配置，也可以直接用 Envoy。L1 的协议不用跟着变。
-2. L2 目的地址拒绝范围。环回、链路本地和云元数据地址建议始终拒绝。RFC1918 等内网网段是拒绝还是按出口放行，需要按实际目标确认。
-3. 跳级凭据按 L2 节点分开，还是整簇共用，以及轮换方式。这只决定 `Proxy-Authorization` 里的账号从哪里来，不改变握手本身。
+- 两种替换都要先重跑 A.1 的 ClientHello 字节比对，再灰度。替换不改变共享口令，也不放宽 A.5 的出口拒绝范围。
