@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -51,11 +52,13 @@ type fileConfig struct {
 	ResourceFaultAction      string   `json:"resource_fault_action"`
 	DrainAttemptMS           int      `json:"drain_attempt_ms"`
 	DrainBudgetMS            int      `json:"drain_budget_ms"`
-	RedialJitterMS           int      `json:"redial_jitter_ms"`
+	// RedialJitterMS 用指针区分「没写」和「写成 0」。0 只有 -allow-zero-jitter 才接受。
+	RedialJitterMS *int `json:"redial_jitter_ms"`
 }
 
 func main() {
 	cfgPath := flag.String("config", "", "JSON 配置文件")
+	allowZeroJitter := flag.Bool("allow-zero-jitter", false, "测试或演示才允许 redial_jitter_ms 为 0。生产不要加这个开关")
 	flag.Parse()
 	if *cfgPath == "" {
 		log.Fatal("需要 -config")
@@ -74,6 +77,47 @@ func main() {
 	if err := loopback(fc.API); err != nil {
 		log.Fatal(err)
 	}
+	cfg, err := applyFile(fc, *allowZeroJitter)
+	if err != nil {
+		log.Fatal(err)
+	}
+	cfg.LocalIP = func() string { return readIP(fc.IPSource) }
+	cfg.Logger = registrar.JSONLogger{Out: os.Stdout}
+	cfg.OnAlert = func(a registrar.Alert) {
+		cfg.Logger.Event("alert", "kind", a.Kind, "key", a.Key, "other_lease", a.OtherLease, "msg", a.Message)
+	}
+	if len(cfg.Endpoints) < 3 {
+		cfg.Logger.Event("endpoints_warning", "n", len(cfg.Endpoints), "msg", "生产环境必须配置全部 etcd 成员")
+	}
+
+	reg, err := registrar.New(cfg)
+	if err != nil {
+		log.Fatal(err)
+	}
+	// 不在启动时调用 Ready。旧状态文件如果没有 machine_id 或 instance_id，进程会停在 drained，
+	// 直到 admin POST /v1/ready。这里没有出口地址，不能替它注册。
+	if err := reg.Start(context.Background()); err != nil {
+		log.Fatal(err)
+	}
+	srv := &http.Server{Addr: fc.API, Handler: newHandler(reg)}
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatal(err)
+		}
+	}()
+
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	<-sig
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_ = srv.Shutdown(ctx)
+	if err := reg.Stop(context.Background()); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func applyFile(fc fileConfig, allowZeroJitter bool) (registrar.Config, error) {
 	cfg := registrar.DefaultConfig()
 	cfg.Endpoints = fc.Endpoints
 	cfg.NodeID = fc.NodeID
@@ -93,11 +137,6 @@ func main() {
 	if fc.AssumedRedialFailureRate > 0 {
 		cfg.AssumedRedialFailureRate = fc.AssumedRedialFailureRate
 	}
-	cfg.LocalIP = func() string { return readIP(fc.IPSource) }
-	cfg.Logger = registrar.JSONLogger{Out: os.Stdout}
-	cfg.OnAlert = func(a registrar.Alert) {
-		cfg.Logger.Event("alert", "kind", a.Kind, "key", a.Key, "other_lease", a.OtherLease, "msg", a.Message)
-	}
 	if fc.TTLSeconds > 0 {
 		cfg.TTL = time.Duration(fc.TTLSeconds) * time.Second
 	}
@@ -110,38 +149,69 @@ func main() {
 	setMS(&cfg.InspectionInterval, fc.InspectionIntervalMS)
 	setMS(&cfg.DrainAttempt, fc.DrainAttemptMS)
 	setMS(&cfg.DrainBudget, fc.DrainBudgetMS)
-	setMS(&cfg.RedialJitter, fc.RedialJitterMS)
+	if err := applyJitter(&cfg, fc.RedialJitterMS, allowZeroJitter); err != nil {
+		return cfg, err
+	}
 	if fc.FailThreshold > 0 {
 		cfg.ProbeFailThreshold = fc.FailThreshold
 	}
 	if fc.RiseThreshold > 0 {
 		cfg.ProbeRiseThreshold = fc.RiseThreshold
 	}
-	if len(cfg.Endpoints) < 3 {
-		cfg.Logger.Event("endpoints_warning", "n", len(cfg.Endpoints), "msg", "生产环境必须配置全部 etcd 成员")
-	}
+	return cfg, nil
+}
 
-	reg, err := registrar.New(cfg)
-	if err != nil {
-		log.Fatal(err)
+// applyJitter 拒绝生产配置把抖动写成 0。没写这个字段时保持默认 60s。
+func applyJitter(cfg *registrar.Config, ms *int, allowZero bool) error {
+	if ms == nil {
+		return nil
 	}
-	// 不在启动时调用 Ready。旧状态文件如果没有 machine_id 或 instance_id，进程会停在 drained，
-	// 直到 admin POST /v1/ready。这里没有出口地址，不能替它注册。
-	if err := reg.Start(context.Background()); err != nil {
-		log.Fatal(err)
+	if *ms < 0 {
+		return fmt.Errorf("redial_jitter_ms 不能为负")
 	}
+	if *ms == 0 {
+		if !allowZero {
+			return fmt.Errorf("redial_jitter_ms 为 0 只允许在测试或演示时加上 -allow-zero-jitter")
+		}
+		cfg.RedialJitter = 0
+		return nil
+	}
+	cfg.RedialJitter = time.Duration(*ms) * time.Millisecond
+	return nil
+}
+
+// newHandler 的 /v1/drain 一接受就返回 202，抖动和 Drain 用独立的 context。
+// 客户端超时短于 60s 时断开连接，不能把等待取消掉，否则 key 会留在 etcd。
+func newHandler(reg *registrar.Registrar) http.Handler {
+	var mu sync.Mutex
+	running := false
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/drain", func(w http.ResponseWriter, rq *http.Request) {
 		if rq.Method != http.MethodPost {
 			http.Error(w, "POST", http.StatusMethodNotAllowed)
 			return
 		}
-		if err := reg.JitterBeforeDrain(rq.Context()); err != nil {
-			writeResult(w, err)
+		mu.Lock()
+		if running {
+			mu.Unlock()
+			writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "accepted": true, "in_progress": true})
 			return
 		}
-		err := reg.Drain(rq.Context())
-		writeResult(w, err)
+		running = true
+		mu.Unlock()
+		go func() {
+			defer func() {
+				mu.Lock()
+				running = false
+				mu.Unlock()
+			}()
+			ctx := context.Background()
+			if err := reg.JitterBeforeDrain(ctx); err != nil {
+				return
+			}
+			_ = reg.Drain(ctx)
+		}()
+		writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "accepted": true})
 	})
 	mux.HandleFunc("/v1/ready", func(w http.ResponseWriter, rq *http.Request) {
 		if rq.Method != http.MethodPost {
@@ -186,22 +256,7 @@ func main() {
 	mux.HandleFunc("/v1/status", func(w http.ResponseWriter, rq *http.Request) {
 		writeJSON(w, http.StatusOK, reg.Status())
 	})
-	srv := &http.Server{Addr: fc.API, Handler: mux}
-	go func() {
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatal(err)
-		}
-	}()
-
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	<-sig
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	_ = srv.Shutdown(ctx)
-	if err := reg.Stop(context.Background()); err != nil {
-		log.Fatal(err)
-	}
+	return mux
 }
 
 func writeResult(w http.ResponseWriter, err error) {

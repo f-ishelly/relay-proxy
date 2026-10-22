@@ -129,7 +129,7 @@ func main() {
 		}
 	}()
 
-	var registered, readyErr, drainOK, drainErr atomic.Int64
+	var registered, readyErr, drainOK, drainFail, redialReadyFail atomic.Int64
 	redialStart := make(chan struct{})
 	var drainSem chan struct{}
 	if *redialInflight > 0 {
@@ -231,7 +231,7 @@ func main() {
 			dcancel()
 			if err != nil {
 				giveSem(drainSem)
-				drainErr.Add(1)
+				drainFail.Add(1)
 				return
 			}
 			cur.Store(ip2)
@@ -240,7 +240,7 @@ func main() {
 			rcancel()
 			if err != nil {
 				giveSem(drainSem)
-				drainErr.Add(1)
+				redialReadyFail.Add(1)
 				return
 			}
 			giveSem(drainSem)
@@ -260,15 +260,16 @@ func main() {
 			close(redialStart)
 		}
 		redialDeadline := time.Now().Add(*registerTimeout)
-		for time.Now().Before(redialDeadline) && drainOK.Load()+drainErr.Load() < up {
+		for time.Now().Before(redialDeadline) && drainOK.Load()+drainFail.Load()+redialReadyFail.Load() < up {
 			time.Sleep(200 * time.Millisecond)
 		}
 	}
-	fmt.Fprintf(out, "{\"event\":\"redial\",\"label\":%q,\"drain_ok\":%d,\"drain_err\":%d,\"elapsed_ms\":%d}\n",
-		*label, drainOK.Load(), drainErr.Load(), time.Since(start).Milliseconds())
+	drainErr := drainFail.Load() + redialReadyFail.Load()
+	fmt.Fprintf(out, "{\"event\":\"redial\",\"label\":%q,\"drain_ok\":%d,\"drain_fail\":%d,\"redial_ready_fail\":%d,\"drain_err\":%d,\"elapsed_ms\":%d}\n",
+		*label, drainOK.Load(), drainFail.Load(), redialReadyFail.Load(), drainErr, time.Since(start).Milliseconds())
 
 	killed := ""
-	if *killAfter > 0 && cluster != nil && up == int64(*hosts) && drainErr.Load() == 0 {
+	if *killAfter > 0 && cluster != nil && up == int64(*hosts) && drainErr == 0 {
 		time.Sleep(*killAfter)
 		ep, err := cluster.KillLeader()
 		if err != nil {
@@ -330,7 +331,9 @@ func main() {
 		"keepalive_err_sample": counts.sample(),
 		"lease_lost":           counts.leaseLost.Load(),
 		"drain_ok":             drainOK.Load(),
-		"drain_err":            drainErr.Load(),
+		"drain_fail":           drainFail.Load(),
+		"redial_ready_fail":    redialReadyFail.Load(),
+		"drain_err":            drainFail.Load() + redialReadyFail.Load(),
 		"watch_put":            watchPut.Load(),
 		"watch_del":            watchDel.Load(),
 		"leader_killed":        killed != "",
@@ -343,7 +346,7 @@ func main() {
 	// 每台主机恰好一次计划内删除。多出来的 DELETE 是 lease 过期。
 	// keepalive_err 是 registrar 单次 KeepAliveOnce 失败，切主时可能出现，随后会重试。
 	// 通过条件是租约没有丢、也没有计划外的 DELETE。
-	if up != int64(*hosts) || readyErr.Load() != 0 || drainOK.Load() != up || drainErr.Load() != 0 || counts.leaseLost.Load() != 0 || watchDel.Load() != drainOK.Load() {
+	if up != int64(*hosts) || readyErr.Load() != 0 || drainOK.Load() != up || drainFail.Load()+redialReadyFail.Load() != 0 || counts.leaseLost.Load() != 0 || watchDel.Load() != drainOK.Load() {
 		if lg != nil {
 			lg.Close()
 		}

@@ -67,11 +67,15 @@ type Registrar struct {
 
 	holdSince  atomic.Int64
 	holdActive atomic.Bool
+	// holdGen 每次 beginDrainedHold 加一。过期通知带着当时的代；代变了就不能再发 epoch_hold_expired。
+	holdGen atomic.Uint64
+	// lastRTT 是最近一次续租成功的往返时间，用来把 Drain 单次尝试拉到盖住这条延迟。
+	lastRTT atomic.Int64
 
 	pendingMu    sync.Mutex
 	pendingMain  *leaseFail
 	pendingEpoch *leaseFail
-	pendingHold  int64
+	pendingHold  holdFail
 	lossWake     chan struct{}
 
 	lease           clientv3.LeaseID
@@ -219,10 +223,7 @@ func (r *Registrar) Drain(ctx context.Context) error {
 	const backoffCap = 500 * time.Millisecond
 	var err error
 	for {
-		attempt := r.cfg.DrainAttempt
-		if remain := time.Until(deadline); remain < attempt {
-			attempt = remain
-		}
+		attempt := r.drainAttemptFor(time.Until(deadline))
 		if attempt <= 0 {
 			break
 		}
@@ -933,6 +934,10 @@ func (r *Registrar) finishPut(ip, how, reason string) {
 	r.revokeStale(context.Background(), r.cfg.OpTimeout)
 	r.clearEpoch(context.Background())
 	r.revokeEpoch(context.Background())
+	// 下一次 Drain 要在一次事务里写标记。提前 Grant，避免 Drain 再多一次往返。
+	if err := r.ensureEpochLease(context.Background()); err != nil {
+		r.event("epoch_grant_err", "err", err.Error())
+	}
 	r.saveLocked()
 }
 
@@ -976,9 +981,98 @@ func (r *Registrar) allowWrite(ctx context.Context, lease int64, raw []byte) (st
 	return "", false, nil
 }
 
+// deleteIfOwnLease 在一次事务里处理「业务 key 还挂在本进程 lease 上」的删除。
+// done 为 false 且 err 为 nil 时，调用方走原来的 Get + 判定路径（lease 已经不是我们的）。
+func (r *Registrar) deleteIfOwnLease(ctx context.Context, reason string) (bool, error) {
+	if err := r.ensureEpochLease(ctx); err != nil {
+		// Grant 失败时退回只删 key。慢路径会再试一次 Grant，仍然失败才 Delete。
+		return false, nil
+	}
+	body, err := r.epochBody()
+	if err != nil {
+		return false, err
+	}
+	epochKey := EpochKey(r.cfg.NodeID)
+	leaseID := r.epochLease
+	biz := r.lease
+	tr, err := r.commitTxn(r.txn(ctx).
+		If(clientv3.Compare(clientv3.LeaseValue(r.key), "=", int64(biz))).
+		Then(
+			clientv3.OpGet(epochKey),
+			clientv3.OpPut(epochKey, body, clientv3.WithLease(leaseID)),
+			clientv3.OpDelete(r.key),
+		).
+		Else(clientv3.OpGet(r.key)))
+	if leaseRejected(err) {
+		if r.epochLease == leaseID {
+			r.clearEpochLeaseLocked()
+		}
+		if err2 := r.ensureEpochLease(ctx); err2 != nil {
+			return false, err2
+		}
+		leaseID = r.epochLease
+		tr, err = r.commitTxn(r.txn(ctx).
+			If(clientv3.Compare(clientv3.LeaseValue(r.key), "=", int64(biz))).
+			Then(
+				clientv3.OpGet(epochKey),
+				clientv3.OpPut(epochKey, body, clientv3.WithLease(leaseID)),
+				clientv3.OpDelete(r.key),
+			).
+			Else(clientv3.OpGet(r.key)))
+	}
+	if err != nil {
+		landed, checked := r.epochWriteLanded(context.WithoutCancel(ctx), body, leaseID)
+		if checked && landed {
+			r.event("epoch_txn_committed", "err", err.Error(), "lease", int64(leaseID))
+			r.priorHolder = true
+			r.event("unregistered", "reason", reason, "ip", r.regIP, "lease", int64(r.lease))
+			r.regIP = ""
+			return true, nil
+		}
+		return false, err
+	}
+	if tr != nil && tr.Succeeded {
+		r.noteEpochDeletes(ctx, tr)
+		r.priorHolder = true
+		r.event("unregistered", "reason", reason, "ip", r.regIP, "lease", int64(r.lease))
+		r.regIP = ""
+		return true, nil
+	}
+	if tr != nil && len(tr.Responses) > 0 {
+		if rr := tr.Responses[0].GetResponseRange(); rr != nil && len(rr.Kvs) == 1 {
+			// lease 已经不是我们的，交给原来的判定去告警或重试。
+			return false, nil
+		}
+	}
+	if err := r.writeHolderEpoch(ctx, true); err != nil && !errors.Is(err, ErrNodeConflict) {
+		if errors.Is(err, errLostRace) {
+			return false, err
+		}
+		return false, err
+	}
+	if r.regIP != "" {
+		r.event("unregistered", "reason", reason, "ip", r.regIP, "missing", true)
+	}
+	r.regIP = ""
+	return true, nil
+}
+
 func (r *Registrar) deleteOwned(ctx context.Context, reason string, timeout time.Duration) error {
 	if r.cli == nil {
 		return errors.New("etcd client closed")
+	}
+	// 持有者且业务 lease 还在：一次事务完成「还是我的 lease → 写标记 → 删 key」。
+	// 先 Get 再 Grant 再提交是三次往返，1–1.5s 延迟时会超出 2s 的单次尝试。
+	if r.priorHolder && r.lease != 0 {
+		c, cancel := context.WithTimeout(ctx, timeout)
+		done, err := r.deleteIfOwnLease(c, reason)
+		cancel()
+		if done {
+			return nil
+		}
+		if err != nil && !errors.Is(err, errLostRace) {
+			return err
+		}
 	}
 	var last error
 	for attempt := 0; attempt < 3; attempt++ {
@@ -1219,8 +1313,24 @@ func (r *Registrar) opCreateGuarded(body string) clientv3.Op {
 }
 
 func (r *Registrar) ensureEpochLease(ctx context.Context) error {
-	if r.epochLease != 0 {
+	pub := r.pubEpoch.Load()
+	if r.epochLease != 0 && pub == int64(r.epochLease) {
 		return nil
+	}
+	// 续租循环已经因为 MaxDrained 把这条 lease 从续租名单拿掉。不能再把标记挂上去，
+	// 否则标记会跟着剩余 TTL 提前消失，而 drainSignals 还会把这次新的 Drain 报成 epoch_hold_expired。
+	if r.epochLease != 0 {
+		old := r.epochLease
+		if pub == int64(old) {
+			r.clearEpochLeaseLocked()
+		} else {
+			r.epochLease = 0
+			r.epochDeadline = time.Time{}
+			r.epochNextRenew = time.Time{}
+		}
+		if r.staleEpoch == 0 {
+			r.staleEpoch = old
+		}
 	}
 	cli := r.cli
 	hook := r.epochGrant
@@ -1265,7 +1375,12 @@ func (r *Registrar) beginDrainedHold() {
 	r.drained = true
 	r.drainedSince = time.Now()
 	r.epochHoldReleased = false
+	r.holdGen.Add(1)
 	r.publishHoldLocked()
+	// 上一窗的过期通知作废。正在等锁的 Drain 会自己 Grant 一条还在续的 lease。
+	r.pendingMu.Lock()
+	r.pendingHold = holdFail{}
+	r.pendingMu.Unlock()
 }
 
 func (r *Registrar) epochHoldExceeded() bool {
@@ -1473,7 +1588,7 @@ func (r *Registrar) deleteKeyAndEpoch(ctx context.Context, mod int64) error {
 			continue
 		}
 		if err != nil {
-			landed, checked := r.epochWriteLanded(ctx, body, leaseID)
+			landed, checked := r.epochWriteLanded(context.WithoutCancel(ctx), body, leaseID)
 			if checked && landed {
 				r.event("epoch_txn_committed", "err", err.Error(), "lease", int64(leaseID))
 				if tr != nil && tr.Succeeded {

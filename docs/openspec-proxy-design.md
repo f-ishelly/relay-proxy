@@ -471,7 +471,7 @@ Value：
 
 标记不在 `/relay/l2/` 前缀下，L1 的 Watch 看不到。它挂在自己的 epoch lease 上（默认 max(30s, 3×业务 TTL)，业务 TTL 为 10s 时就是 30s；进程还活着就按 EpochRenewInterval 续租，默认 10s），正文是 `instance_id`、`node_id`、`addr`、`machine_id`。所以业务 lease 在 drained 期间丢失时，标记还在。创建业务 key，以及靠“lease 已死”这条路径覆盖残留 key，都要求标记不存在，或属于本实例：`instance_id` 相同，并且标记里的 `addr` 为空（旧格式）或等于本机 `IntranetAddr`。只凭相同的 `addr` 和 `machine_id` 不能注册。注册成功后只删除本实例的这些标记。
 
-重拨中崩溃并且状态文件也丢了时，新进程的 `instance_id` 是新的。标记上的内网地址和 `machine_id` 如果仍是这台机器，就不报 `foreign_instance`，但在标记过期之前仍然拒绝注册：`Ready` 即使带了不同的 `prevEgress` 也返回 `ErrNodeConflict`，也不会删掉持有者的标记。同一台机器必须等到 EpochTTL（默认 30s）之后才能重新注册。拷走状态文件、因此 `instance_id` 相同、但 `IntranetAddr` 已经不同的机器不算持有者，按 `foreign_instance` 拒绝。地址或 machine-id 对不上的标记同样是 `foreign_instance`。持有者一直停在 drained、不再调用 `Ready` 时，标记最多再续 `MaxDrained`（默认 10×EpochTTL；EpochTTL 为 30s 时是 5 分钟），然后停止续租并 `OnAlert`（`kind = epoch_hold_expired`），标记在剩余的一个 EpochTTL 内自己过期。进程退出后 epoch lease 不再续租。这是残留风险。
+重拨中崩溃并且状态文件也丢了时，新进程的 `instance_id` 是新的。标记上的内网地址和 `machine_id` 如果仍是这台机器，就不报 `foreign_instance`，但在标记过期之前仍然拒绝注册：`Ready` 即使带了不同的 `prevEgress` 也返回 `ErrNodeConflict`，也不会删掉持有者的标记。同一台机器必须等到 EpochTTL（默认 30s）之后才能重新注册。拷走状态文件、因此 `instance_id` 相同、但 `IntranetAddr` 已经不同的机器不算持有者，按 `foreign_instance` 拒绝。地址或 machine-id 对不上的标记同样是 `foreign_instance`。持有者一直停在 drained、不再调用 `Ready` 时，标记最多再续 `MaxDrained`（默认 10×EpochTTL；EpochTTL 为 30s 时是 5 分钟），然后停止续租并 `OnAlert`（`kind = epoch_hold_expired`），标记在剩余的一个 EpochTTL 内自己过期。续租循环到点时如果别的操作还占着锁，随后进来的 `Drain` 不会把标记再挂回这条已经停止续租的 epoch lease，也不会把这次新的窗口报成 `epoch_hold_expired`。它重新计算 `MaxDrained`，并 Grant 一条新的 epoch lease。进程退出后 epoch lease 不再续租。这是残留风险。
 
 上次在线且本机 ppp 地址未变、状态文件也属于本机时，新进程 Grant 新 lease，用事务盖住原 key，再撤销旧 lease，Watch 不会看到 DELETE。这是进程重启，不是重拨，不要求出口变化。客户端如果误以为自己的 lease 已经丢失（例如切主后本地截止时间到了，服务端租约其实还在），旧 lease 会留在本实例的上一任列表里，重新 Put 时认领，而不是报成和自己冲突。
 
@@ -480,7 +480,7 @@ Value：
 | 调用 | 行为 |
 | --- | --- |
 | `Start` | 连接配置里的全部成员并 Grant。业务 lease 和 epoch lease 在独立 goroutine 里续租（默认每 3s / 10s），不跟 Drain、Ready、探测共用 `r.mu`。`r.mu` 也不跨过 etcd 调用和状态文件 fsync。探测每 1s，ppp 地址每 500ms。探测未通过不 Put |
-| `Drain` | 同步 Delete 本 key。单次尝试默认 2s，失败后按指数退避加抖动再试（大约从 100ms 起到 500ms），总预算 6s，etcd 确认后才返回。不要用 700ms 的紧重试，延迟一高就会打成重试风暴。业务 lease 继续由独立循环续租，Drain 持有状态机锁时也续得上。记下重拨前的出口。还没注册过就 `Drain` 时没有出口可记，也不写 epoch 标记，之后的 `Ready` 必须由调用方传入一个不同的 `prevEgress`。登记过的持有者在同一次事务里写自己的标记并删除 key；别人的标记不会让这次删除失败。epoch lease 已在服务端撤销时，重新 Grant 并再试一次合并事务，然后才退回只删 key。事务在客户端超时但标记已经写成这次的 lease 时，不 Revoke 这条刚写上的标记。没写上标记的新 lease 会撤销。停在 drained 超过 `MaxDrained` 后不再续租标记 |
+| `Drain` | 同步 Delete 本 key。注册成功时就 Grant 一条还没有标记的 epoch lease 并继续续租，所以持有者的删除是一次事务：业务 lease 仍是自己的，才写上标记并删除 key。不再先 Get、再 Grant、再提交。单次尝试默认 2s；续租已经量到更大的 RTT 时，这一次拉到 1.5×RTT，但不超过剩余预算。失败后按指数退避加抖动再试（大约从 100ms 起到 500ms），总预算 6s，etcd 确认后才返回。不要用 700ms 的紧重试，延迟一高就会打成重试风暴。业务 lease 继续由独立循环续租，Drain 持有状态机锁时也续得上。记下重拨前的出口。还没注册过就 `Drain` 时没有出口可记，也不写 epoch 标记，之后的 `Ready` 必须由调用方传入一个不同的 `prevEgress`。别人的标记不会让这次删除失败。epoch lease 已在服务端撤销时，重新 Grant 并再试一次合并事务，然后才退回只删 key。事务在客户端超时但标记已经写成这次的 lease 时，不 Revoke 这条刚写上的标记。没写上标记的新 lease 会撤销。停在 drained 超过 `MaxDrained` 后不再续租标记；下一次 `Drain` 另 Grant，不复用那条已经停续的 lease |
 | `Ready(egressIP, prevEgress)` | 本机 ppp 地址必须等于 `egressIP`，且 gost 探测已通过，才 Put。创建 key 的事务会同时看 epoch 标记；lease 已死的覆盖也看。能穿过标记的只有本实例：`instance_id` 相同，且 `addr` 为空或等于本机内网地址。重拨中：状态文件里的上一任出口和调用方传入的 `prevEgress` 都用来比对，相同则 `ErrEgressUnchanged`。状态文件损坏、`node_id` 对不上，或文件整个缺失时，都先按 `drained` 处理，`Report` 不能注册。损坏或 `node_id` 不符时，不传 `prevEgress` 得到 `ErrEgressUnconfirmed`。文件缺失且没有标记时，和第一次启动无法区分：`Ready` 不传 `prevEgress` 会注册。文件缺失但标记上的地址和 machine-id 是本机时，不报 `foreign_instance`，标记过期前 `Ready` 返回 `ErrNodeConflict`，不同的 `prevEgress` 也不能接管。`instance_id` 相同但 `addr` 不同，按 `foreign_instance` 拒绝 |
 | `Report` | 每分钟一次。零值表示健康。`NetFault` 表示访问外部失败，`CPUFault` / `MemFault` 表示 CPU 或内存异常。任一故障则 Delete，恢复后（再传零值或没有故障位）Put。`drained` 期间，以及还没有一次通过出口校验的 `Ready`（或本机接管）时，忽略，不会把出口写进 etcd。上报正文不写 etcd |
 | `Stop` | `Revoke` lease。进程被杀或宿主机异常时没有这一步，key 等 TTL |
@@ -489,7 +489,7 @@ Value：
 
 一次拨号加一次出口校验合计约 5s（规划上按 4s 拨号、1s 校验，失败率低于 1%）。这段时间里 lease 继续每 3s 续租，所以 TTL 仍是 10s，`Drain` 的 6s 预算也不用拉长：`Drain` 在挂断之前就返回。registrar 不替 admin 睡眠，这两个时长只放在 `AssumedDial` 和 `AssumedEgressCheck` 里。
 
-计划内、按时刻对齐的批量重拨必须先调用 `JitterBeforeDrain`。默认 `RedialJitter` 是 60s，每台机器在 `Drain` 之前随机等待 `[0, 60s)`。这是硬要求：同一时刻一起 `Drain` 会把 etcd 打满，业务 lease 的 10s TTL 保不住。`example/admin` 的演示可以用 `-redial-jitter 0` 跳过等待，生产配置不能设 0。`cmd/registrard` 的 `POST /v1/drain` 会先做这段等待，默认同样是 60s。
+计划内、按时刻对齐的批量重拨必须先调用 `JitterBeforeDrain`。默认 `RedialJitter` 是 60s，每台机器在 `Drain` 之前随机等待 `[0, 60s)`。这是硬要求：同一时刻一起 `Drain` 会把 etcd 打满，业务 lease 的 10s TTL 保不住。`example/admin` 的演示可以用 `-redial-jitter 0` 跳过等待，生产配置不能设 0。`cmd/registrard` 没写 `redial_jitter_ms` 时也是这 60s。配置里把该字段写成 0 会拒绝启动，只有测试或演示加上 `-allow-zero-jitter` 才接受。`POST /v1/drain` 接受请求后立刻返回 202，抖动和 `Drain` 使用独立于 HTTP 请求的 context。客户端超时短于 60s、连接断开，也不会取消这次 `Drain`，key 不会因此留在 etcd。调用方用 `GET /v1/status` 看 `drained`。
 
 下线用 Delete，不用 `status=draining`。key 在即可路由，不依赖每个 L1 都正确过滤状态。业务 key 仍是一次重拨删一次、写一次。持有者的 `Drain` 在同一次事务里写 epoch 标记，成功注册后再按条件删掉，所以重拨路径上的 etcd 写大约翻倍（4000 台同时重拨时，这部分大约从 2.2 次/s 抬到 4.4 次/s）。在线节点的 3s 续租不写这个标记。没登记过的实例不产生这些写。
 
@@ -513,20 +513,20 @@ Value：
 | 计划外掉线 | 节点是虚拟机，只有宿主机异常时才发生，而且很少。同一宿主机上的一批节点会一起过期。不因此改 TTL | `TTL` 10s，`RenewInterval` 3s。L1 要承受批量 DELETE，见 §8.3 |
 | nodeId | 环境变量 `RELAY_NODE_ID`，运维保证唯一。变量存在但只有空白是配置错误，不会改去读文件。事务冲突检测保留作兜底 | `NodeID` 可直接传入；为空且环境变量未设置时才读 `NodeIDFile`。告警走 `OnAlert` |
 | admin 语言 | Go。主路径是进程内调用 `registrar`。`cmd/registrard` 只是备选，启动时不调用 `Ready` | `example/admin` 在 `Start` 之后调用 `Ready` |
-| 计划内重拨的时间拉开 | 必须。调用 `JitterBeforeDrain`，默认在 Drain 之前随机等待 0–60s。同一时刻一起 Drain 会丢 lease。演示可以设 0，生产不能 | `RedialJitter`，默认 `DefaultRedialJitter` |
+| 计划内重拨的时间拉开 | 必须。调用 `JitterBeforeDrain`，默认在 Drain 之前随机等待 0–60s。同一时刻一起 Drain 会丢 lease。`example/admin` 的演示可以设 0。`registrard` 生产配置写成 0 会拒绝启动，只有 `-allow-zero-jitter` 才接受；`POST /v1/drain` 返回 202，不跟请求 context 一起取消 | `RedialJitter`，默认 `DefaultRedialJitter` |
 | 同一台机器丢掉状态文件再启动 | 新 `instance_id` 对不上还活着的重拨标记。不报 `foreign_instance`，但标记过期前不能注册。最多等一个 EpochTTL，默认 30s | `EpochTTL` |
 | 旧状态文件 | 没有 `machine_id` 或 `instance_id` 时保持 `drained`，不撤旧 lease，直到 `Ready`。旧 epoch 标记如果只有 `instance_id` 和 `node_id`、没有 `addr`，仍然算本实例；带了 `addr` 就必须和本机内网地址一致。文件整个丢失见上一行 | 无自动升级开关 |
 | drained 期间的标记 | 持有者停在 drained 时继续续租标记，默认最多 10×EpochTTL（30s 时为 5 分钟）。到期停止续租，`OnAlert` 的 kind 为 `epoch_hold_expired`，标记再在一个 EpochTTL 内过期 | `MaxDrained` |
 
 ### 8.5 本仓库里怎么验证
 
-`go test ./registrar/` 用内嵌 etcd 覆盖验收里的计划内重拨、重拨后出口 IP 没变时不注册、校验失败与崩溃恢复、未 `Drain` 的地址变化、gost 挂死与外网/资源巡检失败、切主时在线节点不删 key 且 `Drain` 在 3s 内完成、进程消失后的 TTL / 切主上限、nodeId 冲突，以及 etcd 单次操作延迟 1.5s 时续租间隔仍低于 TTL。压测入口是 `cmd/loadgen` 和 `scripts/loadtest.sh`。
+`go test ./registrar/` 用内嵌 etcd 覆盖验收里的计划内重拨、重拨后出口 IP 没变时不注册、校验失败与崩溃恢复、未 `Drain` 的地址变化、gost 挂死与外网/资源巡检失败、切主时在线节点不删 key 且 `Drain` 在 3s 内完成、进程消失后的 TTL / 切主上限、nodeId 冲突，以及 etcd 单次操作延迟 1.5s 时续租间隔仍低于 TTL。另有：默认 `DrainAttempt` / `DrainBudget` 下，1.5s 的 etcd 延迟时持有者 `Drain` 只有一次事务，实测约 1.5s，低于 3s。leader 进程被杀掉（连接重置）时，验收 5 的 3s 仍然成立。leader 的客户端口和 peer 口被 iptables 丢包时，第一次尝试会坐满 `DrainAttempt` 再换成员；一次实测是 2.08s，仍低于 3s，但第二次如果也慢就会超过 3s。这条测试断言的是 6s 预算内删掉 key、业务 lease 不丢，不把 3s 当成丢包时的上限。压测入口是 `cmd/loadgen` 和 `scripts/loadtest.sh`。
 
 启动错开是 `(staggerBase+i) % 8000ms`。单进程 `staggerBase` 为 0，公式就是 `i % 8000ms`。`hosts=4000` 时下标最大是 3999，所以实际错开是 0–3999ms，不是 8s。多进程时父进程把已经分出去的主机数当作 `staggerBase`，4000 台仍然铺在这 4s 里，而不是每个进程各自从 0 再铺一遍。loadgen 把公式和 `start_sleep_max_ms` 写进 summary。`-redial-inflight 0` 表示不限制同时进行的 `Drain`+`Ready`。
 
-续租和 `Drain` 不再共用一把锁。锁拆开之前，单进程、内嵌 etcd、4000 路不限并发、同一时刻 `Drain`：`docs/acceptance/acceptance7-unbounded-before.log` 由 loadgen 在干净工作区上自己写入（commit `7c4cd62`），`drain_err` 4000，`lease_lost` 4000，`keepalive_ok` 1918，`keepalive_err` 247。同一形状在锁拆开之后（`acceptance7-unbounded-after.log`，commit `8d2b963`）：`lease_lost` 0，`keepalive_err` 0，`keepalive_ok` 26574（每台 min/p50/max 6/7/7），`drain_ok` 3968，`drain_err` 32。这 32 次是客户端在 6s 预算里没拿到确认，租约没有丢。
+续租和 `Drain` 不再共用一把锁。锁拆开之前，单进程、内嵌 etcd、4000 路不限并发、同一时刻 `Drain`：`docs/acceptance/acceptance7-unbounded-before.log` 由 loadgen 在干净工作区上自己写入（commit `7c4cd62`），`drain_err` 4000，`lease_lost` 4000，`keepalive_ok` 1918，`keepalive_err` 247。同一形状在锁拆开之后（`acceptance7-unbounded-after.log`，commit `8d2b963`）：`lease_lost` 0，`keepalive_err` 0，`keepalive_ok` 26574（每台 min/p50/max 6/7/7），`drain_ok` 3968，`drain_err` 32。这 32 次当时没有分开记：`drain_err` 把 `Drain` 失败和 `Drain` 成功之后的 `Ready` 失败加在了一起。租约没有丢。loadgen 现在分开写 `drain_fail` 和 `redial_ready_fail`，`drain_err` 仍是两者之和。同形状、拆开计数的运行在 `docs/acceptance/acceptance7-unbounded-split.log`。
 
-验收 7（`acceptance7.log`，commit `0695611`）是 8 个 OS 进程、每个 500 个 registrar，对 3 个独立 etcd 进程，`-redial-inflight 0`，重拨时刻对齐，然后停掉 leader。合计 `registered` 4000，`ready_err` 0，`drain_ok` 4000，`drain_err` 0，`lease_lost` 0，`keepalive_err` 0，`keepalive_ok` 36522，`watch_del` 4000，`watch_put` 8000，`leader_killed` true。每个进程都 Watch 整个 `/relay/l2/` 前缀，汇总时取最大的那一份，不把次数乘上进程数。日志头里的 commit、`git status`、Go 版本、开始和结束时间都是运行时写的，不要手改。
+验收 7（`acceptance7.log`，commit `0695611`）是 8 个 OS 进程、每个 500 个 registrar，对 **127.0.0.1 上的 3 个 etcd 进程**（同一台机器，不是分在不同主机上的集群），`-redial-inflight 0`，重拨时刻对齐。合计 `registered` 4000，`ready_err` 0，`drain_ok` 4000，`drain_err` 0，`lease_lost` 0，`keepalive_err` 0，`keepalive_ok` 36522，`watch_del` 4000，`watch_put` 8000。日志里的 `kill_leader` 写在全部 `redial` 事件之后：leader 是在所有 `Drain` 已经结束之后才停的，不是重拨进行中。`leader_killed` true 只表示这次运行后来停过 leader。每个进程都 Watch 整个 `/relay/l2/` 前缀，汇总时取最大的那一份，不把次数乘上进程数。日志头里的 commit、`git status`、Go 版本、开始和结束时间都是运行时写的，不要手改。
 
 Watch DELETE 次数等于这次 `Drain` 的次数；多出来的 DELETE 才是 lease 过期。续租次数来自 registrar 自己的续租循环，不会正好是主机数乘一个固定次数。loadgen 默认同时只进行 64 路 `Drain`+`Ready`，那只是可选的压测调度，不是 registrar 的限制。最近一次验收 5、验收 7 的输出在 `docs/acceptance/`。
 

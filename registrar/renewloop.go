@@ -18,6 +18,14 @@ type leaseFail struct {
 	gen int64
 }
 
+// holdFail 是 MaxDrained 到点、续租循环已经停止续这条 epoch lease。
+// since 和 gen 是采样时的窗口。Drain 如果开了新窗口，这两个对不上，就不能再报警。
+type holdFail struct {
+	id    int64
+	since int64
+	gen   uint64
+}
+
 // commitTxn 在锁外提交已经组好的事务。组事务本身不访问网络，要在持锁时做完。
 func (r *Registrar) commitTxn(txn clientv3.Txn) (*clientv3.TxnResponse, error) {
 	if txn == nil {
@@ -130,9 +138,15 @@ func (r *Registrar) renewIndependent(epoch bool) {
 		every = r.cfg.EpochRenewInterval
 		if id != 0 && r.holdActive.Load() {
 			since := r.holdSince.Load()
+			gen := r.holdGen.Load()
 			if since > 0 && !time.Now().Before(time.Unix(0, since).Add(r.cfg.MaxDrained)) {
 				if r.pubEpoch.CompareAndSwap(id, 0) {
-					r.queueHold(id)
+					// Drain 可能已经把窗口重新算过。把 lease 放回续租，不要拿旧窗口去报警。
+					if r.holdGen.Load() != gen || r.holdSince.Load() != since {
+						r.pubEpoch.CompareAndSwap(0, id)
+						return
+					}
+					r.queueHold(holdFail{id: id, since: since, gen: gen})
 				}
 				return
 			}
@@ -204,6 +218,7 @@ func (r *Registrar) renewIndependent(epoch bool) {
 		}
 		r.renewMu.Unlock()
 		r.dropPending(epoch, id)
+		r.lastRTT.Store(time.Since(t0).Nanoseconds())
 		if !epoch {
 			r.event("ka_ok", "ttl", resp.TTL, "rtt_ms", time.Since(t0).Milliseconds())
 		}
@@ -310,9 +325,9 @@ func (r *Registrar) queueEpoch(f leaseFail) {
 	r.wakeLoss()
 }
 
-func (r *Registrar) queueHold(id int64) {
+func (r *Registrar) queueHold(h holdFail) {
 	r.pendingMu.Lock()
-	r.pendingHold = id
+	r.pendingHold = h
 	r.pendingMu.Unlock()
 	r.wakeLoss()
 }
@@ -320,7 +335,7 @@ func (r *Registrar) queueHold(id int64) {
 func (r *Registrar) hasSignals() bool {
 	r.pendingMu.Lock()
 	defer r.pendingMu.Unlock()
-	return r.pendingMain != nil || r.pendingEpoch != nil || r.pendingHold != 0
+	return r.pendingMain != nil || r.pendingEpoch != nil || r.pendingHold.id != 0
 }
 
 // drainSignals 在控制循环里处理续租失败。拿不到 opMu 就留到下一轮，不挡住续租循环。
@@ -338,9 +353,9 @@ func (r *Registrar) drainSignals() {
 	hold := r.pendingHold
 	r.pendingMain = nil
 	r.pendingEpoch = nil
-	r.pendingHold = 0
+	r.pendingHold = holdFail{}
 	r.pendingMu.Unlock()
-	if main == nil && epoch == nil && hold == 0 {
+	if main == nil && epoch == nil && hold.id == 0 {
 		return
 	}
 	r.mu.Lock()
@@ -351,7 +366,7 @@ func (r *Registrar) drainSignals() {
 	if main != nil && r.lossStillCurrent(false, main) {
 		r.loseLeaseLocked(main.err)
 	}
-	if hold != 0 && int64(r.epochLease) == hold && !r.epochHoldReleased {
+	if hold.id != 0 && r.holdStillCurrent(hold) {
 		r.releaseEpochHoldLocked()
 	}
 	if epoch != nil && r.lossStillCurrent(true, epoch) {
@@ -362,6 +377,14 @@ func (r *Registrar) drainSignals() {
 			r.event("epoch_refresh_err", "err", werr.Error())
 		}
 	}
+}
+
+// holdStillCurrent 在 r.mu 下调用。lease 已经换成新 Drain 的，或者窗口代际变了，就不是这次过期。
+func (r *Registrar) holdStillCurrent(hold holdFail) bool {
+	if hold.id == 0 || r.epochHoldReleased || int64(r.epochLease) != hold.id {
+		return false
+	}
+	return r.holdGen.Load() == hold.gen && r.holdSince.Load() == hold.since
 }
 
 // lossStillCurrent 在 r.mu 下调用。续租已经又成功过，或者 lease 已经换了，就不要再判丢失。
@@ -440,6 +463,25 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 	case <-t.C:
 		return nil
 	}
+}
+
+// drainAttemptFor 是这一次尝试的超时。默认 DrainAttempt；续租已经量到更大的 RTT 时拉到 1.5 倍，
+// 但不超过这次 Drain 还剩下的预算。持有者路径只有一次事务，1.5s 的 RTT 用 2.25s 就盖住，仍低于 3s。
+func (r *Registrar) drainAttemptFor(remain time.Duration) time.Duration {
+	attempt := r.cfg.DrainAttempt
+	if rtt := time.Duration(r.lastRTT.Load()); rtt > 0 {
+		need := rtt + rtt/2
+		if need > attempt {
+			attempt = need
+		}
+	}
+	if remain < attempt {
+		attempt = remain
+	}
+	if attempt < 0 {
+		return 0
+	}
+	return attempt
 }
 
 // drainBackoff 是失败后的等待，落在 [base/2, base)，并封顶由调用方控制。

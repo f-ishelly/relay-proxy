@@ -34,7 +34,9 @@ const (
 	DefaultProbeRiseThreshold = 2
 	// DefaultIPGuardInterval 是 ppp 地址守卫的间隔。
 	DefaultIPGuardInterval = 500 * time.Millisecond
-	// DefaultDrainAttempt 是 Drain 单次 etcd 调用的超时。失败后按指数退避加抖动再试，避免 700ms 超时打成重试风暴。
+	// DefaultDrainAttempt 是 Drain 单次尝试的超时。持有者删除是一次事务。
+	// 续租量到更大的 RTT 时，这一次会拉到 1.5×RTT，但不超过剩余的 DrainBudget。
+	// 失败后按指数退避加抖动再试，避免 700ms 超时打成重试风暴。
 	DefaultDrainAttempt = 2 * time.Second
 	// DefaultRedialJitter 是计划内批量重拨在 Drain 之前必须拉开的随机上界。
 	DefaultRedialJitter = 60 * time.Second

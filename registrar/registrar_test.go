@@ -1943,11 +1943,20 @@ func TestDrainFallsBackWhenEpochGrantFails(t *testing.T) {
 	g := newRig(t, 1, "626220", func(cfg *Config) { cfg.MachineID = "host-a" })
 	g.ready("100.64.0.1")
 	g.waitKey(true, 2*time.Second)
+	g.reg.opMu.Lock()
 	g.reg.mu.Lock()
+	id := g.reg.epochLease
+	g.reg.clearEpochLeaseLocked()
 	g.reg.epochGrant = func(context.Context, int64) (*clientv3.LeaseGrantResponse, error) {
 		return nil, errors.New("grant failed")
 	}
 	g.reg.mu.Unlock()
+	g.reg.opMu.Unlock()
+	if id != 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_, _ = g.cli.Revoke(ctx, id)
+		cancel()
+	}
 	if err := g.reg.Drain(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -1965,7 +1974,7 @@ func TestDrainFallsBackWhenEpochGrantFails(t *testing.T) {
 		t.Fatalf("fallback left a marker err=%v n=%d", err, n)
 	}
 	g.reg.mu.Lock()
-	id := g.reg.epochLease
+	id = g.reg.epochLease
 	g.reg.mu.Unlock()
 	if id != 0 {
 		t.Fatalf("failed grant left epoch lease %d", id)
@@ -1976,6 +1985,17 @@ func TestConflictRevokesUnusedEpochLease(t *testing.T) {
 	g := newRig(t, 1, "626220", func(cfg *Config) { cfg.MachineID = "host-a" })
 	g.ready("100.64.0.1")
 	g.waitKey(true, 2*time.Second)
+	g.reg.opMu.Lock()
+	g.reg.mu.Lock()
+	pre := g.reg.epochLease
+	g.reg.clearEpochLeaseLocked()
+	g.reg.mu.Unlock()
+	g.reg.opMu.Unlock()
+	if pre != 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_, _ = g.cli.Revoke(ctx, pre)
+		cancel()
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	before, err := g.cli.Leases(ctx)
 	cancel()

@@ -25,6 +25,7 @@ type Cluster struct {
 type member struct {
 	name      string
 	clientURL string
+	peerURL   string
 	srv       *embed.Etcd
 	closed    bool
 }
@@ -52,6 +53,7 @@ func Start(dir string, n int) (*Cluster, error) {
 		c.members = append(c.members, &member{
 			name:      fmt.Sprintf("e%d", i),
 			clientURL: clients[i],
+			peerURL:   peers[i],
 		})
 	}
 	var initial []string
@@ -118,9 +120,16 @@ func (c *Cluster) Endpoints() []string {
 	return out
 }
 
-// KillLeader stops the current leader process. The endpoint remains in Endpoints
-// so clients configured with the full list must fail over by themselves.
-func (c *Cluster) KillLeader() (string, error) {
+// LeaderURLs is the current leader's client and peer URLs.
+func (c *Cluster) LeaderURLs() (clientURL, peerURL string, err error) {
+	m, err := c.leaderMember()
+	if err != nil {
+		return "", "", err
+	}
+	return m.clientURL, m.peerURL, nil
+}
+
+func (c *Cluster) leaderMember() (*member, error) {
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		c.mu.Lock()
@@ -136,25 +145,35 @@ func (c *Cluster) KillLeader() (string, error) {
 		}
 		c.mu.Unlock()
 		if target != nil {
-			// HardStop 相当于 kill -9：raft 立刻停，不等 HTTP 排空，也不做 leadership transfer。
-			// 不调用 embed.Close，避免它在停掉的 leader 上再跑一轮优雅退出把选举拖长。
-			if target.srv.Server != nil {
-				target.srv.Server.HardStop()
-			}
-			for _, ln := range target.srv.Clients {
-				_ = ln.Close()
-			}
-			for _, p := range target.srv.Peers {
-				_ = p.Close()
-			}
-			c.mu.Lock()
-			target.closed = true
-			c.mu.Unlock()
-			return target.clientURL, nil
+			return target, nil
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	return "", fmt.Errorf("etcdcluster: no leader")
+	return nil, fmt.Errorf("etcdcluster: no leader")
+}
+
+// KillLeader stops the current leader process. The endpoint remains in Endpoints
+// so clients configured with the full list must fail over by themselves.
+func (c *Cluster) KillLeader() (string, error) {
+	target, err := c.leaderMember()
+	if err != nil {
+		return "", err
+	}
+	// HardStop 相当于 kill -9：raft 立刻停，不等 HTTP 排空，也不做 leadership transfer。
+	// 不调用 embed.Close，避免它在停掉的 leader 上再跑一轮优雅退出把选举拖长。
+	if target.srv.Server != nil {
+		target.srv.Server.HardStop()
+	}
+	for _, ln := range target.srv.Clients {
+		_ = ln.Close()
+	}
+	for _, p := range target.srv.Peers {
+		_ = p.Close()
+	}
+	c.mu.Lock()
+	target.closed = true
+	c.mu.Unlock()
+	return target.clientURL, nil
 }
 
 // Close stops every member that is still running.
