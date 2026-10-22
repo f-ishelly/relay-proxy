@@ -463,9 +463,9 @@ Value：
 
 写入用事务：key 不存在、lease 属于本进程、lease 是本机状态文件里的上一任且 value 的 `instance_id` 也是本实例，或该 lease 已经失效，才允许 Put / Delete。否则视为 nodeId 冲突，不覆盖，并调用 `OnAlert`。活着的别人的 lease 用 `kind = node_id_conflict`。`instance_id` 对不上时用 `kind = foreign_instance`，并且不 Revoke 那条 lease。
 
-`instance_id` 是第一次启动时生成的随机数，和当时的 `/etc/machine-id` 一起写进状态文件，也写进 value。状态文件被拷到另一台机器（`machine-id` 不同）时，新进程不认里面的 lease，也不会把原机的 key 撤掉。两边的 `/etc/machine-id` 如果也被一起拷走，registrar 无法分辨，这是残留风险：克隆虚拟机时要重新生成 machine-id，不要把状态文件当成镜像的一部分。
+`instance_id` 是第一次启动时生成的随机数，和当时的 `/etc/machine-id` 一起写进状态文件，也写进 value。状态文件被拷到另一台机器（`machine-id` 不同）时，新进程不认里面的 lease，也不会把原机的 key 撤掉。`machine-id` 或 `instance_id` 有一边是空的，同样不认、不撤。即便 `machine-id` 也被一起拷走，撤销之前会先读当前 key：`value.addr` 不是本机 `IntranetAddr`，或 `instance_id` 对不上，或这两个字段有一个是空的，都不 Revoke，也不覆盖。只有地址和实例都对得上，才把状态文件里的 lease 当成自己的。克隆体如果连 `machine-id`、`instance_id`、内网地址全部相同，registrar 仍然分不出来，这是残留风险：克隆虚拟机时要重新生成 machine-id，不要把状态文件当成镜像的一部分。
 
-状态文件（例如 `/var/lib/relay-registrar/{nodeId}.json`）记录 instance、lease、`drained`、当前出口，以及计划内重拨前的出口（`prev_egress`）。`Drain` 先把 `drained` 和“必须换出口”落盘，再删 key，并在 `/relay/l2-epoch/{nodeId}` 留下本实例的标记（挂在同一条 lease 上，不在 `/relay/l2/` 前缀下，L1 的 Watch 看不到）。另一个实例在这期间来创建同一个 key，会告警并拒绝。标记随 lease 消失；标记没写上、或写它的进程已经退出且 lease 到期之后，空 key 可以被别的实例创建，这时没有上一任实例可以告警。这是残留风险。
+状态文件（例如 `/var/lib/relay-registrar/{nodeId}.json`）记录 instance、lease、`drained`、当前出口，以及计划内重拨前的出口（`prev_egress`）。写文件时先把临时文件 fsync，再 rename，然后 fsync 目录。`Drain` 先把 `drained` 和“必须换出口”落盘，再删 key，并用事务写 `/relay/l2-epoch/{nodeId}`：标记不存在，或内容就是本实例，才写入；别人的标记不会被盖掉。这个标记不在 `/relay/l2/` 前缀下，L1 的 Watch 看不到，也不挂在业务 lease 上，而是挂在自己的 epoch lease 上（默认 max(30s, 3×业务 TTL)，业务 TTL 为 10s 时就是 30s；进程还活着就按 EpochRenewInterval 续租，默认 10s）。所以业务 lease 在 drained 期间被判定丢失时，标记还在。创建业务 key 的事务同时要求 key 不存在，且标记不存在或属于本实例。注册成功后，只删除内容属于本实例的标记。另一个实例在这期间来创建同一个 key，或自己也 `Drain`，会告警并拒绝。进程退出后 epoch lease 不再续租，标记最多再留一个 EpochTTL（默认 30s），这段时间空 key 仍不能被别的实例创建；到期之后可以。这是残留风险。
 
 上次在线且本机 ppp 地址未变、状态文件也属于本机时，新进程 Grant 新 lease，用事务盖住原 key，再撤销旧 lease，Watch 不会看到 DELETE。这是进程重启，不是重拨，不要求出口变化。客户端如果误以为自己的 lease 已经丢失（例如切主后本地截止时间到了，服务端租约其实还在），旧 lease 会留在本实例的上一任列表里，重新 Put 时认领，而不是报成和自己冲突。
 
@@ -474,16 +474,16 @@ Value：
 | 调用 | 行为 |
 | --- | --- |
 | `Start` | 连接配置里的全部成员并 Grant。之后每 3s 续租、每 1s 探测 gost、每 500ms 检查 ppp 地址。探测未通过不 Put |
-| `Drain` | 同步 Delete 本 key。单次超时 700ms，最多重试 6s，etcd 确认后才返回。lease 继续续租。记下重拨前的出口。还没注册过就 `Drain` 时没有出口可记，之后的 `Ready` 必须由调用方传入一个不同的 `prevEgress` |
-| `Ready(egressIP, prevEgress)` | 本机 ppp 地址必须等于 `egressIP`，且 gost 探测已通过，才 Put。重拨中：状态文件里的上一任出口和调用方传入的 `prevEgress` 都用来比对，相同则 `ErrEgressUnchanged`。状态文件损坏或 `node_id` 对不上时，不传 `prevEgress` 得到 `ErrEgressUnconfirmed`，不注册。状态文件整个缺失和第一次启动无法区分：不传 `prevEgress` 会注册；调用方如果还知道旧出口，必须传进来，传了相同的值就会拒绝 |
-| `Report` | 每分钟一次。零值表示健康。`NetFault` 表示访问外部失败，`CPUFault` / `MemFault` 表示 CPU 或内存异常。任一故障则 Delete，恢复后（再传零值或没有故障位）Put。`drained` 期间忽略。上报正文不写 etcd |
+| `Drain` | 同步 Delete 本 key，并写本实例的 epoch 标记。单次超时 700ms，最多重试 6s，etcd 确认后才返回。业务 lease 继续续租。记下重拨前的出口。还没注册过就 `Drain` 时没有出口可记，之后的 `Ready` 必须由调用方传入一个不同的 `prevEgress`。标记那次事务比以前多一次往返 |
+| `Ready(egressIP, prevEgress)` | 本机 ppp 地址必须等于 `egressIP`，且 gost 探测已通过，才 Put。创建 key 的事务会同时看 epoch 标记。重拨中：状态文件里的上一任出口和调用方传入的 `prevEgress` 都用来比对，相同则 `ErrEgressUnchanged`。状态文件损坏、`node_id` 对不上，或文件整个缺失时，都先按 `drained` 处理，`Report` 不能注册。损坏或 `node_id` 不符时，不传 `prevEgress` 得到 `ErrEgressUnconfirmed`。文件缺失和第一次启动仍然无法靠文件区分：`Ready` 不传 `prevEgress` 会注册；调用方如果还知道旧出口，必须传进来，传了相同的值就会拒绝 |
+| `Report` | 每分钟一次。零值表示健康。`NetFault` 表示访问外部失败，`CPUFault` / `MemFault` 表示 CPU 或内存异常。任一故障则 Delete，恢复后（再传零值或没有故障位）Put。`drained` 期间，以及还没有一次通过出口校验的 `Ready`（或本机接管）时，忽略，不会把出口写进 etcd。上报正文不写 etcd |
 | `Stop` | `Revoke` lease。进程被杀或宿主机异常时没有这一步，key 等 TTL |
 
 后台探测向本机 gost 发带口令的 `CONNECT 127.0.0.1:1`，期望 `403`。这和 gost v3 的 HTTP 行为一致：认证通过之后，bypass 命中的 `CONNECT` 回 `403`，不是 `407`（go-gost 的 `TestHTTPConnect/bypass-403`）。连续 3 次失败就 Delete，连续 2 次成功再 Put，单次超时 800ms。ppp 守卫发现已注册出口和本机地址不一致，或链路断开（`LocalIP` 返回空），立刻 Delete 并进入 `drained`，直到下一次 `Ready`。这条路径不是计划内重拨，不额外要求出口必须变化。
 
 一次拨号加一次出口校验合计约 5s（规划上按 4s 拨号、1s 校验，失败率低于 1%）。这段时间里 lease 继续每 3s 续租，所以 TTL 仍是 10s，`Drain` 的 6s 预算也不用拉长：`Drain` 在挂断之前就返回。registrar 不替 admin 睡眠，这两个时长只放在 `AssumedDial` 和 `AssumedEgressCheck` 里。
 
-下线用 Delete，不用 `status=draining`。key 在即可路由，不依赖每个 L1 都正确过滤状态。两种写法的 etcd 写入次数相同，都是一次重拨两次写。
+下线用 Delete，不用 `status=draining`。key 在即可路由，不依赖每个 L1 都正确过滤状态。业务 key 仍是一次重拨删一次、写一次。`Drain` 另外用事务写 epoch 标记，成功注册后再按条件删掉，所以重拨路径上的 etcd 写大约翻倍（4000 台同时重拨时，这部分大约从 2.2 次/s 抬到 4.4 次/s），`Drain` 多一次往返。在线节点的 3s 续租不写这个标记。
 
 ### 8.3 L1 消费
 
@@ -499,7 +499,7 @@ Value：
 
 | 事项 | 决定 | 哪里改 |
 | --- | --- | --- |
-| 一次拨号加一次出口校验 | 合计约 5s，失败率低于 1%。规划上按拨号 4s、校验 1s。计划内重拨后外部出口必须变化，否则不注册。状态文件缺失时，只有调用方传入的 `prevEgress` 能挡住旧出口 | `AssumedDial`、`AssumedEgressCheck`、`AssumedRedialFailureRate`。`Ready` 的第二个参数 |
+| 一次拨号加一次出口校验 | 合计约 5s，失败率低于 1%。规划上按拨号 4s、校验 1s。计划内重拨后外部出口必须变化，否则不注册。状态文件缺失或损坏时按 drained 处理：`Report` 不能注册，必须先 `Ready`。文件缺失时，`Ready` 不传 `prevEgress` 仍会注册；调用方如果还知道旧出口，传进来才能挡住 | `AssumedDial`、`AssumedEgressCheck`、`AssumedRedialFailureRate`。`Ready` 的第二个参数 |
 | 巡检 | 每 1 分钟。检查访问外部是否正常，以及 CPU、内存是否正常。默认两类失败都摘掉 key，恢复后再写回。`Report` 的零值是健康 | `InspectionInterval`。故障用 `NetFault`、`CPUFault`、`MemFault`。外网巡检不可靠时设 `IgnoreAdminNetCheck`。资源异常不想摘除时把 `ResourceFaultAction` 设为 `ignore` |
 | 定期上报发往哪里 | 不外发，上报正文不写 etcd。L1 只读注册 value | `OnReport` 交给 admin 原有上报通道 |
 | 计划外掉线 | 节点是虚拟机，只有宿主机异常时才发生，而且很少。同一宿主机上的一批节点会一起过期。不因此改 TTL | `TTL` 10s，`RenewInterval` 3s。L1 要承受批量 DELETE，见 §8.3 |

@@ -18,6 +18,10 @@ const (
 	DefaultTTL = 10 * time.Second
 	// DefaultRenewInterval 是续租间隔。
 	DefaultRenewInterval = 3 * time.Second
+	// DefaultEpochTTL 是重拨标记自己的租期，比业务 lease 长。进程还在就续租；进程退出后标记最多再留这么久。
+	DefaultEpochTTL = 30 * time.Second
+	// DefaultEpochRenewInterval 是重拨标记的续租间隔。
+	DefaultEpochRenewInterval = 10 * time.Second
 	// DefaultProbeInterval 是 gost 探测间隔。
 	DefaultProbeInterval = time.Second
 	// DefaultProbeTimeout 是单次探测超时。
@@ -170,8 +174,12 @@ type Config struct {
 	ProbeRiseThreshold int
 	IPGuardInterval    time.Duration
 
-	TTL                  time.Duration
-	RenewInterval        time.Duration
+	TTL           time.Duration
+	RenewInterval time.Duration
+	// EpochTTL 是 /relay/l2-epoch/{nodeId} 的租期。它不挂在业务 lease 上，业务 lease 丢失时标记还在。
+	// 默认是业务 TTL 的 3 倍，且不少于 DefaultEpochTTL。进程退出后，别人要等这条租约到期才能在空窗里创建 key。
+	EpochTTL             time.Duration
+	EpochRenewInterval   time.Duration
 	OpTimeout            time.Duration
 	BackgroundTimeout    time.Duration
 	DrainAttempt         time.Duration
@@ -220,6 +228,8 @@ func DefaultConfig() Config {
 		IPGuardInterval:          DefaultIPGuardInterval,
 		TTL:                      DefaultTTL,
 		RenewInterval:            DefaultRenewInterval,
+		EpochTTL:                 DefaultEpochTTL,
+		EpochRenewInterval:       DefaultEpochRenewInterval,
 		OpTimeout:                DefaultOpTimeout,
 		BackgroundTimeout:        DefaultBackgroundTimeout,
 		DrainAttempt:             DefaultDrainAttempt,
@@ -273,6 +283,18 @@ func applyDefaults(c *Config) {
 	}
 	if c.RenewInterval == 0 {
 		c.RenewInterval = d.RenewInterval
+	}
+	if c.EpochTTL == 0 {
+		c.EpochTTL = c.TTL * 3
+		if c.EpochTTL < d.EpochTTL {
+			c.EpochTTL = d.EpochTTL
+		}
+	}
+	if c.EpochRenewInterval == 0 {
+		c.EpochRenewInterval = d.EpochRenewInterval
+		if c.EpochRenewInterval >= c.EpochTTL {
+			c.EpochRenewInterval = c.EpochTTL / 3
+		}
 	}
 	if c.OpTimeout == 0 {
 		c.OpTimeout = d.OpTimeout
@@ -356,6 +378,12 @@ func validate(c *Config) error {
 	}
 	if c.RenewInterval <= 0 || c.RenewInterval >= c.TTL {
 		return fmt.Errorf("%w: renew interval must be >0 and < ttl", ErrInvalidConfig)
+	}
+	if c.EpochTTL < time.Second || c.EpochTTL%time.Second != 0 || c.EpochTTL < c.TTL {
+		return fmt.Errorf("%w: epoch ttl must be whole seconds and >= ttl", ErrInvalidConfig)
+	}
+	if c.EpochRenewInterval <= 0 || c.EpochRenewInterval >= c.EpochTTL {
+		return fmt.Errorf("%w: epoch renew interval must be >0 and < epoch ttl", ErrInvalidConfig)
 	}
 	if c.DrainAttempt <= 0 || c.DrainBudget < c.DrainAttempt {
 		return fmt.Errorf("%w: drain budget", ErrInvalidConfig)

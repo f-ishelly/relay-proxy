@@ -59,11 +59,36 @@ func (r *Registrar) saveLocked() {
 		return
 	}
 	tmp := r.cfg.StateFile + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
 		r.event("state_err", "err", err.Error())
 		return
 	}
+	_, werr := f.Write(b)
+	if werr == nil {
+		werr = f.Sync()
+	}
+	cerr := f.Close()
+	if werr != nil {
+		r.event("state_err", "err", werr.Error())
+		return
+	}
+	if cerr != nil {
+		r.event("state_err", "err", cerr.Error())
+		return
+	}
 	if err := os.Rename(tmp, r.cfg.StateFile); err != nil {
+		r.event("state_err", "err", err.Error())
+		return
+	}
+	df, err := os.Open(dir)
+	if err != nil {
+		r.event("state_err", "err", err.Error())
+		return
+	}
+	err = df.Sync()
+	_ = df.Close()
+	if err != nil {
 		r.event("state_err", "err", err.Error())
 	}
 }

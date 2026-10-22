@@ -1014,6 +1014,13 @@ func TestCorruptStateRefusesUntilPrevConfirmed(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitUntil(t, 3*time.Second, func() bool { return again.Status().ProbeOK })
+	if err := again.Report(context.Background(), Report{EgressIP: "100.64.0.1"}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if _, _, _, ok := g.kv(again.key); ok {
+		t.Fatal("Report registered over a corrupt state file")
+	}
 	if err := again.Ready(context.Background(), "100.64.0.1", ""); !errors.Is(err, ErrEgressUnconfirmed) {
 		t.Fatalf("corrupt state err=%v", err)
 	}
@@ -1049,6 +1056,16 @@ func TestMissingStateFileLooksLikeFirstBoot(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitUntil(t, 3*time.Second, func() bool { return again.Status().ProbeOK })
+	if !again.Status().Drained {
+		t.Fatal("missing state file was not treated as drained")
+	}
+	if err := again.Report(context.Background(), Report{EgressIP: "100.64.0.1"}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if _, _, _, ok := g.kv(again.key); ok {
+		t.Fatal("Report registered when the state file was missing")
+	}
 	if err := again.Ready(context.Background(), "100.64.0.1", "100.64.0.1"); !errors.Is(err, ErrEgressUnchanged) {
 		t.Fatalf("caller prev err=%v", err)
 	}
@@ -1081,48 +1098,131 @@ func TestClientDeadlineReclaimsOwnLease(t *testing.T) {
 	if !ok || gotCreate != create || val.InstanceID == "" {
 		t.Fatalf("reclaim ok=%v lease %d->%d create %d->%d val=%+v", ok, lease, got, create, gotCreate, val)
 	}
+	if got == lease {
+		t.Fatalf("reclaim kept the old lease %d", lease)
+	}
 	if dels := g.w.since(t0, g.reg.key, "DELETE"); len(dels) != 0 {
 		t.Fatalf("reclaim deleted the key: %+v", dels)
+	}
+	ttl, err := leaseTTL(g.cli, lease)
+	if err == nil && ttl > 0 {
+		t.Fatalf("old lease %d still live ttl=%d", lease, ttl)
 	}
 }
 
 func TestCloneDoesNotRevokeOriginal(t *testing.T) {
-	g := newRig(t, 1, "626220", func(cfg *Config) { cfg.MachineID = "host-a" })
-	g.ready("100.64.0.1")
-	lease, create, _ := g.waitKey(true, 2*time.Second)
-	raw, err := os.ReadFile(g.reg.cfg.StateFile)
-	if err != nil {
-		t.Fatal(err)
+	startClone := func(t *testing.T, g *rig, raw []byte, tweak func(*Config, *diskState)) *Registrar {
+		t.Helper()
+		cfg := g.reg.cfg
+		cfg.StateFile = filepath.Join(t.TempDir(), "clone.json")
+		cfg.OnAlert = func(Alert) {}
+		var st diskState
+		if err := json.Unmarshal(raw, &st); err != nil {
+			t.Fatal(err)
+		}
+		if tweak != nil {
+			tweak(&cfg, &st)
+		}
+		b, err := json.Marshal(st)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(cfg.StateFile, b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		clone, err := New(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = clone.Stop(context.Background()) })
+		if err := clone.Start(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		return clone
 	}
-	alerts := make(chan Alert, 2)
-	cfg := g.reg.cfg
-	cfg.MachineID = "host-b"
-	cfg.StateFile = filepath.Join(t.TempDir(), "clone.json")
-	cfg.OnAlert = func(a Alert) { alerts <- a }
-	if err := os.WriteFile(cfg.StateFile, raw, 0o600); err != nil {
-		t.Fatal(err)
+	assertOriginal := func(t *testing.T, g *rig, lease, create int64) {
+		t.Helper()
+		time.Sleep(400 * time.Millisecond)
+		got, gotCreate, _, ok := g.kv(g.reg.key)
+		if !ok || got != lease || gotCreate != create {
+			t.Fatalf("clone revoked the original ok=%v lease %d->%d create %d->%d", ok, lease, got, create, gotCreate)
+		}
 	}
-	clone, err := New(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = clone.Stop(context.Background()) })
-	if err := clone.Start(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	time.Sleep(400 * time.Millisecond)
-	got, gotCreate, _, ok := g.kv(g.reg.key)
-	if !ok || got != lease || gotCreate != create {
-		t.Fatalf("clone revoked the original ok=%v lease %d->%d create %d->%d", ok, lease, got, create, gotCreate)
-	}
-	waitUntil(t, 3*time.Second, func() bool { return clone.Status().ProbeOK })
-	if err := clone.Ready(context.Background(), "100.64.0.1", ""); !errors.Is(err, ErrNodeConflict) {
-		t.Fatalf("clone ready err=%v", err)
-	}
-	got, gotCreate, _, ok = g.kv(g.reg.key)
-	if !ok || got != lease || gotCreate != create {
-		t.Fatalf("original changed after clone Ready ok=%v lease %d create %d", ok, got, gotCreate)
-	}
+
+	t.Run("different machine-id", func(t *testing.T) {
+		g := newRig(t, 1, "626220", func(cfg *Config) { cfg.MachineID = "host-a" })
+		g.ready("100.64.0.1")
+		lease, create, _ := g.waitKey(true, 2*time.Second)
+		raw, err := os.ReadFile(g.reg.cfg.StateFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		clone := startClone(t, g, raw, func(cfg *Config, st *diskState) {
+			cfg.MachineID = "host-b"
+		})
+		assertOriginal(t, g, lease, create)
+		waitUntil(t, 3*time.Second, func() bool { return clone.Status().ProbeOK })
+		if err := clone.Ready(context.Background(), "100.64.0.1", ""); !errors.Is(err, ErrNodeConflict) {
+			t.Fatalf("clone ready err=%v", err)
+		}
+		assertOriginal(t, g, lease, create)
+	})
+
+	t.Run("cloned machine-id different local ip", func(t *testing.T) {
+		g := newRig(t, 1, "626220", func(cfg *Config) { cfg.MachineID = "host-a" })
+		g.ready("100.64.0.1")
+		lease, create, _ := g.waitKey(true, 2*time.Second)
+		raw, err := os.ReadFile(g.reg.cfg.StateFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		clone := startClone(t, g, raw, func(cfg *Config, st *diskState) {
+			cfg.MachineID = "host-a"
+			cfg.LocalIP = func() string { return "100.64.9.9" }
+			cfg.IntranetAddr = "10.9.9.9:8080"
+			cfg.ProxyPort = 8080
+		})
+		assertOriginal(t, g, lease, create)
+		waitUntil(t, 3*time.Second, func() bool { return clone.Status().ProbeOK })
+		if err := clone.Ready(context.Background(), "100.64.9.9", ""); !errors.Is(err, ErrNodeConflict) {
+			t.Fatalf("clone ready err=%v", err)
+		}
+		assertOriginal(t, g, lease, create)
+	})
+
+	t.Run("empty machine-id", func(t *testing.T) {
+		g := newRig(t, 1, "626220", func(cfg *Config) { cfg.MachineID = "host-a" })
+		g.ready("100.64.0.1")
+		lease, create, _ := g.waitKey(true, 2*time.Second)
+		raw, err := os.ReadFile(g.reg.cfg.StateFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		clone := startClone(t, g, raw, func(cfg *Config, st *diskState) {
+			cfg.MachineID = "host-a"
+			st.MachineID = ""
+			cfg.LocalIP = func() string { return "100.64.9.9" }
+		})
+		assertOriginal(t, g, lease, create)
+		_ = clone
+	})
+
+	t.Run("empty instance-id", func(t *testing.T) {
+		g := newRig(t, 1, "626220", func(cfg *Config) { cfg.MachineID = "host-a" })
+		g.ready("100.64.0.1")
+		lease, create, _ := g.waitKey(true, 2*time.Second)
+		raw, err := os.ReadFile(g.reg.cfg.StateFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		clone := startClone(t, g, raw, func(cfg *Config, st *diskState) {
+			cfg.MachineID = "host-a"
+			st.InstanceID = ""
+			cfg.LocalIP = func() string { return "100.64.9.9" }
+		})
+		assertOriginal(t, g, lease, create)
+		_ = clone
+	})
 }
 
 func TestDrainEpochBlocksOtherInstance(t *testing.T) {
@@ -1178,6 +1278,161 @@ func TestDrainEpochBlocksOtherInstance(t *testing.T) {
 	cancel()
 	if err != nil || len(resp.Kvs) != 0 {
 		t.Fatalf("epoch left behind err=%v n=%d", err, len(resp.Kvs))
+	}
+}
+
+func TestDuplicateDrainDoesNotOverwriteEpoch(t *testing.T) {
+	g := newRig(t, 1, "626220", func(cfg *Config) { cfg.MachineID = "host-a" })
+	g.ready("100.64.0.1")
+	g.waitKey(true, 2*time.Second)
+	if err := g.reg.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	resp, err := g.cli.Get(ctx, EpochKey("626220"))
+	cancel()
+	if err != nil || len(resp.Kvs) != 1 {
+		t.Fatalf("epoch missing err=%v n=%d", err, len(resp.Kvs))
+	}
+	original := string(resp.Kvs[0].Value)
+	mainLease := g.reg.Status().LeaseID
+	if resp.Kvs[0].Lease == 0 || resp.Kvs[0].Lease == mainLease {
+		t.Fatalf("epoch lease %d should be its own lease, not the main lease %d", resp.Kvs[0].Lease, mainLease)
+	}
+
+	cfg := g.reg.cfg
+	cfg.MachineID = "host-b"
+	cfg.StateFile = filepath.Join(t.TempDir(), "other.json")
+	other, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = other.Stop(context.Background()) })
+	if err := other.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, 3*time.Second, func() bool { return other.Status().ProbeOK })
+	if err := other.Drain(context.Background()); !errors.Is(err, ErrNodeConflict) {
+		t.Fatalf("duplicate drain err=%v", err)
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), 2*time.Second)
+	resp, err = g.cli.Get(ctx, EpochKey("626220"))
+	cancel()
+	if err != nil || len(resp.Kvs) != 1 || string(resp.Kvs[0].Value) != original {
+		n := 0
+		got := ""
+		if resp != nil {
+			n = len(resp.Kvs)
+			if n == 1 {
+				got = string(resp.Kvs[0].Value)
+			}
+		}
+		t.Fatalf("epoch overwritten err=%v n=%d got=%s want=%s", err, n, got, original)
+	}
+	if err := other.Ready(context.Background(), "100.64.0.1", "100.64.0.9"); !errors.Is(err, ErrNodeConflict) {
+		t.Fatalf("duplicate ready err=%v", err)
+	}
+	if _, _, _, ok := g.kv(g.reg.key); ok {
+		t.Fatal("duplicate instance registered after its own drain")
+	}
+}
+
+func TestEpochSurvivesMainLeaseLossWhileDrained(t *testing.T) {
+	g := newRig(t, 1, "626220", func(cfg *Config) { cfg.MachineID = "host-a" })
+	g.ready("100.64.0.1")
+	mainLease, _, _ := g.waitKey(true, 2*time.Second)
+	if err := g.reg.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	g.reg.mu.Lock()
+	g.reg.loseLeaseLocked(errors.New("client deadline"))
+	g.reg.mu.Unlock()
+	time.Sleep(400 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	resp, err := g.cli.Get(ctx, EpochKey("626220"))
+	cancel()
+	if err != nil || len(resp.Kvs) != 1 {
+		t.Fatalf("epoch gone with the main lease err=%v n=%d", err, len(resp.Kvs))
+	}
+	var ev epochValue
+	if err := json.Unmarshal(resp.Kvs[0].Value, &ev); err != nil || ev.InstanceID == "" {
+		t.Fatalf("epoch value %s err=%v", resp.Kvs[0].Value, err)
+	}
+	if resp.Kvs[0].Lease == mainLease {
+		t.Fatalf("epoch still attached to the lost main lease %d", mainLease)
+	}
+	ttl, err := leaseTTL(g.cli, resp.Kvs[0].Lease)
+	if err != nil || ttl <= 0 {
+		t.Fatalf("epoch lease not live ttl=%d err=%v", ttl, err)
+	}
+
+	cfg := g.reg.cfg
+	cfg.MachineID = "host-b"
+	cfg.StateFile = filepath.Join(t.TempDir(), "other.json")
+	other, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = other.Stop(context.Background()) })
+	if err := other.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, 3*time.Second, func() bool { return other.Status().ProbeOK })
+	if err := other.Ready(context.Background(), "100.64.0.1", ""); !errors.Is(err, ErrNodeConflict) {
+		t.Fatalf("takeover after main lease loss err=%v", err)
+	}
+	if _, _, _, ok := g.kv(g.reg.key); ok {
+		t.Fatal("other instance registered while the epoch survived")
+	}
+	g.ip.set("100.64.0.2")
+	if err := g.reg.Ready(context.Background(), "100.64.0.2", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, val, ok := g.kv(g.reg.key); !ok || val.EgressIP != "100.64.0.2" || val.InstanceID != ev.InstanceID {
+		t.Fatalf("owner return ok=%v val=%+v instance=%s", ok, val, ev.InstanceID)
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), 2*time.Second)
+	resp, err = g.cli.Get(ctx, EpochKey("626220"))
+	cancel()
+	if err != nil || len(resp.Kvs) != 0 {
+		t.Fatalf("epoch left behind err=%v n=%d", err, len(resp.Kvs))
+	}
+}
+
+func TestReportSkipsRegistrationAfterLostState(t *testing.T) {
+	g := newRig(t, 1, "626220", nil)
+	g.ready("100.64.0.1")
+	g.waitKey(true, 2*time.Second)
+	if err := g.reg.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	g.reg.abandon()
+	if err := os.Remove(g.reg.cfg.StateFile); err != nil {
+		t.Fatal(err)
+	}
+	again, err := New(g.reg.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = again.Stop(context.Background()) })
+	if err := again.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, 3*time.Second, func() bool { return again.Status().ProbeOK })
+	if err := again.Report(context.Background(), Report{EgressIP: "100.64.0.1"}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if _, _, _, ok := g.kv(again.key); ok {
+		t.Fatal("Report re-registered the old egress after the state file was lost")
+	}
+	// 状态文件丢了，实例身份也丢了。上一任 Drain 留下的标记还在，Ready 也不能把旧空窗抢走。
+	g.ip.set("100.64.0.8")
+	if err := again.Ready(context.Background(), "100.64.0.8", "100.64.0.1"); !errors.Is(err, ErrNodeConflict) {
+		t.Fatalf("ready while foreign epoch present err=%v", err)
+	}
+	if _, _, _, ok := g.kv(again.key); ok {
+		t.Fatal("Ready wrote a key over a live epoch after the state file was lost")
 	}
 }
 
