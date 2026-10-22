@@ -516,7 +516,7 @@ Value：
 
 ### 8.5 本仓库里怎么验证
 
-`go test ./registrar/` 用内嵌 etcd 覆盖验收里的计划内重拨、重拨后出口 IP 没变时不注册、校验失败与崩溃恢复、未 `Drain` 的地址变化、gost 挂死与外网/资源巡检失败、切主时在线节点不删 key 且 `Drain` 在 3s 内完成、进程消失后的 TTL / 切主上限，以及 nodeId 冲突。压测入口是 `cmd/loadgen` 和 `scripts/loadtest.sh`：本进程拉起 3 个 etcd 成员。每台逻辑主机是一个 `registrar` 实例，客户端配置全部成员，注册后调用 `Drain` 再 `Ready`，然后才切主。续租次数来自 registrar 自己的续租循环。Watch DELETE 次数等于这次 `Drain` 的次数；多出来的 DELETE 才是 lease 过期。最近一次验收 5、验收 7 的输出在 `docs/acceptance/`。
+`go test ./registrar/` 用内嵌 etcd 覆盖验收里的计划内重拨、重拨后出口 IP 没变时不注册、校验失败与崩溃恢复、未 `Drain` 的地址变化、gost 挂死与外网/资源巡检失败、切主时在线节点不删 key 且 `Drain` 在 3s 内完成、进程消失后的 TTL / 切主上限，以及 nodeId 冲突。压测入口是 `cmd/loadgen` 和 `scripts/loadtest.sh`：本进程拉起 3 个 etcd 成员。每台逻辑主机是一个 `registrar` 实例，客户端配置全部成员，注册后调用 `Drain` 再 `Ready`，然后才切主。续租次数来自 registrar 自己的续租循环，所以不会正好是主机数乘一个固定次数。Watch DELETE 次数等于这次 `Drain` 的次数；多出来的 DELETE 才是 lease 过期。4000 台如果同一瞬间 `Drain`，内嵌 etcd 会来不及在 10s TTL 内响应，而 `Drain` 持有锁时续不了租。loadgen 默认同时只进行 64 路 `Drain`+`Ready`（`-redial-inflight`）。这是压测调度，不是 registrar 的限制。最近一次验收 5、验收 7 的输出在 `docs/acceptance/`。
 
 ---
 

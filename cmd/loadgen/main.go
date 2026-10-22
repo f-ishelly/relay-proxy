@@ -31,6 +31,7 @@ func main() {
 	keep := flag.Duration("keep", 20*time.Second, "全部重拨完成并切主之后，继续让 registrar 续租这么久")
 	killAfter := flag.Duration("kill-after", 0, "全部重拨完成后，再等这么久杀掉 leader；0 表示不杀")
 	registerTimeout := flag.Duration("register-timeout", 60*time.Second, "等待全部 Ready，以及之后全部 Drain+Ready 的上限")
+	redialInflight := flag.Int("redial-inflight", 64, "同时进行 Drain+Ready 的 registrar 数，避免 4000 路一起把 etcd 打满导致 TTL 内续不上租")
 	endpoints := flag.String("endpoints", "", "逗号分隔的成员；为空且 -embed 时在本进程拉起 3 节点")
 	embedCluster := flag.Bool("embed", true, "在本进程启动 3 节点 etcd")
 	label := flag.String("label", "load", "")
@@ -89,6 +90,10 @@ func main() {
 
 	var registered, readyErr, drainOK, drainErr atomic.Int64
 	redialStart := make(chan struct{})
+	if *redialInflight < 1 {
+		*redialInflight = 1
+	}
+	drainSem := make(chan struct{}, *redialInflight)
 	regs := make([]*registrar.Registrar, *hosts)
 	perHost := make([]*hostLog, *hosts)
 	var wg sync.WaitGroup
@@ -161,10 +166,16 @@ func main() {
 				return
 			case <-redialStart:
 			}
+			select {
+			case <-ctx.Done():
+				return
+			case drainSem <- struct{}{}:
+			}
 			dctx, dcancel := context.WithTimeout(context.Background(), 8*time.Second)
 			err = reg.Drain(dctx)
 			dcancel()
 			if err != nil {
+				<-drainSem
 				drainErr.Add(1)
 				return
 			}
@@ -173,9 +184,11 @@ func main() {
 			err = reg.Ready(rctx, ip2, ip1)
 			rcancel()
 			if err != nil {
+				<-drainSem
 				drainErr.Add(1)
 				return
 			}
+			<-drainSem
 			drainOK.Add(1)
 		}(i)
 	}
@@ -235,6 +248,7 @@ func main() {
 		"hosts":                *hosts,
 		"conns_flag":           *conns,
 		"registrar_clients":    *hosts,
+		"redial_inflight":      *redialInflight,
 		"client_mode":          "registrar",
 		"endpoints":            len(eps),
 		"ttl_s":                *ttl,
