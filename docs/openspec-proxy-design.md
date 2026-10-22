@@ -183,7 +183,7 @@ sequenceDiagram
     T-->>U: TLS ServerHello 及后续记录（经 L2、L1 原样返回）
 ```
 
-L1 必须先收到 L2 的 `200`（L2 已经与目标完成 TCP 握手），再向客户端回 `200`。在此之前客户端不应发出 ClientHello。L2 的非 2xx 或拨号失败由 L1 转为对客户端的 `502`，隧道字节不会开始传输。
+L1 必须先收到 L2 的 `200`（L2 已经与目标完成 TCP 握手），再向客户端回 `200`。在此之前客户端不应发出 ClientHello。客户端口令为空或不匹配时，L1 直接回 `407`，不拨 L2。目标不是 `host:port`（缺少端口），或用户名里没有 `node_id`，回 `400`。L2 返回 `407` 时，L1 把 `407` 和 `Proxy-Authenticate` 交给客户端，不改写成 `502`。L2 的其他非 2xx、应答超时或拨号失败才转为 `502`。这些失败路径上都不会开始传输隧道字节。
 
 ### 5.2 流程图（路由决策）
 
@@ -193,16 +193,19 @@ flowchart TD
     B -- 否 --> X[返回 407]
     B -- 是 --> C[解析 username]
     C --> D{是否包含 node_id}
-    D -- 否 --> Y[返回 400 或默认路由池]
-    D -- 是 --> E{本地缓存是否有可用节点}
+    D -- 否 --> Y[返回 400]
+    D -- 是 --> T{target 是否为 host:port}
+    T -- 否 --> Y
+    T -- 是 --> E{本地缓存是否有可用节点}
     E -- 否 --> F[从 etcd 拉取并刷新缓存]
     F --> G{节点可用?}
     E -- 是 --> G
     G -- 否 --> Z[返回 502]
     G -- 是 --> H[向 L2 发送 CONNECT 并等待应答]
-    H --> J{L2 是否返回 200}
-    J -- 否 --> Z
-    J -- 是 --> K[向客户端返回 200]
+    H --> J{L2 状态码}
+    J -- 200 --> K[向客户端返回 200]
+    J -- 407 --> X
+    J -- 其他或超时 --> Z
     K --> I[双向原样转发并记录指标]
 ```
 
@@ -308,20 +311,42 @@ flowchart TD
 
 ## 10. Go 使用示例（一级代理核心逻辑）
 
-下面是 L1 在共享口令校验通过之后的 CONNECT 数据面。它向 L2 发第二次 `CONNECT`，`Proxy-Authorization` 使用客户端提交的同一组用户名和密码，确认 `200` 后才应答客户端，并以字节方式拼接两侧连接。解析节点、拨号 L2、读取 L2 应答失败或 L2 返回非 `200` 时，函数先向客户端写 `502`（见 §5.1），再返回错误。出口网段拒绝在 L2 解析之后做，不在本函数里。示例不包含 etcd。涉及 `bufio`、`fmt`、`net`、`net/http`、`encoding/base64`、`io`、`strconv`、`strings`、`time`。
+下面是 L1 处理 CONNECT 的数据面，共享口令校验就在这个函数里完成。口令先做 SHA-256，再用 `subtle.ConstantTimeCompare` 与全系统共享口令比较；为空或不匹配时直接回 `407`，不拨 L2。用户名以最后一个 `@` 切分，`node_id` 是它后面的那一段，因此用户名本身可以含 `@`。目标不是 `host:port`，或切不出 `node_id`，回 `400`。通过后再向 L2 发第二次 `CONNECT`，`Proxy-Authorization` 使用客户端提交的同一组用户名和密码。读取 L2 应答带有截止时间，读完无论成败都清掉，避免静默的 L2 占住 goroutine 和文件描述符。L2 返回 `407` 时，连同 `Proxy-Authenticate` 交给客户端；解析节点、拨号、读应答失败，以及除 `200`/`407` 以外的状态，先写 `502` 再返回错误（见 §5.1）。确认 `200` 后才应答客户端。之后两个方向各自拷贝：某一方向读到 EOF 只对对端 `CloseWrite`，两个方向都结束后再完全关闭。出口网段拒绝在 L2 解析之后做，不在本函数里。示例不包含 etcd。涉及 `bufio`、`crypto/sha256`、`crypto/subtle`、`encoding/base64`、`fmt`、`io`、`net`、`net/http`、`strconv`、`strings`、`time`。
 
 ```go
 type Resolver interface {
     Resolve(nodeID string) (addr string, err error)
 }
 
-// username 格式示例: appuser@node-az01-003
+// sharedSecret 是全系统那一份共享口令，与客户端登录 L1 以及 L2 的 auth.password 相同。
+// 生产环境从配置注入；示例写成常量。
+var sharedSecret = "s3cret"
+
+// l2ResponseTimeout 限制等待 L2 CONNECT 状态行的时间。TCP 已连通但 L2 不回答时，
+// 没有这个截止时间，读会一直阻塞，goroutine 和文件描述符都退不掉。
+// 读完应答后必须清掉，后面的隧道拷贝不再受它限制。
+// 示例取 2s，与一次建连等待同一量级；源站拨号较慢时再调大。
+const l2ResponseTimeout = 2 * time.Second
+
+// username 格式示例: appuser@node-az01-003。
+// node_id 取最后一个 '@' 之后的部分，用户名本身可以含 '@'（例如 user@corp@node1 → node1）。
 func parseNodeID(username string) (user string, nodeID string, err error) {
-    parts := strings.Split(username, "@")
-    if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+    i := strings.LastIndex(username, "@")
+    if i <= 0 || i == len(username)-1 {
         return "", "", fmt.Errorf("invalid username format")
     }
-    return parts[0], parts[1], nil
+    user, nodeID = username[:i], username[i+1:]
+    if strings.ContainsAny(nodeID, " \r\n/") {
+        return "", "", fmt.Errorf("invalid username format")
+    }
+    return user, nodeID, nil
+}
+
+// sharedPasswordOK 先哈希再比较，避免口令长度不同时 ConstantTimeCompare 直接返回。
+func sharedPasswordOK(password string) bool {
+    got := sha256.Sum256([]byte(password))
+    want := sha256.Sum256([]byte(sharedSecret))
+    return subtle.ConstantTimeCompare(got[:], want[:]) == 1
 }
 
 // target 为客户端 CONNECT 的 authority，形如 host:port；IPv6 字面量保留方括号。
@@ -329,26 +354,41 @@ func parseNodeID(username string) (user string, nodeID string, err error) {
 func handleConnect(clientConn net.Conn, username, password, target string, resolver Resolver) error {
     defer clientConn.Close()
 
-    // L2 相关的失败统一对客户端回 502（见 §5.1），隧道字节此时尚未开始传输。
-    badGateway := func(err error) error {
-        _, _ = io.WriteString(clientConn, "HTTP/1.1 502 Bad Gateway\r\n\r\n")
+    // 隧道字节还没开始。400 / 407 / 502 都在这里写回客户端（见 §5.1、§5.2）。
+    reply := func(status int, reason, header string, err error) error {
+        msg := fmt.Sprintf("HTTP/1.1 %d %s\r\n", status, reason)
+        if header != "" {
+            msg += header + "\r\n"
+        }
+        msg += "\r\n"
+        _, _ = io.WriteString(clientConn, msg)
         return err
+    }
+    badGateway := func(err error) error {
+        return reply(http.StatusBadGateway, "Bad Gateway", "", err)
+    }
+
+    if strings.ContainsAny(username, "\r\n") || strings.ContainsAny(password, "\r\n") {
+        return reply(http.StatusBadRequest, "Bad Request", "", fmt.Errorf("invalid credential"))
+    }
+    if !sharedPasswordOK(password) {
+        return reply(http.StatusProxyAuthRequired, "Proxy Authentication Required",
+            `Proxy-Authenticate: Basic realm="relay"`, fmt.Errorf("invalid credential"))
+    }
+
+    _, nodeID, err := parseNodeID(username)
+    if err != nil {
+        return reply(http.StatusBadRequest, "Bad Request", "", err)
     }
 
     host, port, err := net.SplitHostPort(target)
     if err != nil || host == "" || strings.ContainsAny(host, " \r\n/") {
-        return fmt.Errorf("invalid connect target")
+        return reply(http.StatusBadRequest, "Bad Request", "", fmt.Errorf("invalid connect target"))
     }
     if _, err := strconv.Atoi(port); err != nil {
-        return fmt.Errorf("invalid connect target")
+        return reply(http.StatusBadRequest, "Bad Request", "", fmt.Errorf("invalid connect target"))
     }
-    if password == "" || strings.ContainsAny(username, "\r\n") || strings.ContainsAny(password, "\r\n") {
-        return fmt.Errorf("invalid credential")
-    }
-    _, nodeID, err := parseNodeID(username)
-    if err != nil {
-        return err
-    }
+
     upstreamAddr, err := resolver.Resolve(nodeID)
     if err != nil {
         return badGateway(fmt.Errorf("resolve node %s failed: %w", nodeID, err))
@@ -365,13 +405,27 @@ func handleConnect(clientConn net.Conn, username, password, target string, resol
         "Host: " + target + "\r\n" +
         "Proxy-Authorization: Basic " + token + "\r\n\r\n"
     if _, err := upstreamConn.Write([]byte(req)); err != nil {
-        return err
+        return badGateway(err)
     }
 
+    if err := upstreamConn.SetReadDeadline(time.Now().Add(l2ResponseTimeout)); err != nil {
+        return badGateway(err)
+    }
     br := bufio.NewReader(upstreamConn)
-    code, err := readConnectStatus(br)
+    code, proxyAuthenticate, err := readConnectStatus(br)
+    if clearErr := upstreamConn.SetReadDeadline(time.Time{}); clearErr != nil && err == nil {
+        err = clearErr
+    }
     if err != nil {
         return badGateway(err)
+    }
+    if code == http.StatusProxyAuthRequired {
+        challenge := proxyAuthenticate
+        if challenge == "" || strings.ContainsAny(challenge, "\r\n") {
+            challenge = `Basic realm="relay"`
+        }
+        return reply(http.StatusProxyAuthRequired, "Proxy Authentication Required",
+            "Proxy-Authenticate: "+challenge, fmt.Errorf("l2 connect status 407"))
     }
     if code != http.StatusOK {
         return badGateway(fmt.Errorf("l2 connect status %d", code))
@@ -383,45 +437,63 @@ func handleConnect(clientConn net.Conn, username, password, target string, resol
 
     // br 可能已经缓冲了与 200 粘在一起的后续字节，转发必须从 br 读，不能另起一次 net.Conn 读。
     // 从这里开始不再解析 HTTP，也不建立 TLS。io.Copy 会保持字节内容；是否换成 splice 不影响 JA3/JA4。
+    // 某一方向读到 EOF 时只 CloseWrite 对端，让对端把已经缓冲的响应写回来；两个方向都结束后再由 defer 完全关闭。
     errc := make(chan error, 2)
     go func() {
         _, copyErr := io.Copy(upstreamConn, clientConn)
+        closeWrite(upstreamConn)
         errc <- copyErr
     }()
     go func() {
         _, copyErr := io.Copy(clientConn, br)
+        closeWrite(clientConn)
         errc <- copyErr
     }()
-    first := <-errc
-    clientConn.Close()
-    upstreamConn.Close()
-    <-errc
-    return first
+    err1 := <-errc
+    err2 := <-errc
+    if err1 != nil {
+        return err1
+    }
+    return err2
 }
 
-func readConnectStatus(r *bufio.Reader) (int, error) {
+// closeWrite 关闭写端，使对端读到 EOF，同时保留本端读端。不是 TCP 连接时退化为完全关闭。
+func closeWrite(conn net.Conn) {
+    if cw, ok := conn.(interface{ CloseWrite() error }); ok {
+        _ = cw.CloseWrite()
+        return
+    }
+    _ = conn.Close()
+}
+
+func readConnectStatus(r *bufio.Reader) (int, string, error) {
     line, err := r.ReadString('\n')
     if err != nil {
-        return 0, err
+        return 0, "", err
     }
     parts := strings.SplitN(strings.TrimSpace(line), " ", 3)
     if len(parts) < 2 {
-        return 0, fmt.Errorf("bad status line")
+        return 0, "", fmt.Errorf("bad status line")
     }
     code, err := strconv.Atoi(parts[1])
     if err != nil {
-        return 0, err
+        return 0, "", err
     }
+    var proxyAuthenticate string
     for i := 0; i < 64; i++ {
         line, err = r.ReadString('\n')
         if err != nil {
-            return 0, err
+            return 0, "", err
         }
         if line == "\r\n" || line == "\n" {
-            return code, nil
+            return code, proxyAuthenticate, nil
+        }
+        key, val, ok := strings.Cut(strings.TrimRight(line, "\r\n"), ":")
+        if ok && proxyAuthenticate == "" && strings.EqualFold(strings.TrimSpace(key), "Proxy-Authenticate") {
+            proxyAuthenticate = strings.TrimSpace(val)
         }
     }
-    return 0, fmt.Errorf("l2 response headers too long")
+    return 0, "", fmt.Errorf("l2 response headers too long")
 }
 ```
 
