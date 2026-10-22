@@ -12,6 +12,8 @@ import (
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func TestJitterBeforeDrainZeroAndCancel(t *testing.T) {
@@ -403,5 +405,175 @@ func delayStream(d time.Duration) grpc.StreamClientInterceptor {
 			return nil, err
 		}
 		return streamer(ctx, desc, cc, method, opts...)
+	}
+}
+
+func TestNotPrimaryLessorIsRetryableText(t *testing.T) {
+	if !notPrimaryLessor(status.Error(codes.Unknown, "not a primary lessor")) {
+		t.Fatal("missing not a primary lessor")
+	}
+	if !notPrimaryLessor(status.Error(codes.Unavailable, "etcdserver: leader changed")) {
+		t.Fatal("missing leader changed")
+	}
+	if notPrimaryLessor(status.Error(codes.NotFound, "etcdserver: requested lease not found")) {
+		t.Fatal("lease not found matched the handoff check")
+	}
+	if notPrimaryLessor(nil) {
+		t.Fatal("nil")
+	}
+}
+
+// KeepAlive 被拦截成 etcd 的 not a primary lessor，并且本地 deadline 已经过了。
+// TimeToLive 仍看到 TTL>0 时，不能 lease_lost，业务 lease id 保持不变，恢复后续租还能成功。
+func TestNotPrimaryPastDeadlineKeepsLiveLease(t *testing.T) {
+	var failKA atomic.Bool
+	var ttlCalls atomic.Int64
+	g := newNotPrimaryRig(t, &failKA, nil, &ttlCalls)
+	g.ready("100.64.0.1")
+	g.waitKey(true, 5*time.Second)
+	lease := g.reg.Status().LeaseID
+	if lease == 0 {
+		t.Fatal("no business lease")
+	}
+	baseTTL := ttlCalls.Load()
+	baseOK := g.log.count("ka_ok")
+	failKA.Store(true)
+	forceDeadlinesUntil(t, g.reg, 8*time.Second, func() bool {
+		return ttlCalls.Load() > baseTTL && g.log.has("ka_err")
+	})
+	if g.log.has("lease_lost") {
+		t.Fatal("live lease declared lost on not a primary lessor")
+	}
+	if got := g.reg.Status().LeaseID; got != lease {
+		t.Fatalf("lease id %d -> %d", lease, got)
+	}
+	if ttlCalls.Load() <= baseTTL {
+		t.Fatal("TimeToLive was not called")
+	}
+	failKA.Store(false)
+	g.reg.renewMu.Lock()
+	g.reg.bizDue = time.Now().Add(-time.Millisecond)
+	g.reg.epDue = time.Now().Add(-time.Millisecond)
+	g.reg.renewMu.Unlock()
+	waitUntil(t, 5*time.Second, func() bool { return g.log.count("ka_ok") > baseOK })
+	if g.log.has("lease_lost") {
+		t.Fatal("lease lost after keepalive recovered")
+	}
+	if got := g.reg.Status().LeaseID; got != lease {
+		t.Fatalf("lease id after recover %d -> %d", lease, got)
+	}
+	got, _, _, ok := g.kv(g.reg.key)
+	if !ok || got != lease {
+		t.Fatalf("key lease=%d ok=%v want %d", got, ok, lease)
+	}
+}
+
+// 租约已经被撤销。KeepAlive 仍只返回 not a primary lessor，本地 deadline 已过。
+// TimeToLive 看到 not found 之后才允许 lease_lost。
+func TestNotPrimaryPastDeadlineLosesRevokedLease(t *testing.T) {
+	var failKA atomic.Bool
+	var ttlCalls atomic.Int64
+	g := newNotPrimaryRig(t, &failKA, nil, &ttlCalls)
+	g.ready("100.64.0.1")
+	g.waitKey(true, 5*time.Second)
+	lease := g.reg.Status().LeaseID
+	if lease == 0 {
+		t.Fatal("no business lease")
+	}
+	baseTTL := ttlCalls.Load()
+	failKA.Store(true)
+	// 先等到拦截生效，再撤销。否则正在飞的那次真实 KeepAlive 会直接看到 not found，
+	// 丢失通知就绕过了 TimeToLive。
+	waitUntil(t, 5*time.Second, func() bool { return g.log.has("ka_err") })
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	_, err := g.cli.Revoke(ctx, clientv3.LeaseID(lease))
+	cancel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	forceDeadlinesUntil(t, g.reg, 8*time.Second, func() bool {
+		return g.log.has("lease_lost") && ttlCalls.Load() > baseTTL
+	})
+	if ttlCalls.Load() <= baseTTL {
+		t.Fatal("lease_lost without TimeToLive")
+	}
+	ttl, err := leaseTTL(g.cli, lease)
+	if err == nil && ttl > 0 {
+		t.Fatalf("revoked lease %d still live ttl=%d", lease, ttl)
+	}
+}
+
+// TimeToLive 自己也返回 not a primary lessor。本地 deadline 已过也不能 lease_lost。
+func TestNotPrimaryProbeFailureDoesNotLoseLease(t *testing.T) {
+	var failKA atomic.Bool
+	var failTTL atomic.Bool
+	var ttlCalls atomic.Int64
+	g := newNotPrimaryRig(t, &failKA, &failTTL, &ttlCalls)
+	g.ready("100.64.0.1")
+	g.waitKey(true, 5*time.Second)
+	lease := g.reg.Status().LeaseID
+	if lease == 0 {
+		t.Fatal("no business lease")
+	}
+	baseTTL := ttlCalls.Load()
+	failKA.Store(true)
+	failTTL.Store(true)
+	forceDeadlinesUntil(t, g.reg, 8*time.Second, func() bool {
+		return ttlCalls.Load() > baseTTL && g.log.has("ka_err")
+	})
+	if g.log.has("lease_lost") {
+		t.Fatal("probe failure declared the lease lost")
+	}
+	if got := g.reg.Status().LeaseID; got != lease {
+		t.Fatalf("lease id %d -> %d", lease, got)
+	}
+	got, _, _, ok := g.kv(g.reg.key)
+	if !ok || got != lease {
+		t.Fatalf("key lease=%d ok=%v want %d", got, ok, lease)
+	}
+}
+
+func newNotPrimaryRig(t *testing.T, failKA, failTTL *atomic.Bool, ttlCalls *atomic.Int64) *rig {
+	t.Helper()
+	return newRig(t, 1, "626220", func(cfg *Config) {
+		cfg.MachineID = "host-a"
+		cfg.TTL = 30 * time.Second
+		cfg.RenewInterval = time.Second
+		cfg.DialOptions = []grpc.DialOption{
+			grpc.WithChainUnaryInterceptor(func(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+				if strings.Contains(method, "LeaseTimeToLive") {
+					ttlCalls.Add(1)
+					if failTTL != nil && failTTL.Load() {
+						return status.Error(codes.Unknown, "not a primary lessor")
+					}
+				}
+				return invoker(ctx, method, req, reply, cc, opts...)
+			}),
+			grpc.WithChainStreamInterceptor(func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+				if failKA.Load() && strings.Contains(method, "LeaseKeepAlive") {
+					return nil, status.Error(codes.Unknown, "not a primary lessor")
+				}
+				return streamer(ctx, desc, cc, method, opts...)
+			}),
+		}
+	})
+}
+
+func forceDeadlinesUntil(t *testing.T, r *Registrar, d time.Duration, done func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if done() {
+			return
+		}
+		past := time.Now().Add(-time.Second)
+		r.renewMu.Lock()
+		r.bizDead, r.bizDue = past, past
+		r.epDead, r.epDue = past, past
+		r.renewMu.Unlock()
+		time.Sleep(30 * time.Millisecond)
+	}
+	if !done() {
+		t.Fatal("condition not met")
 	}
 }

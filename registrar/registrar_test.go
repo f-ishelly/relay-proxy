@@ -179,14 +179,19 @@ func (l *memLog) Event(ev string, args ...any) {
 }
 
 func (l *memLog) has(ev string) bool {
+	return l.count(ev) > 0
+}
+
+func (l *memLog) count(ev string) int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	n := 0
 	for _, x := range l.lines {
 		if x == ev {
-			return true
+			n++
 		}
 	}
-	return false
+	return n
 }
 
 type watchEv struct {

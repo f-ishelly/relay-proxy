@@ -6,6 +6,7 @@ import (
 	"errors"
 	"math/big"
 	mrand "math/rand"
+	"strings"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -224,53 +225,154 @@ func (r *Registrar) renewIndependent(epoch bool) {
 		}
 		return
 	}
-	lost := leaseMissing(err) || (err == nil && (resp == nil || resp.TTL <= 0)) || time.Now().After(dead)
-	if lost {
-		// 不把 pub id 清掉。Drain 可能正占着 opMu，处理函数要等它结束；
-		// 这段时间里必须继续 KeepAliveOnce，否则一次超时就会把还活着的 lease 饿死。
-		r.renewMu.Lock()
-		var gen int64
-		if r.pubID(epoch) == id {
-			retry := time.Now().Add(200 * time.Millisecond)
-			if epoch {
-				r.epDue = retry
-				gen = r.epGen.Load()
-			} else {
-				r.bizDue = retry
-				gen = r.bizGen.Load()
-			}
-		} else {
-			r.renewMu.Unlock()
+	// 租约已经不在（KeepAliveOnce 把 TTL<=0 收成 ErrLeaseNotFound）。这才是丢失。
+	if leaseMissing(err) || (err == nil && (resp == nil || resp.TTL <= 0)) {
+		r.queueLoss(epoch, id, err)
+		return
+	}
+	// not a primary lessor / leader changed：etcd 要客户端换成员再试，租约还在。
+	// clientv3 对 Unknown 不重试。本地 deadline 过了也不在这里判丢失；
+	// 那样会停掉 KeepAlive，key 随后才真过期。先 TimeToLive。
+	if notPrimaryLessor(err) {
+		if time.Now().After(dead) {
+			r.confirmLease(epoch, id, err)
 			return
 		}
-		r.renewMu.Unlock()
-		note := leaseFail{id: id, err: err, gen: gen}
-		if epoch {
-			r.queueEpoch(note)
-		} else {
-			r.queueMain(note)
-		}
+		r.noteRetry(epoch, id, notPrimaryBackoff(), err)
 		return
 	}
-	var msg string
-	if err != nil {
-		msg = err.Error()
+	if time.Now().After(dead) {
+		r.queueLoss(epoch, id, err)
+		return
 	}
-	retry := time.Now().Add(200 * time.Millisecond)
-	var emit bool
-	r.renewMu.Lock()
-	if r.pubID(epoch) == id {
-		emit = true
-		if epoch {
-			r.epDue = retry
-		} else {
-			r.bizDue = retry
+	r.noteRetry(epoch, id, 200*time.Millisecond, err)
+}
+
+// notPrimaryLessor 是 etcd 要求换成员再续的错误。
+// LeaseRenew 在 isLeader 但 ensureLeadership 失败时返回 lease.ErrNotPrimary，
+// gRPC 没有这项映射，客户端看到的是 codes.Unknown「not a primary lessor」。
+// leader changed 是 Unavailable，KeepAliveOnce 会在单次超时内自己重试；
+// 一旦原样冒出来，同样不能当成租约已删。
+func notPrimaryLessor(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "not a primary lessor") || strings.Contains(msg, "leader changed")
+}
+
+// notPrimaryBackoff 把同一时刻的重试错开。[500ms, 1500ms)。
+// 固定 200ms 时，几千路会一起打在还没确认领导权的成员上。
+func notPrimaryBackoff() time.Duration {
+	return 500*time.Millisecond + time.Duration(mrand.Int63n(int64(time.Second)))
+}
+
+// confirmLease 在本地 deadline 已过、但续租返回的是「换成员再试」时核对租约。
+// TTL>0：按剩余时间拨回 deadline，继续续，不报 lease_lost。
+// 不存在或 TTL<=0：这时才排队丢失。
+// 核对自己也是 not-primary 或超时：不报丢失，退避后再试。
+func (r *Registrar) confirmLease(epoch bool, id int64, cause error) {
+	cli := r.cliPtr.Load()
+	if cli == nil || r.pubID(epoch) != id {
+		return
+	}
+	parent := r.root
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, r.cfg.OpTimeout)
+	resp, err := cli.TimeToLive(ctx, clientv3.LeaseID(id))
+	cancel()
+	if r.pubID(epoch) != id {
+		return
+	}
+	if err == nil && resp != nil && resp.TTL > 0 {
+		r.keepAfterProbe(epoch, id, resp.TTL, cause)
+		return
+	}
+	if leaseMissing(err) || (err == nil && (resp == nil || resp.TTL <= 0)) {
+		why := err
+		if why == nil {
+			why = errors.New("lease ttl <= 0")
 		}
+		r.queueLoss(epoch, id, why)
+		return
+	}
+	r.noteRetry(epoch, id, notPrimaryBackoff(), cause)
+}
+
+// keepAfterProbe 把核对到的剩余 TTL 写回本地 deadline，并尽快再续一次。
+// 代际加一，丢掉核对之前已经排队的丢失通知。
+func (r *Registrar) keepAfterProbe(epoch bool, id int64, ttl int64, cause error) {
+	deadline := time.Now().Add(time.Duration(ttl) * time.Second)
+	next := time.Now().Add(notPrimaryBackoff())
+	r.renewMu.Lock()
+	if r.pubID(epoch) != id {
+		r.renewMu.Unlock()
+		return
+	}
+	if epoch {
+		r.epDead = deadline
+		r.epDue = next
+		r.epGen.Add(1)
+	} else {
+		r.bizDead = deadline
+		r.bizDue = next
+		r.bizGen.Add(1)
 	}
 	r.renewMu.Unlock()
-	if !emit {
+	r.dropPending(epoch, id)
+	if epoch {
+		r.event("epoch_ka_err", "err", errString(cause), "ttl", ttl)
 		return
 	}
+	r.event("ka_err", "err", errString(cause), "ttl", ttl)
+}
+
+// queueLoss 把可能的丢失交给控制循环。pub id 保持不变，下一次仍会 KeepAliveOnce：
+// Drain 可能正占着 opMu，处理要等它结束，这段时间不能把还活着的 lease 饿死。
+func (r *Registrar) queueLoss(epoch bool, id int64, err error) {
+	r.renewMu.Lock()
+	var gen int64
+	if r.pubID(epoch) == id {
+		retry := time.Now().Add(200 * time.Millisecond)
+		if epoch {
+			r.epDue = retry
+			gen = r.epGen.Load()
+		} else {
+			r.bizDue = retry
+			gen = r.bizGen.Load()
+		}
+	} else {
+		r.renewMu.Unlock()
+		return
+	}
+	r.renewMu.Unlock()
+	note := leaseFail{id: id, err: err, gen: gen}
+	if epoch {
+		r.queueEpoch(note)
+		return
+	}
+	r.queueMain(note)
+}
+
+func (r *Registrar) noteRetry(epoch bool, id int64, wait time.Duration, err error) {
+	if wait < 0 {
+		wait = 0
+	}
+	retry := time.Now().Add(wait)
+	r.renewMu.Lock()
+	if r.pubID(epoch) != id {
+		r.renewMu.Unlock()
+		return
+	}
+	if epoch {
+		r.epDue = retry
+	} else {
+		r.bizDue = retry
+	}
+	r.renewMu.Unlock()
+	msg := errString(err)
 	if epoch {
 		r.event("epoch_ka_err", "err", msg)
 		return
