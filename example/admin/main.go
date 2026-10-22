@@ -158,6 +158,7 @@ cfg.StateFile = "/var/lib/relay-registrar/" + cfg.NodeID + ".json"
 cfg.LocalIP = readPPP // 链路断开时返回 ""
 reg, err := registrar.New(cfg)
 err = reg.Start(ctx)
+// 启动后要调用 Ready。从没有 instance_id / machine_id 的旧状态文件升级时，Start 不会自动注册。
 // 重拨 API。一次拨号加一次出口校验大约 5 秒，失败率低于 1%。
 err = reg.Drain(ctx) // etcd 确认删除后才挂断
 dial()

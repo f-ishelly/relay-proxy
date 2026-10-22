@@ -60,6 +60,12 @@ type Registrar struct {
 	drained         bool
 	// mayRegister 为 false 时，探测、地址守卫和 Report 都不能创建 key。只有接管本机原 key，或 Ready 通过出口校验之后，才置真。
 	mayRegister bool
+	// priorHolder 表示本进程登记过这个 nodeId（写成功过，或状态文件里的身份就是我们）。没拿过 key 的实例不能写 epoch 标记。
+	priorHolder bool
+	// recognizedEpoch 是本实例或同一台机器留下的旧标记原文。注册成功后按这个字节删掉它。
+	recognizedEpoch string
+	// staleEpoch 是被换掉的上一条 epoch lease，写完新标记后撤销。
+	staleEpoch  clientv3.LeaseID
 	wantIP      string
 	netOK       bool
 	resourcesOK bool
@@ -438,11 +444,13 @@ func (r *Registrar) adoptState(ctx context.Context, st diskState) {
 		r.stale = stale
 		r.drained = false
 		r.mayRegister = true
+		r.priorHolder = true
 		r.event("takeover_candidate", "ip", st.IP, "prev_leases", stale, "instance", r.instanceID)
 		return
 	}
 	r.drained = st.Drained || (st.IP != "" && st.IP != lip)
 	r.mayRegister = false
+	r.priorHolder = true
 	r.stale = stale
 	r.revokeStale(ctx, r.cfg.OpTimeout)
 	if r.drained {
@@ -607,11 +615,10 @@ func (r *Registrar) renewLease(epoch bool) {
 		}
 		if leaseMissing(err) || (err == nil && (resp == nil || resp.TTL <= 0)) || time.Now().After(dead) {
 			r.event("epoch_lease_lost", "err", fmt.Sprint(err))
+			r.staleEpoch = id
 			r.epochLease = 0
-			if r.drained || r.expectNewEgress {
-				if werr := r.writeEpoch(context.Background()); werr != nil {
-					r.event("epoch_refresh_err", "err", werr.Error())
-				}
+			if werr := r.refreshEpoch(context.Background()); werr != nil {
+				r.event("epoch_refresh_err", "err", werr.Error())
 			}
 			return
 		}
@@ -645,11 +652,9 @@ func (r *Registrar) loseLeaseLocked(err error) {
 	r.lease = 0
 	r.regIP = ""
 	r.saveLocked()
-	// 业务 lease 丢了不能把重拨标记一起带走。标记在自己的 lease 上；这里再写一次，把还挂在旧 lease 上的标记挪过去。
-	if r.drained || r.expectNewEgress {
-		if werr := r.writeEpoch(context.Background()); werr != nil {
-			r.event("epoch_refresh_err", "err", werr.Error())
-		}
+	// 只有登记过的持有者才补标记。没拿过 key 的实例在这里写，会把别人的空窗占住。
+	if werr := r.refreshEpoch(context.Background()); werr != nil {
+		r.event("epoch_refresh_err", "err", werr.Error())
 	}
 }
 
@@ -758,17 +763,39 @@ func (r *Registrar) put(ctx context.Context, ip, how string, timeout time.Durati
 			return err
 		}
 		if tr.Succeeded {
-			wrote, inst, foreignLease, retry := createResult(tr, r.instanceID)
-			cancel()
+			wrote, ev, foreignLease, raw, kind := createResult(tr, r.instanceID, r.cfg.IntranetAddr, r.machineID, r.epochCanonical())
 			if wrote {
+				cancel()
 				r.finishPut(ip, how, "create")
 				return nil
 			}
-			if retry {
+			if kind == epochRetry {
+				cancel()
 				last = errLostRace
 				continue
 			}
-			r.alertForeign(foreignLease, inst)
+			if kind == epochSameOwner || kind == epochSameHost {
+				if kind == epochSameHost && !r.egressChanged(ip) {
+					cancel()
+					r.event("epoch_same_host", "addr", ev.Addr, "instance", ev.InstanceID, "blocked", true)
+					return fmt.Errorf("%w: same-host epoch addr %s", ErrEgressUnconfirmed, ev.Addr)
+				}
+				r.event("epoch_same_host", "addr", ev.Addr, "instance", ev.InstanceID, "kind", kind)
+				ok, perr := r.putIfEpochBytes(c, op, raw, 0)
+				cancel()
+				if perr != nil {
+					return perr
+				}
+				if !ok {
+					last = errLostRace
+					continue
+				}
+				r.recognizedEpoch = raw
+				r.finishPut(ip, how, "create")
+				return nil
+			}
+			cancel()
+			r.alertForeign(foreignLease, ev.InstanceID)
 			return ErrNodeConflict
 		}
 		kvs := tr.Responses[0].GetResponseRange().Kvs
@@ -786,6 +813,54 @@ func (r *Registrar) put(ctx context.Context, ip, how string, timeout time.Durati
 		if !allow {
 			cancel()
 			r.alertDenied(kv.Lease, kv.Value, reason)
+			return ErrNodeConflict
+		}
+		if reason == "dead_lease" {
+			// 过期 lease 上的残留 key 也不能绕过重拨标记。
+			tr2, err := r.cli.Txn(c).
+				If(clientv3.Compare(clientv3.ModRevision(r.key), "=", kv.ModRevision)).
+				Then(r.opCreateGuarded(string(body))).
+				Commit()
+			if err != nil {
+				cancel()
+				return err
+			}
+			if !tr2.Succeeded {
+				cancel()
+				last = errLostRace
+				continue
+			}
+			wrote, ev, foreignLease, raw, kind := createResult(tr2, r.instanceID, r.cfg.IntranetAddr, r.machineID, r.epochCanonical())
+			if wrote {
+				cancel()
+				r.finishPut(ip, how, reason)
+				return nil
+			}
+			if kind == epochRetry {
+				cancel()
+				last = errLostRace
+				continue
+			}
+			if kind == epochSameOwner || (kind == epochSameHost && r.egressChanged(ip)) {
+				ok, perr := r.putIfEpochBytes(c, op, raw, kv.ModRevision)
+				cancel()
+				if perr != nil {
+					return perr
+				}
+				if !ok {
+					last = errLostRace
+					continue
+				}
+				r.recognizedEpoch = raw
+				r.finishPut(ip, how, reason)
+				return nil
+			}
+			cancel()
+			if kind == epochSameHost {
+				r.event("epoch_same_host", "addr", ev.Addr, "instance", ev.InstanceID, "blocked", true)
+				return fmt.Errorf("%w: same-host epoch addr %s", ErrEgressUnconfirmed, ev.Addr)
+			}
+			r.alertForeign(foreignLease, ev.InstanceID)
 			return ErrNodeConflict
 		}
 		tr2, err := r.cli.Txn(c).
@@ -816,6 +891,7 @@ func (r *Registrar) finishPut(ip, how, reason string) {
 	r.prevEgress = ip
 	r.expectNewEgress = false
 	r.conflictAlerted = false
+	r.priorHolder = true
 	r.event("registered", "how", how, "reason", reason, "ip", ip, "old_ip", old, "lease", int64(r.lease), "instance", r.instanceID)
 	r.revokeStale(context.Background(), r.cfg.OpTimeout)
 	r.clearEpoch(context.Background())
@@ -864,9 +940,14 @@ func (r *Registrar) deleteOwned(ctx context.Context, reason string, timeout time
 			return err
 		}
 		if len(resp.Kvs) == 0 {
-			if r.regIP != "" || r.drained || r.expectNewEgress {
-				if err := r.writeEpoch(c); err != nil {
+			// 只有曾经拿过这个 key 的进程才补标记。Drain 本身把 drained 置上，不能当成持有证明。
+			if r.priorHolder {
+				if err := r.writeHolderEpoch(c, true); err != nil && !errors.Is(err, ErrNodeConflict) {
 					cancel()
+					if errors.Is(err, errLostRace) {
+						last = err
+						continue
+					}
 					return err
 				}
 			}
@@ -888,22 +969,24 @@ func (r *Registrar) deleteOwned(ctx context.Context, reason string, timeout time
 			r.alertDenied(kv.Lease, kv.Value, why)
 			return ErrNodeConflict
 		}
-		if err := r.writeEpoch(c); err != nil {
-			cancel()
-			return err
+		// 标记和删除放进同一事务。别人先写下的标记不能挡住我们摘掉自己的 key。
+		if err := r.deleteKeyAndEpoch(c, kv.ModRevision); err != nil {
+			if errors.Is(err, errLostRace) {
+				cancel()
+				last = err
+				continue
+			}
+			if derr := r.deleteAtRev(c, kv.ModRevision); derr != nil {
+				cancel()
+				if errors.Is(derr, errLostRace) {
+					last = derr
+					continue
+				}
+				return derr
+			}
 		}
-		tr, err := r.cli.Txn(c).
-			If(clientv3.Compare(clientv3.ModRevision(r.key), "=", kv.ModRevision)).
-			Then(clientv3.OpDelete(r.key)).
-			Commit()
 		cancel()
-		if err != nil {
-			return err
-		}
-		if !tr.Succeeded {
-			last = errLostRace
-			continue
-		}
+		r.priorHolder = true
 		r.event("unregistered", "reason", reason, "ip", r.regIP, "lease", int64(r.lease))
 		r.regIP = ""
 		return nil
@@ -912,6 +995,20 @@ func (r *Registrar) deleteOwned(ctx context.Context, reason string, timeout time
 		last = errLostRace
 	}
 	return last
+}
+
+func (r *Registrar) deleteAtRev(ctx context.Context, mod int64) error {
+	tr, err := r.cli.Txn(ctx).
+		If(clientv3.Compare(clientv3.ModRevision(r.key), "=", mod)).
+		Then(clientv3.OpDelete(r.key)).
+		Commit()
+	if err != nil {
+		return err
+	}
+	if !tr.Succeeded {
+		return errLostRace
+	}
+	return nil
 }
 
 func (r *Registrar) revokeCurrent(ctx context.Context, reason string, timeout time.Duration) error {
@@ -995,17 +1092,38 @@ func (r *Registrar) alert(kind string, other int64, msg string) {
 }
 
 // epochValue 的字节要稳定，事务才能用 Value(epoch)==mine 判断是不是自己的标记。不要往里写时间戳。
+// addr 和 machine_id 用来认出「同一台机器、状态文件丢了」的残留标记，避免把它报成 foreign_instance。
 type epochValue struct {
 	InstanceID string `json:"instance_id"`
 	NodeID     string `json:"node_id"`
+	Addr       string `json:"addr,omitempty"`
+	MachineID  string `json:"machine_id,omitempty"`
+}
+
+func (ev epochValue) sameHost(addr, machine string) bool {
+	return ev.Addr != "" && ev.MachineID != "" && addr != "" && machine != "" && ev.Addr == addr && ev.MachineID == machine
+}
+
+func (r *Registrar) epochCanonical() string {
+	s, _ := r.epochBody()
+	return s
 }
 
 func (r *Registrar) epochBody() (string, error) {
-	b, err := json.Marshal(epochValue{InstanceID: r.instanceID, NodeID: r.cfg.NodeID})
+	b, err := json.Marshal(epochValue{
+		InstanceID: r.instanceID,
+		NodeID:     r.cfg.NodeID,
+		Addr:       r.cfg.IntranetAddr,
+		MachineID:  r.machineID,
+	})
 	if err != nil {
 		return "", err
 	}
 	return string(b), nil
+}
+
+func (r *Registrar) egressChanged(ip string) bool {
+	return r.prevEgress != "" && ip != r.prevEgress
 }
 
 // opCreateGuarded 在一次事务里创建业务 key：epoch 不存在，或内容就是本实例，才 Put。
@@ -1046,11 +1164,29 @@ func (r *Registrar) ensureEpochLease(ctx context.Context) error {
 	return nil
 }
 
-// writeEpoch 只在标记不存在，或标记内容就是本实例时写入。别人的标记不会被盖掉。
-func (r *Registrar) writeEpoch(ctx context.Context) error {
-	if r.cli == nil || r.instanceID == "" {
-		return fmt.Errorf("%w: epoch identity", ErrInvalidConfig)
+// refreshEpoch 在 drained 期间把已有标记续到新的 epoch lease 上。
+// 业务 key 若属于别人，或者本进程从来没拿过这个 nodeId，就什么都不写。
+func (r *Registrar) refreshEpoch(ctx context.Context) error {
+	if !r.priorHolder || (!r.drained && !r.expectNewEgress) {
+		return nil
 	}
+	present, ours, _, err := r.keyOwnedHere(ctx, r.cfg.OpTimeout)
+	if err != nil {
+		return err
+	}
+	if present && !ours {
+		return nil
+	}
+	return r.writeHolderEpoch(ctx, !present)
+}
+
+// writeHolderEpoch 只给登记过的持有者补标记。requireMainAbsent 时，业务 key 一旦出现就不写。
+// 已有标记只有内容就是本实例才刷新，并且会撤销被换掉的旧 epoch lease。
+func (r *Registrar) writeHolderEpoch(ctx context.Context, requireMainAbsent bool) error {
+	if !r.priorHolder || r.cli == nil || r.instanceID == "" {
+		return nil
+	}
+	prev := r.epochLease
 	if err := r.ensureEpochLease(ctx); err != nil {
 		return err
 	}
@@ -1058,60 +1194,143 @@ func (r *Registrar) writeEpoch(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	key := EpochKey(r.cfg.NodeID)
-	op := clientv3.OpPut(key, body, clientv3.WithLease(r.epochLease))
+	epochKey := EpochKey(r.cfg.NodeID)
+	put := clientv3.OpPut(epochKey, body, clientv3.WithLease(r.epochLease))
 	c, cancel := context.WithTimeout(ctx, r.cfg.OpTimeout)
 	defer cancel()
-	tr, err := r.cli.Txn(c).
-		If(clientv3.Compare(clientv3.CreateRevision(key), "=", 0)).
-		Then(op).
-		Else(clientv3.OpTxn(
-			[]clientv3.Cmp{clientv3.Compare(clientv3.Value(key), "=", body)},
-			[]clientv3.Op{op},
-			[]clientv3.Op{clientv3.OpGet(key)},
-		)).
-		Commit()
+
+	var tr *clientv3.TxnResponse
+	if requireMainAbsent {
+		tr, err = r.cli.Txn(c).
+			If(
+				clientv3.Compare(clientv3.CreateRevision(r.key), "=", 0),
+				clientv3.Compare(clientv3.CreateRevision(epochKey), "=", 0),
+			).
+			Then(put).
+			Else(clientv3.OpTxn(
+				[]clientv3.Cmp{
+					clientv3.Compare(clientv3.CreateRevision(r.key), "=", 0),
+					clientv3.Compare(clientv3.Value(epochKey), "=", body),
+				},
+				[]clientv3.Op{clientv3.OpGet(epochKey), put},
+				[]clientv3.Op{clientv3.OpGet(r.key), clientv3.OpGet(epochKey)},
+			)).
+			Commit()
+	} else {
+		tr, err = r.cli.Txn(c).
+			If(clientv3.Compare(clientv3.CreateRevision(epochKey), "=", 0)).
+			Then(put).
+			Else(clientv3.OpTxn(
+				[]clientv3.Cmp{clientv3.Compare(clientv3.Value(epochKey), "=", body)},
+				[]clientv3.Op{clientv3.OpGet(epochKey), put},
+				[]clientv3.Op{clientv3.OpGet(epochKey)},
+			)).
+			Commit()
+	}
 	if err != nil {
 		return err
 	}
 	if tr.Succeeded {
+		r.revokeStaleEpoch(ctx)
 		return nil
 	}
 	inner := nestedTxn(tr)
-	if inner == nil {
-		return errLostRace
-	}
-	if inner.Succeeded {
+	if inner != nil && inner.Succeeded {
+		r.revokeObservedEpoch(ctx, inner)
+		r.revokeStaleEpoch(ctx)
 		return nil
 	}
-	inst, lease, empty := epochGet(inner)
-	if empty || inst == r.instanceID {
+	if requireMainAbsent && mainKeyPresent(inner) {
+		if prev == 0 {
+			r.revokeEpoch(ctx)
+		}
 		return errLostRace
 	}
-	r.alertForeign(lease, inst)
-	// 没写上别人的标记。刚申请的空 lease 不要一直续租。
-	r.revokeEpoch(ctx)
+	ev, _, _, empty := epochFromTxn(inner, requireMainAbsent)
+	if empty || ev.InstanceID == r.instanceID {
+		return errLostRace
+	}
+	if prev == 0 {
+		r.revokeEpoch(ctx)
+	}
 	return ErrNodeConflict
 }
 
-// clearEpoch 只删除内容属于本实例的标记。
+// deleteKeyAndEpoch 在一次事务里确认业务 key 还是我们刚读到的那一版，写上本实例的标记，并删除 key。
+// 标记原先属于谁都无所谓：拿着当前 key 的才是持有者。写标记失败时由调用方继续删 key。
+func (r *Registrar) deleteKeyAndEpoch(ctx context.Context, mod int64) error {
+	if err := r.ensureEpochLease(ctx); err != nil {
+		return err
+	}
+	body, err := r.epochBody()
+	if err != nil {
+		return err
+	}
+	epochKey := EpochKey(r.cfg.NodeID)
+	tr, err := r.cli.Txn(ctx).
+		If(clientv3.Compare(clientv3.ModRevision(r.key), "=", mod)).
+		Then(
+			clientv3.OpGet(epochKey),
+			clientv3.OpPut(epochKey, body, clientv3.WithLease(r.epochLease)),
+			clientv3.OpDelete(r.key),
+		).
+		Commit()
+	if err != nil {
+		return err
+	}
+	if !tr.Succeeded {
+		return errLostRace
+	}
+	if len(tr.Responses) > 0 {
+		if rr := tr.Responses[0].GetResponseRange(); rr != nil && len(rr.Kvs) == 1 {
+			old := clientv3.LeaseID(rr.Kvs[0].Lease)
+			if old != 0 && old != r.epochLease && old != r.lease {
+				r.revokeLeaseID(ctx, old)
+			}
+		}
+	}
+	r.revokeStaleEpoch(ctx)
+	return nil
+}
+
+func (r *Registrar) putIfEpochBytes(ctx context.Context, op clientv3.Op, raw string, mod int64) (bool, error) {
+	cmps := []clientv3.Cmp{clientv3.Compare(clientv3.Value(EpochKey(r.cfg.NodeID)), "=", raw)}
+	if mod > 0 {
+		cmps = append(cmps, clientv3.Compare(clientv3.ModRevision(r.key), "=", mod))
+	} else {
+		cmps = append(cmps, clientv3.Compare(clientv3.CreateRevision(r.key), "=", 0))
+	}
+	tr, err := r.cli.Txn(ctx).If(cmps...).Then(op).Commit()
+	if err != nil {
+		return false, err
+	}
+	return tr.Succeeded, nil
+}
+
+// clearEpoch 只删除本实例的标记，或同一台机器上已认出的残留标记。
 func (r *Registrar) clearEpoch(ctx context.Context) {
 	if r.cli == nil || r.instanceID == "" {
 		return
 	}
-	body, err := r.epochBody()
-	if err != nil {
+	bodies := []string{}
+	if body, err := r.epochBody(); err == nil && body != "" {
+		bodies = append(bodies, body)
+	} else if err != nil {
 		r.event("epoch_delete_err", "err", err.Error())
-		return
 	}
-	c, cancel := context.WithTimeout(ctx, r.cfg.OpTimeout)
-	defer cancel()
-	_, err = r.cli.Txn(c).
-		If(clientv3.Compare(clientv3.Value(EpochKey(r.cfg.NodeID)), "=", body)).
-		Then(clientv3.OpDelete(EpochKey(r.cfg.NodeID))).
-		Commit()
-	if err != nil {
-		r.event("epoch_delete_err", "err", err.Error())
+	if r.recognizedEpoch != "" && r.recognizedEpoch != r.epochCanonical() {
+		bodies = append(bodies, r.recognizedEpoch)
+	}
+	for _, body := range bodies {
+		c, cancel := context.WithTimeout(ctx, r.cfg.OpTimeout)
+		_, err := r.cli.Txn(c).
+			If(clientv3.Compare(clientv3.Value(EpochKey(r.cfg.NodeID)), "=", body)).
+			Then(clientv3.OpDelete(EpochKey(r.cfg.NodeID))).
+			Commit()
+		cancel()
+		if err != nil {
+			r.event("epoch_delete_err", "err", err.Error())
+		}
 	}
 }
 
@@ -1119,16 +1338,45 @@ func (r *Registrar) revokeEpoch(ctx context.Context) {
 	if r.epochLease == 0 || r.cli == nil {
 		return
 	}
+	id := r.epochLease
+	r.revokeLeaseID(ctx, id)
+	if r.epochLease == id {
+		r.epochLease = 0
+	}
+}
+
+func (r *Registrar) revokeStaleEpoch(ctx context.Context) {
+	if r.staleEpoch == 0 {
+		return
+	}
+	id := r.staleEpoch
+	r.staleEpoch = 0
+	r.revokeLeaseID(ctx, id)
+}
+
+func (r *Registrar) revokeObservedEpoch(ctx context.Context, tr *clientv3.TxnResponse) {
+	if tr == nil || len(tr.Responses) == 0 {
+		return
+	}
+	rr := tr.Responses[0].GetResponseRange()
+	if rr == nil || len(rr.Kvs) != 1 {
+		return
+	}
+	old := clientv3.LeaseID(rr.Kvs[0].Lease)
+	if old != 0 && old != r.epochLease && old != r.lease {
+		r.revokeLeaseID(ctx, old)
+	}
+}
+
+func (r *Registrar) revokeLeaseID(ctx context.Context, id clientv3.LeaseID) {
+	if id == 0 || r.cli == nil || id == r.lease {
+		return
+	}
 	c, cancel := context.WithTimeout(ctx, r.cfg.OpTimeout)
 	defer cancel()
-	id := r.epochLease
 	_, err := r.cli.Revoke(c, id)
 	if err != nil && !leaseMissing(err) {
 		r.event("epoch_revoke_err", "lease", int64(id), "err", err.Error())
-		return
-	}
-	if r.epochLease == id {
-		r.epochLease = 0
 	}
 }
 
@@ -1191,43 +1439,77 @@ func nestedTxn(tr *clientv3.TxnResponse) *clientv3.TxnResponse {
 	return (*clientv3.TxnResponse)(tv)
 }
 
-// createResult 解读「key 不存在」那次事务的内层结果。
-// wrote 表示业务 key 已经写入。retry 表示标记刚消失或刚好变成自己的，可以再试。
-func createResult(tr *clientv3.TxnResponse, self string) (wrote bool, foreignInst string, foreignLease int64, retry bool) {
+const (
+	epochWrote = iota
+	epochRetry
+	epochForeign
+	epochSameOwner
+	epochSameHost
+)
+
+// createResult 解读内层 epoch 事务。wrote 表示业务 key 已经写入。
+func createResult(tr *clientv3.TxnResponse, self, addr, machine, canonical string) (wrote bool, ev epochValue, lease int64, raw string, kind int) {
 	epochTxn := nestedTxn(tr)
 	if epochTxn == nil {
-		return false, "", 0, true
+		return false, epochValue{}, 0, "", epochRetry
 	}
 	if epochTxn.Succeeded {
-		return true, "", 0, false
+		return true, epochValue{}, 0, "", epochWrote
 	}
 	mineTxn := nestedTxn(epochTxn)
 	if mineTxn == nil {
-		return false, "", 0, true
+		return false, epochValue{}, 0, "", epochRetry
 	}
 	if mineTxn.Succeeded {
-		return true, "", 0, false
+		return true, epochValue{}, 0, "", epochWrote
 	}
-	inst, lease, empty := epochGet(mineTxn)
-	if empty || inst == self {
-		return false, "", 0, true
+	ev, raw, lease, empty := epochGet(mineTxn)
+	if empty {
+		return false, ev, 0, "", epochRetry
 	}
-	return false, inst, lease, false
+	if ev.InstanceID != "" && ev.InstanceID == self {
+		if raw == canonical {
+			return false, ev, lease, raw, epochRetry
+		}
+		return false, ev, lease, raw, epochSameOwner
+	}
+	if ev.sameHost(addr, machine) {
+		return false, ev, lease, raw, epochSameHost
+	}
+	return false, ev, lease, raw, epochForeign
 }
 
-func epochGet(tr *clientv3.TxnResponse) (inst string, lease int64, empty bool) {
+func epochGet(tr *clientv3.TxnResponse) (ev epochValue, raw string, lease int64, empty bool) {
 	if tr == nil || len(tr.Responses) == 0 {
-		return "", 0, true
+		return epochValue{}, "", 0, true
 	}
 	rr := tr.Responses[0].GetResponseRange()
 	if rr == nil || len(rr.Kvs) == 0 {
-		return "", 0, true
+		return epochValue{}, "", 0, true
 	}
-	var ev epochValue
+	raw = string(rr.Kvs[0].Value)
 	if json.Unmarshal(rr.Kvs[0].Value, &ev) != nil {
-		return "", rr.Kvs[0].Lease, false
+		return epochValue{}, raw, rr.Kvs[0].Lease, false
 	}
-	return ev.InstanceID, rr.Kvs[0].Lease, false
+	return ev, raw, rr.Kvs[0].Lease, false
+}
+
+func epochFromTxn(tr *clientv3.TxnResponse, requireMainAbsent bool) (epochValue, string, int64, bool) {
+	if tr == nil {
+		return epochValue{}, "", 0, true
+	}
+	if requireMainAbsent && len(tr.Responses) > 1 {
+		return epochGet(&clientv3.TxnResponse{Responses: tr.Responses[1:]})
+	}
+	return epochGet(tr)
+}
+
+func mainKeyPresent(tr *clientv3.TxnResponse) bool {
+	if tr == nil || len(tr.Responses) == 0 {
+		return false
+	}
+	rr := tr.Responses[0].GetResponseRange()
+	return rr != nil && len(rr.Kvs) > 0
 }
 
 func removeLease(ids []int64, id int64) []int64 {

@@ -123,6 +123,8 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	// 不在启动时调用 Ready。旧状态文件如果没有 machine_id 或 instance_id，进程会停在 drained，
+	// 直到 admin POST /v1/ready。这里没有出口地址，不能替它注册。
 	if err := reg.Start(context.Background()); err != nil {
 		log.Fatal(err)
 	}

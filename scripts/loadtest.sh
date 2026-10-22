@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # 续租压测。默认在本进程拉起 3 节点 etcd，全部客户端配置全部成员。
+# 全部注册后，每台主机会做一次带 epoch 标记的 Drain 再写回，然后才按 KILL_AFTER 切主。
 # 环境变量：HOSTS CONNS KEEP KILL_AFTER
 set -euo pipefail
 cd "$(dirname "$0")/.."

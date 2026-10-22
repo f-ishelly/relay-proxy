@@ -1,5 +1,6 @@
 // Command loadgen 按 PoC 的方式把 N 个 L2 lease 打到本机 etcd 上。
-// 每个逻辑主机：Grant + Put /relay/l2/{id}，之后按续租间隔 KeepAliveOnce。
+// 每个逻辑主机：Grant + Put /relay/l2/{id}，全部注册后做一次带 epoch 标记的 Drain 再写回，
+// 之后按续租间隔 KeepAliveOnce。
 // 客户端配置全部成员。-kill-after 时停掉当前 leader，用来看续租错误和 lease 过期。
 package main
 
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/f-ishelly/relay-proxy/internal/etcdcluster"
+	"github.com/f-ishelly/relay-proxy/registrar"
 	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/zap"
@@ -96,7 +98,8 @@ func main() {
 		}
 	}()
 
-	var registered, kaErr, kaOK, kaRaw, leaseLost, grantErr atomic.Int64
+	var registered, kaErr, kaOK, kaRaw, leaseLost, grantErr, drainOK, drainErr atomic.Int64
+	redialStart := make(chan struct{})
 	var rawErr atomic.Value
 	var wg sync.WaitGroup
 	start := time.Now()
@@ -113,6 +116,23 @@ func main() {
 				return
 			}
 			registered.Add(1)
+			select {
+			case <-ctx.Done():
+				return
+			case <-redialStart:
+			}
+			// 等全部注册时，先上去的 lease 已经走了一段 TTL。重拨前先续一次。
+			{
+				c, cancel := context.WithTimeout(ctx, 3*time.Second)
+				_, _ = cli.KeepAliveOnce(c, lid)
+				cancel()
+			}
+			time.Sleep(time.Duration(i%500) * time.Millisecond)
+			if err := redial(ctx, cli, key, lid, i); err != nil {
+				drainErr.Add(1)
+			} else {
+				drainOK.Add(1)
+			}
 			tk := time.NewTicker(*renew)
 			defer tk.Stop()
 			for {
@@ -168,6 +188,15 @@ func main() {
 	up := registered.Load()
 	fmt.Printf("{\"event\":\"registered\",\"label\":%q,\"hosts\":%d,\"up\":%d,\"grant_err\":%d,\"elapsed_ms\":%d,\"endpoints\":%q}\n",
 		*label, *hosts, up, grantErr.Load(), time.Since(start).Milliseconds(), strings.Join(eps, ","))
+	if up == int64(*hosts) {
+		close(redialStart)
+		redialDeadline := time.Now().Add(*registerTimeout)
+		for time.Now().Before(redialDeadline) && drainOK.Load()+drainErr.Load() < up {
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
+	fmt.Printf("{\"event\":\"redial\",\"label\":%q,\"drain_ok\":%d,\"drain_err\":%d,\"elapsed_ms\":%d}\n",
+		*label, drainOK.Load(), drainErr.Load(), time.Since(start).Milliseconds())
 
 	killed := ""
 	if *killAfter > 0 && cluster != nil && up == int64(*hosts) {
@@ -203,6 +232,8 @@ func main() {
 		}(),
 		"lease_lost":    leaseLost.Load(),
 		"grant_err":     grantErr.Load(),
+		"drain_ok":      drainOK.Load(),
+		"drain_err":     drainErr.Load(),
 		"watch_put":     watchPut.Load(),
 		"watch_del":     watchDel.Load(),
 		"leader_killed": killed != "",
@@ -210,9 +241,84 @@ func main() {
 	}
 	b, _ := json.Marshal(summary)
 	fmt.Println(string(b))
-	if up != int64(*hosts) || kaErr.Load() != 0 || leaseLost.Load() != 0 || watchDel.Load() != 0 {
+	// 每台主机恰好一次计划内删除。多出来的 DELETE 才是 lease 过期。
+	if up != int64(*hosts) || drainOK.Load() != up || drainErr.Load() != 0 || kaErr.Load() != 0 || leaseLost.Load() != 0 || watchDel.Load() != drainOK.Load() {
 		os.Exit(1)
 	}
+}
+
+func hostBody(i int) string {
+	return fmt.Sprintf(`{"addr":"10.0.0.%d:8080","egress_ip":"100.64.%d.%d","proxy_port":8080,"control_port":17001,"node_id":"%06d","az":"az01","weight":100,"capability":"http-connect","version":"gost-v3","registered_at":%d}`,
+		(i%250)+1, (i/256)%256, i%256, 600000+i, time.Now().UnixMilli())
+}
+
+// redial 模仿持有者的 Drain：只有本 lease 还挂着 key 时，才在同一次事务里写 epoch 标记并删除 key，然后再写回。
+func redial(ctx context.Context, cli *clientv3.Client, key string, lease clientv3.LeaseID, i int) error {
+	node := fmt.Sprintf("%06d", 600000+i)
+	epochKey := registrar.EpochKey(node)
+	body := hostBody(i)
+	marker := fmt.Sprintf(`{"instance_id":"load-%s","node_id":"%s","addr":"10.0.0.%d:8080","machine_id":"loadgen"}`, node, node, (i%250)+1)
+	var last error
+	for n := 0; n < 4; n++ {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		c, cancel := context.WithTimeout(ctx, 3*time.Second)
+		gr, err := cli.Grant(c, 30)
+		if err != nil {
+			cancel()
+			last = err
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		tr, err := cli.Txn(c).
+			If(clientv3.Compare(clientv3.LeaseValue(key), "=", lease)).
+			Then(
+				clientv3.OpPut(epochKey, marker, clientv3.WithLease(gr.ID)),
+				clientv3.OpDelete(key),
+			).
+			Commit()
+		if err != nil || tr == nil || !tr.Succeeded {
+			_, _ = cli.Put(c, key, body, clientv3.WithLease(lease))
+			_, _ = cli.Revoke(c, gr.ID)
+			cancel()
+			if err != nil {
+				last = err
+			} else {
+				last = fmt.Errorf("drain txn lost")
+			}
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		_, err = cli.Put(c, key, body, clientv3.WithLease(lease))
+		if err != nil {
+			cancel()
+			last = err
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		_, err = cli.Txn(c).
+			If(clientv3.Compare(clientv3.Value(epochKey), "=", marker)).
+			Then(clientv3.OpDelete(epochKey)).
+			Commit()
+		_, rerr := cli.Revoke(c, gr.ID)
+		cancel()
+		if err != nil {
+			last = err
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		if rerr != nil && !leaseMissing(rerr) {
+			last = rerr
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		return nil
+	}
+	if last == nil {
+		last = fmt.Errorf("redial failed")
+	}
+	return last
 }
 
 func register(ctx context.Context, cli *clientv3.Client, key string, i int, ttl int64) (clientv3.LeaseID, error) {
@@ -221,9 +327,7 @@ func register(ctx context.Context, cli *clientv3.Client, key string, i int, ttl 
 		c, cancel := context.WithTimeout(ctx, 3*time.Second)
 		gr, err := cli.Grant(c, ttl)
 		if err == nil {
-			body := fmt.Sprintf(`{"addr":"10.0.0.%d:8080","egress_ip":"100.64.%d.%d","proxy_port":8080,"control_port":17001,"node_id":"%06d","az":"az01","weight":100,"capability":"http-connect","version":"gost-v3","registered_at":%d}`,
-				(i%250)+1, (i/256)%256, i%256, 600000+i, time.Now().UnixMilli())
-			_, err = cli.Put(c, key, body, clientv3.WithLease(gr.ID))
+			_, err = cli.Put(c, key, hostBody(i), clientv3.WithLease(gr.ID))
 		}
 		cancel()
 		if err == nil {

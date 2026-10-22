@@ -1,0 +1,5 @@
+=== RUN   TestAcceptance5_LeaderFailoverDrain
+    registrar_test.go:692: Drain during failover 612.06862ms
+--- PASS: TestAcceptance5_LeaderFailoverDrain (5.14s)
+PASS
+ok  	github.com/f-ishelly/relay-proxy/registrar	6.185s

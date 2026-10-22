@@ -1,0 +1,4 @@
+{"event":"registered","label":"acceptance7","hosts":4000,"up":4000,"grant_err":0,"elapsed_ms":4008,"endpoints":"http://127.0.0.1:42581,http://127.0.0.1:33669,http://127.0.0.1:39089"}
+{"event":"redial","label":"acceptance7","drain_ok":4000,"drain_err":0,"elapsed_ms":7387}
+{"event":"kill_leader","endpoint":"http://127.0.0.1:39089","t_ms":9393}
+{"conns":64,"drain_err":0,"drain_ok":4000,"elapsed_ms":29700,"endpoints":3,"event":"summary","grant_err":0,"hosts":4000,"keepalive_err":0,"keepalive_ok":28000,"keepalive_raw_err":2,"keepalive_raw_sample":"etcdserver: server stopped","label":"acceptance7","leader_killed":true,"lease_lost":0,"registered":4000,"renew_ms":3000,"ttl_s":10,"watch_del":4000,"watch_put":8000}
