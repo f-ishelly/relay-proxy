@@ -67,14 +67,14 @@ L1 与 L2 的职责不同，不能拿同一类软件硬套。
    - **gost v3**（v1 已确认）：HTTP handler 默认就是 `CONNECT` 之后双向转发。
    - **3proxy**：同一 CONNECT 接口下，C + Linux `splice`，连接密度更高。
    - **Envoy dynamic forward proxy**：能终止 `CONNECT` 并原始 TCP 转发，指标与热重启最好；安全配置与官方 HTTP 示例相反，容易配成重新发起 TLS。
-   - **不采用 HAProxy / Nginx stream 的纯 TCP 模式**：它们把连接转到预先配置的后端，L1 的裸 TCP 里没有目标地址，L2 无法知道该连哪台源站。
+   - **不采用 HAProxy / Nginx stream 的纯 TCP 模式**：它们只会把连接转到预先配置的后端，不能按 `CONNECT` 里的目标动态拨号；v0.1 那种裸 TCP 透传里也没有目标地址，L2 无法知道该连哪台源站。
 
 ### 3.2 推荐组合（初版）
 
 - **一级代理（需二开）**：Go 自研网关（借鉴/嵌入高性能开源网络库能力，例如 `gnet`/`fasthttp`/标准库 netpoll 方案）。
 - **L1→L2 目标传递**：第二次 HTTP `CONNECT`（代理链）。请求目标使用客户端原始 authority（`host:port`），DNS 在 L2 做。
 - **二级代理（开箱即用）**：gost v3，`handler: http` + `listener: tcp`。关闭 sniffing、MITM 与压缩。这是 v1 的确定选择。
-- **认证**：一份共享口令。L2 的 `auth.username` 写成客户端访问本节点时使用的用户名（含 `@node_id`），`auth.password` 与客户端登录 L1 的密码相同。L1 转发这同一组凭据。L2 只校验它，不从用户名里做选路。
+- **认证**：一份共享口令。L2 的 `auth.username` 写成客户端访问本节点时使用的用户名（含 `@node_id`），`auth.password` 与客户端登录 L1 的密码相同。L1 转发这同一组凭据。L2 只校验它，不从用户名里做选路。v1 每个 L2 节点只对应一个客户端用户名；若以后同一节点要接受多个用户名，需要把 `auth` 换成 gost 的多用户认证配置。
 - **出口拒绝**：L2 在解析之后、拨号之前拒绝环回与链路本地。RFC1918 及其他私网地址本版放行，此范围以后可以再收紧。见附录 A.5。
 - **服务发现**：etcd。注册地址是该实例的 HTTP `CONNECT` 监听地址。
 - **监控**：eBPF + Prometheus + Grafana。
@@ -199,8 +199,11 @@ flowchart TD
     F --> G{节点可用?}
     E -- 是 --> G
     G -- 否 --> Z[返回 502]
-    G -- 是 --> H[向 L2 发送 CONNECT 并等待 200]
-    H --> I[双向原样转发并记录指标]
+    G -- 是 --> H[向 L2 发送 CONNECT 并等待应答]
+    H --> J{L2 是否返回 200}
+    J -- 否 --> Z
+    J -- 是 --> K[向客户端返回 200]
+    K --> I[双向原样转发并记录指标]
 ```
 
 ---
@@ -305,7 +308,7 @@ flowchart TD
 
 ## 10. Go 使用示例（一级代理核心逻辑）
 
-下面是 L1 在共享口令校验通过之后的 CONNECT 数据面。它向 L2 发第二次 `CONNECT`，`Proxy-Authorization` 使用客户端提交的同一组用户名和密码，确认 `200` 后才应答客户端，并以字节方式拼接两侧连接。出口网段拒绝在 L2 解析之后做，不在本函数里。示例不包含 etcd。涉及 `bufio`、`fmt`、`net`、`net/http`、`encoding/base64`、`io`、`strconv`、`strings`、`time`。
+下面是 L1 在共享口令校验通过之后的 CONNECT 数据面。它向 L2 发第二次 `CONNECT`，`Proxy-Authorization` 使用客户端提交的同一组用户名和密码，确认 `200` 后才应答客户端，并以字节方式拼接两侧连接。解析节点、拨号 L2、读取 L2 应答失败或 L2 返回非 `200` 时，函数先向客户端写 `502`（见 §5.1），再返回错误。出口网段拒绝在 L2 解析之后做，不在本函数里。示例不包含 etcd。涉及 `bufio`、`fmt`、`net`、`net/http`、`encoding/base64`、`io`、`strconv`、`strings`、`time`。
 
 ```go
 type Resolver interface {
@@ -326,6 +329,12 @@ func parseNodeID(username string) (user string, nodeID string, err error) {
 func handleConnect(clientConn net.Conn, username, password, target string, resolver Resolver) error {
     defer clientConn.Close()
 
+    // L2 相关的失败统一对客户端回 502（见 §5.1），隧道字节此时尚未开始传输。
+    badGateway := func(err error) error {
+        _, _ = io.WriteString(clientConn, "HTTP/1.1 502 Bad Gateway\r\n\r\n")
+        return err
+    }
+
     host, port, err := net.SplitHostPort(target)
     if err != nil || host == "" || strings.ContainsAny(host, " \r\n/") {
         return fmt.Errorf("invalid connect target")
@@ -342,12 +351,12 @@ func handleConnect(clientConn net.Conn, username, password, target string, resol
     }
     upstreamAddr, err := resolver.Resolve(nodeID)
     if err != nil {
-        return fmt.Errorf("resolve node %s failed: %w", nodeID, err)
+        return badGateway(fmt.Errorf("resolve node %s failed: %w", nodeID, err))
     }
 
     upstreamConn, err := net.DialTimeout("tcp", upstreamAddr, 3*time.Second)
     if err != nil {
-        return fmt.Errorf("connect l2 failed: %w", err)
+        return badGateway(fmt.Errorf("connect l2 failed: %w", err))
     }
     defer upstreamConn.Close()
 
@@ -362,10 +371,10 @@ func handleConnect(clientConn net.Conn, username, password, target string, resol
     br := bufio.NewReader(upstreamConn)
     code, err := readConnectStatus(br)
     if err != nil {
-        return err
+        return badGateway(err)
     }
     if code != http.StatusOK {
-        return fmt.Errorf("l2 connect status %d", code)
+        return badGateway(fmt.Errorf("l2 connect status %d", code))
     }
 
     if _, err := io.WriteString(clientConn, "HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
@@ -531,7 +540,7 @@ v1 接受这个认证取舍：L2 持有客户端登录 L1 的口令，全系统�
 gost（v1）：
 
 - `listener.type` 为 `tcp`，`handler.type` 为 `http`。
-- `auth.username` 等于客户端访问该节点的用户名，`auth.password` 等于那份共享口令。监听保持认证开启。
+- `auth.username` 等于客户端访问该节点的用户名，`auth.password` 等于那份共享口令。v1 每个节点只有这一个用户名（见 §3.2）。监听保持认证开启。
 - `sniffing` 为 false；不设置 `mitm.certFile`、`mitm.keyFile`、`compression`。
 
 3proxy（替换项，口令与上面相同）：
