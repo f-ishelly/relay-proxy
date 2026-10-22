@@ -524,7 +524,9 @@ Value：
 
 启动错开是 `(staggerBase+i) % 8000ms`。单进程 `staggerBase` 为 0，公式就是 `i % 8000ms`。`hosts=4000` 时下标最大是 3999，所以实际错开是 0–3999ms，不是 8s。多进程时父进程把已经分出去的主机数当作 `staggerBase`，4000 台仍然铺在这 4s 里，而不是每个进程各自从 0 再铺一遍。loadgen 把公式和 `start_sleep_max_ms` 写进 summary。`-redial-inflight 0` 表示不限制同时进行的 `Drain`+`Ready`。
 
-续租和 `Drain` 不再共用一把锁。锁拆开之前，单进程、内嵌 etcd、4000 路不限并发、同一时刻 `Drain`，会把续租堵住：`docs/acceptance/acceptance7-unbounded-before.log` 由 loadgen 在干净工作区上自己写入（commit `7c4cd62`），`lease_lost` 为 4000。修复之后的同形运行和多进程外部 etcd 运行也由工具写头，分别在 `acceptance7-unbounded-after.log` 和 `acceptance7.log`。验收 7 是多个 OS 进程（默认 8）对 3 个独立 etcd 进程，不限并发，重拨时刻对齐，然后停掉 leader。日志头里的 commit、`git status`、Go 版本、开始和结束时间都是运行时写的，不要手改。
+续租和 `Drain` 不再共用一把锁。锁拆开之前，单进程、内嵌 etcd、4000 路不限并发、同一时刻 `Drain`：`docs/acceptance/acceptance7-unbounded-before.log` 由 loadgen 在干净工作区上自己写入（commit `7c4cd62`），`drain_err` 4000，`lease_lost` 4000，`keepalive_ok` 1918，`keepalive_err` 247。同一形状在锁拆开之后（`acceptance7-unbounded-after.log`，commit `8d2b963`）：`lease_lost` 0，`keepalive_err` 0，`keepalive_ok` 26574（每台 min/p50/max 6/7/7），`drain_ok` 3968，`drain_err` 32。这 32 次是客户端在 6s 预算里没拿到确认，租约没有丢。
+
+验收 7（`acceptance7.log`，commit `0695611`）是 8 个 OS 进程、每个 500 个 registrar，对 3 个独立 etcd 进程，`-redial-inflight 0`，重拨时刻对齐，然后停掉 leader。合计 `registered` 4000，`ready_err` 0，`drain_ok` 4000，`drain_err` 0，`lease_lost` 0，`keepalive_err` 0，`keepalive_ok` 36522，`watch_del` 4000，`watch_put` 8000，`leader_killed` true。每个进程都 Watch 整个 `/relay/l2/` 前缀，汇总时取最大的那一份，不把次数乘上进程数。日志头里的 commit、`git status`、Go 版本、开始和结束时间都是运行时写的，不要手改。
 
 Watch DELETE 次数等于这次 `Drain` 的次数；多出来的 DELETE 才是 lease 过期。续租次数来自 registrar 自己的续租循环，不会正好是主机数乘一个固定次数。loadgen 默认同时只进行 64 路 `Drain`+`Ready`，那只是可选的压测调度，不是 registrar 的限制。最近一次验收 5、验收 7 的输出在 `docs/acceptance/`。
 
