@@ -36,16 +36,34 @@ const (
 	DefaultBackgroundTimeout = 700 * time.Millisecond
 	// DefaultStartGrantTimeout 是 Start 等待第一次 Grant 成功的上限。
 	DefaultStartGrantTimeout = 5 * time.Second
-	// DefaultAssumedDial 是 admin 侧拨号耗时的规划值。registrar 不会按它睡眠。
-	DefaultAssumedDial = 3 * time.Second
-	// DefaultAssumedEgressCheck 是 admin 侧出口校验耗时的规划值。registrar 不会按它睡眠。
-	DefaultAssumedEgressCheck = 300 * time.Millisecond
-	// DefaultInspectionInterval 是期望 admin 调用 Report 的间隔。registrar 不会自己按它轮询。
-	DefaultInspectionInterval = 2 * time.Second
+	// DefaultAssumedDial 与 DefaultAssumedEgressCheck 只给 admin 的时钟用，registrar 不按它们睡眠。
+	// 一次拨号加一次出口校验合计约 5s。没有分开的实测，规划上按 4s 拨号、1s 校验。
+	DefaultAssumedDial = 4 * time.Second
+	// DefaultAssumedEgressCheck 见 DefaultAssumedDial。
+	DefaultAssumedEgressCheck = time.Second
+	// DefaultAssumedRedialFailureRate 是一次拨号加出口校验的失败率上界（低于 1%）。
+	// admin 用它估计要不要马上再拨一次。registrar 不按它拒绝注册。
+	DefaultAssumedRedialFailureRate = 0.01
+	// DefaultInspectionInterval 是 admin 巡检间隔：外网是否可达，以及 CPU、内存是否正常。
+	// registrar 不自己轮询，等 admin 调用 Report。
+	DefaultInspectionInterval = time.Minute
 
 	defaultCapability = "http-connect"
 	defaultWeight     = 100
 	defaultVersion    = "gost-v3"
+
+	// NodeIDEnv 是运维注入 nodeId 的环境变量。Config.NodeID 为空时读取它。
+	// 唯一性由运维层保证；事务里的冲突检测只是兜底。
+	NodeIDEnv = "RELAY_NODE_ID"
+)
+
+// 资源异常如何影响注册。v1 的 L1 按 node_id 精确选路，不看 weight，
+// 所以默认摘掉 key，而不是只把 weight 写小。
+const (
+	// ResourceFaultDeregister 在 Report 报告 CPU 或内存异常时 Delete key，恢复后再 Put。
+	ResourceFaultDeregister = "deregister"
+	// ResourceFaultIgnore 只把资源结论交给 OnReport，不改 etcd。
+	ResourceFaultIgnore = "ignore"
 )
 
 // AlertNodeConflict 表示另一个还活着的 lease 占着同一个 nodeId，本进程拒绝覆盖。
@@ -60,12 +78,21 @@ type Alert struct {
 	Message    string
 }
 
+// Report 是 admin 每分钟巡检的结论。
+// NetOK 表示节点访问外部是否正常，ResourcesOK 表示 CPU 和内存是否正常。
+type Report struct {
+	NetOK       bool
+	ResourcesOK bool
+	EgressIP    string
+}
+
 // ReportEvent 是一次 Report 的本地通知。默认不写 etcd，也不外发。
 type ReportEvent struct {
-	NetOK    bool
-	EgressIP string
-	Drained  bool
-	At       time.Time
+	NetOK       bool
+	ResourcesOK bool
+	EgressIP    string
+	Drained     bool
+	At          time.Time
 }
 
 // Logger 接收状态机事件。args 是成对的键和值。nil 表示不打日志。
@@ -99,9 +126,10 @@ func (l JSONLogger) Event(ev string, args ...any) {
 type Config struct {
 	// Endpoints 是 etcd 全部成员。生产环境少配成员时，切主会让连在死去成员上的 lease 过期。
 	Endpoints []string
-	// NodeID 是这台主机已有的节点 ID，例如 626220。空则读 NodeIDFile。本包不分配 ID。
+	// NodeID 是这台虚拟机的节点 ID，例如 626220。
+	// 为空时读环境变量 RELAY_NODE_ID，再不行才读 NodeIDFile。本包不分配 ID，唯一性由运维保证。
 	NodeID string
-	// NodeIDFile 是 NodeID 为空时读取的文件，内容会去掉首尾空白。
+	// NodeIDFile 是环境变量也没有时的兜底文件，内容会去掉首尾空白。生产路径不依赖它。
 	NodeIDFile string
 
 	// IntranetAddr 写入 value.addr，形如 10.0.8.26:8080。重拨前后保持不变。
@@ -149,47 +177,53 @@ type Config struct {
 	// StateFile 保存 lease、drained 和已注册的出口 IP，重拨中崩溃靠它避免提前注册。
 	StateFile string
 
-	// IgnoreAdminNetCheck 为 true 时，Report 的 netOK 不摘除也不恢复。默认 false：信任 admin 巡检。
+	// IgnoreAdminNetCheck 为 true 时，Report 的 NetOK 不摘除也不恢复。默认 false：信任 admin 的外网巡检。
 	IgnoreAdminNetCheck bool
+	// ResourceFaultAction 控制 CPU、内存异常。默认 deregister：摘掉 key，恢复后再写回。
+	// ignore 时不改 etcd。不提供“只降 weight”：v1 按 node_id 精确选路，weight 不影响流量。
+	ResourceFaultAction string
 	// OnReport 把上报转给 admin 现有通道。默认 nil，不上报副本，也不把上报正文写入 etcd。
 	OnReport func(ReportEvent)
-	// OnAlert 在拒绝覆盖冲突 key 时调用。
+	// OnAlert 在拒绝覆盖冲突 key 时调用。冲突检测是 nodeId 的兜底，不能代替运维保证唯一。
 	OnAlert func(Alert)
 	Logger  Logger
 
-	// 下面三项是待确认问题的规划默认值，状态机不按它们睡眠。
-	// admin 自己持有拨号和巡检的时钟，可以从这里读默认值，也可以覆盖。
-	AssumedDial        time.Duration
-	AssumedEgressCheck time.Duration
-	InspectionInterval time.Duration
+	// 下面几项是 admin 侧的规划值，状态机不按它们睡眠。
+	// 一次拨号加一次出口校验合计约 5s，失败率低于 1%。lease 在这段时间里继续续租，TTL 仍是 10s。
+	AssumedDial              time.Duration
+	AssumedEgressCheck       time.Duration
+	AssumedRedialFailureRate float64
+	InspectionInterval       time.Duration
 }
 
 // DefaultConfig 返回方案里的默认节奏。调用方仍须填写 Endpoints、NodeID、地址、探测和 LocalIP。
 func DefaultConfig() Config {
 	return Config{
-		Weight:               defaultWeight,
-		Capability:           defaultCapability,
-		Version:              defaultVersion,
-		ProbeTarget:          "127.0.0.1:1",
-		ProbeExpectStatus:    403,
-		ProbeInterval:        DefaultProbeInterval,
-		ProbeTimeout:         DefaultProbeTimeout,
-		ProbeFailThreshold:   DefaultProbeFailThreshold,
-		ProbeRiseThreshold:   DefaultProbeRiseThreshold,
-		IPGuardInterval:      DefaultIPGuardInterval,
-		TTL:                  DefaultTTL,
-		RenewInterval:        DefaultRenewInterval,
-		OpTimeout:            DefaultOpTimeout,
-		BackgroundTimeout:    DefaultBackgroundTimeout,
-		DrainAttempt:         DefaultDrainAttempt,
-		DrainBudget:          DefaultDrainBudget,
-		StartGrantTimeout:    DefaultStartGrantTimeout,
-		DialTimeout:          2 * time.Second,
-		DialKeepAliveTime:    2 * time.Second,
-		DialKeepAliveTimeout: 2 * time.Second,
-		AssumedDial:          DefaultAssumedDial,
-		AssumedEgressCheck:   DefaultAssumedEgressCheck,
-		InspectionInterval:   DefaultInspectionInterval,
+		Weight:                   defaultWeight,
+		Capability:               defaultCapability,
+		Version:                  defaultVersion,
+		ProbeTarget:              "127.0.0.1:1",
+		ProbeExpectStatus:        403,
+		ProbeInterval:            DefaultProbeInterval,
+		ProbeTimeout:             DefaultProbeTimeout,
+		ProbeFailThreshold:       DefaultProbeFailThreshold,
+		ProbeRiseThreshold:       DefaultProbeRiseThreshold,
+		IPGuardInterval:          DefaultIPGuardInterval,
+		TTL:                      DefaultTTL,
+		RenewInterval:            DefaultRenewInterval,
+		OpTimeout:                DefaultOpTimeout,
+		BackgroundTimeout:        DefaultBackgroundTimeout,
+		DrainAttempt:             DefaultDrainAttempt,
+		DrainBudget:              DefaultDrainBudget,
+		StartGrantTimeout:        DefaultStartGrantTimeout,
+		DialTimeout:              2 * time.Second,
+		DialKeepAliveTime:        2 * time.Second,
+		DialKeepAliveTimeout:     2 * time.Second,
+		AssumedDial:              DefaultAssumedDial,
+		AssumedEgressCheck:       DefaultAssumedEgressCheck,
+		AssumedRedialFailureRate: DefaultAssumedRedialFailureRate,
+		InspectionInterval:       DefaultInspectionInterval,
+		ResourceFaultAction:      ResourceFaultDeregister,
 	}
 }
 
@@ -261,8 +295,14 @@ func applyDefaults(c *Config) {
 	if c.AssumedEgressCheck == 0 {
 		c.AssumedEgressCheck = d.AssumedEgressCheck
 	}
+	if c.AssumedRedialFailureRate == 0 {
+		c.AssumedRedialFailureRate = d.AssumedRedialFailureRate
+	}
 	if c.InspectionInterval == 0 {
 		c.InspectionInterval = d.InspectionInterval
+	}
+	if c.ResourceFaultAction == "" {
+		c.ResourceFaultAction = d.ResourceFaultAction
 	}
 }
 
@@ -311,12 +351,21 @@ func validate(c *Config) error {
 	if c.DrainAttempt <= 0 || c.DrainBudget < c.DrainAttempt {
 		return fmt.Errorf("%w: drain budget", ErrInvalidConfig)
 	}
+	switch c.ResourceFaultAction {
+	case ResourceFaultDeregister, ResourceFaultIgnore:
+	default:
+		return fmt.Errorf("%w: resource fault action %q", ErrInvalidConfig, c.ResourceFaultAction)
+	}
 	return nil
 }
 
 func loadNodeID(c *Config) error {
 	if strings.TrimSpace(c.NodeID) != "" {
 		c.NodeID = strings.TrimSpace(c.NodeID)
+		return nil
+	}
+	if v := strings.TrimSpace(os.Getenv(NodeIDEnv)); v != "" {
+		c.NodeID = v
 		return nil
 	}
 	if c.NodeIDFile == "" {

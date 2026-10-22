@@ -4,7 +4,7 @@
     "http://etcd2.internal:2379",
     "http://etcd3.internal:2379"
   ],
-  "node_id": "626220",
+  "node_id": "",
   "node_id_file": "",
   "proxy_port": 8080,
   "control_port": 17001,
@@ -25,10 +25,12 @@
   "az": "az01",
   "weight": 100,
   "version": "gost-3.3.1",
-  "assumed_dial_ms": 3000,
-  "assumed_egress_check_ms": 300,
-  "inspection_interval_ms": 2000,
+  "assumed_dial_ms": 4000,
+  "assumed_egress_check_ms": 1000,
+  "assumed_redial_failure_rate": 0.01,
+  "inspection_interval_ms": 60000,
   "ignore_admin_net_check": false,
+  "resource_fault_action": "deregister",
   "drain_attempt_ms": 700,
   "drain_budget_ms": 6000
 }

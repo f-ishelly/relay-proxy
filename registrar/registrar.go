@@ -18,6 +18,8 @@ var (
 	ErrNodeConflict = errors.New("nodeId conflict")
 	// ErrEgressMismatch 表示 Ready 带来的出口地址和本机 ppp 地址不一致。
 	ErrEgressMismatch = errors.New("egress ip mismatch")
+	// ErrEgressUnchanged 表示计划内重拨后，外部看到的出口 IP 和重拨前相同。视为校验失败，不注册。
+	ErrEgressUnchanged = errors.New("egress ip unchanged")
 	// ErrNotRegistered 表示探测未通过，或 etcd 里还没有这次 Ready 的 key。
 	ErrNotRegistered = errors.New("not registered")
 	// ErrStopped 表示已经 Stop。
@@ -43,16 +45,19 @@ type Registrar struct {
 	started bool
 	stopped bool
 
-	lease    clientv3.LeaseID
-	stale    []int64
-	regIP    string
-	resumeIP string
-	drained  bool
-	wantIP   string
-	netOK    bool
-	probeOK  bool
-	fails    int
-	oks      int
+	lease           clientv3.LeaseID
+	stale           []int64
+	regIP           string
+	resumeIP        string
+	prevEgress      string
+	expectNewEgress bool
+	drained         bool
+	wantIP          string
+	netOK           bool
+	resourcesOK     bool
+	probeOK         bool
+	fails           int
+	oks             int
 
 	deadline        time.Time
 	nextRenew       time.Time
@@ -71,7 +76,7 @@ func New(cfg Config) (*Registrar, error) {
 	if err := validate(&cfg); err != nil {
 		return nil, err
 	}
-	return &Registrar{cfg: cfg, key: Key(cfg.NodeID), netOK: true}, nil
+	return &Registrar{cfg: cfg, key: Key(cfg.NodeID), netOK: true, resourcesOK: true}, nil
 }
 
 // Start 连接 etcd，Grant 一个  TTL 的 lease，并启动续租、探测和地址守卫。
@@ -134,9 +139,15 @@ func (r *Registrar) Drain(ctx context.Context) error {
 	if r.stopped {
 		return ErrStopped
 	}
+	if r.regIP != "" {
+		r.prevEgress = r.regIP
+	} else if r.prevEgress == "" && r.resumeIP != "" {
+		r.prevEgress = r.resumeIP
+	}
+	r.expectNewEgress = true
 	r.drained = true
 	r.saveLocked()
-	r.event("api_drain")
+	r.event("api_drain", "prev_egress", r.prevEgress)
 	deadline := time.Now().Add(r.cfg.DrainBudget)
 	var err error
 	for {
@@ -176,9 +187,13 @@ func (r *Registrar) Ready(ctx context.Context, egressIP string) error {
 		return ErrStopped
 	}
 	lip := r.cfg.LocalIP()
-	r.event("api_ready", "ip", egressIP, "local_ip", lip)
+	r.event("api_ready", "ip", egressIP, "local_ip", lip, "prev_egress", r.prevEgress)
 	if egressIP == "" || lip != egressIP {
 		return fmt.Errorf("%w: local %q", ErrEgressMismatch, lip)
+	}
+	// 计划内重拨的目的就是换出口。外部看到的地址没变，就是校验失败。
+	if r.expectNewEgress && r.prevEgress != "" && egressIP == r.prevEgress {
+		return fmt.Errorf("%w: %s", ErrEgressUnchanged, egressIP)
 	}
 	r.drained = false
 	r.wantIP = egressIP
@@ -197,9 +212,9 @@ func (r *Registrar) Ready(ctx context.Context, egressIP string) error {
 	return nil
 }
 
-// Report 接收 admin 现有巡检。netOK 为 false 时删除 key，恢复后 Put。
+// Report 接收 admin 每分钟一次的巡检。外网不通，或（默认）CPU/内存异常，都删除 key；恢复后 Put。
 // drained 期间忽略。上报正文不写 etcd；只有注册状态需要变化时才动 key。
-func (r *Registrar) Report(ctx context.Context, netOK bool, egressIP string) error {
+func (r *Registrar) Report(ctx context.Context, rep Report) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -208,21 +223,25 @@ func (r *Registrar) Report(ctx context.Context, netOK bool, egressIP string) err
 	if r.stopped {
 		return ErrStopped
 	}
-	ev := ReportEvent{NetOK: netOK, EgressIP: egressIP, Drained: r.drained, At: time.Now()}
+	ev := ReportEvent{
+		NetOK: rep.NetOK, ResourcesOK: rep.ResourcesOK, EgressIP: rep.EgressIP,
+		Drained: r.drained, At: time.Now(),
+	}
 	if r.cfg.OnReport != nil {
 		cb := r.cfg.OnReport
 		go cb(ev)
 	}
 	if r.drained {
-		r.event("api_report", "ip", egressIP, "net_ok", netOK, "ignored", true)
+		r.event("api_report", "ip", rep.EgressIP, "net_ok", rep.NetOK, "resources_ok", rep.ResourcesOK, "ignored", true)
 		return nil
 	}
-	r.netOK = netOK
-	if egressIP != "" {
-		r.wantIP = egressIP
-		r.resumeIP = egressIP
+	r.netOK = rep.NetOK
+	r.resourcesOK = rep.ResourcesOK
+	if rep.EgressIP != "" {
+		r.wantIP = rep.EgressIP
+		r.resumeIP = rep.EgressIP
 	}
-	r.event("api_report", "ip", egressIP, "net_ok", netOK, "ignored", false)
+	r.event("api_report", "ip", rep.EgressIP, "net_ok", rep.NetOK, "resources_ok", rep.ResourcesOK, "ignored", false)
 	r.reconcile(ctx, "report", r.cfg.OpTimeout)
 	if errors.Is(r.lastErr, ErrNodeConflict) {
 		return ErrNodeConflict
@@ -274,15 +293,16 @@ func (r *Registrar) Status() Status {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return Status{
-		Key:      r.key,
-		NodeID:   r.cfg.NodeID,
-		LeaseID:  int64(r.lease),
-		Addr:     r.cfg.IntranetAddr,
-		EgressIP: r.regIP,
-		Drained:  r.drained,
-		ProbeOK:  r.probeOK,
-		NetOK:    r.netOK,
-		WantIP:   r.wantIP,
+		Key:         r.key,
+		NodeID:      r.cfg.NodeID,
+		LeaseID:     int64(r.lease),
+		Addr:        r.cfg.IntranetAddr,
+		EgressIP:    r.regIP,
+		Drained:     r.drained,
+		ProbeOK:     r.probeOK,
+		NetOK:       r.netOK,
+		ResourcesOK: r.resourcesOK,
+		WantIP:      r.wantIP,
 	}
 }
 
@@ -316,9 +336,15 @@ func (r *Registrar) bootstrap(ctx context.Context) error {
 	if ok {
 		stale := uniqueLeases(append([]int64{st.Lease}, st.PrevLeases...))
 		lip := r.cfg.LocalIP()
+		r.prevEgress = st.PrevEgress
+		r.expectNewEgress = st.ExpectNewEgress
 		if !st.Drained && st.IP != "" && st.IP == lip {
 			r.wantIP = st.IP
 			r.resumeIP = st.IP
+			if r.prevEgress == "" {
+				r.prevEgress = st.IP
+			}
+			r.expectNewEgress = false
 			r.stale = stale
 			r.drained = false
 			r.event("takeover_candidate", "ip", st.IP, "prev_leases", stale)
@@ -329,7 +355,7 @@ func (r *Registrar) bootstrap(ctx context.Context) error {
 			if r.drained {
 				r.resumeIP = ""
 			}
-			r.event("stale_not_resumed", "drained", r.drained, "state_ip", st.IP, "local_ip", lip)
+			r.event("stale_not_resumed", "drained", r.drained, "state_ip", st.IP, "local_ip", lip, "expect_new_egress", r.expectNewEgress)
 		}
 	}
 	if err := r.grant(ctx); err != nil {
@@ -479,6 +505,10 @@ func (r *Registrar) renew() {
 	r.nextRenew = time.Now().Add(500 * time.Millisecond)
 }
 
+func (r *Registrar) resourceFault() bool {
+	return r.cfg.ResourceFaultAction == ResourceFaultDeregister && !r.resourcesOK
+}
+
 func (r *Registrar) reconcile(ctx context.Context, trigger string, timeout time.Duration) {
 	if r.stopped || r.cli == nil {
 		return
@@ -497,7 +527,7 @@ func (r *Registrar) reconcile(ctx context.Context, trigger string, timeout time.
 			r.saveLocked()
 		}
 	}
-	healthy := r.probeOK && (r.cfg.IgnoreAdminNetCheck || r.netOK)
+	healthy := r.probeOK && (r.cfg.IgnoreAdminNetCheck || r.netOK) && !r.resourceFault()
 	want := !r.drained && healthy && r.wantIP != "" && r.wantIP == lip
 	switch {
 	case want && r.regIP != r.wantIP:
@@ -518,6 +548,8 @@ func (r *Registrar) reconcile(ctx context.Context, trigger string, timeout time.
 			reason = "probe_fail"
 		} else if !r.cfg.IgnoreAdminNetCheck && !r.netOK {
 			reason = "net_check_fail"
+		} else if r.resourceFault() {
+			reason = "resource_check_fail"
 		} else if r.drained {
 			reason = "drained"
 		}
@@ -616,6 +648,8 @@ func (r *Registrar) finishPut(ip, how, reason string) {
 	old := r.regIP
 	r.regIP = ip
 	r.resumeIP = ip
+	r.prevEgress = ip
+	r.expectNewEgress = false
 	r.conflictAlerted = false
 	r.event("registered", "how", how, "reason", reason, "ip", ip, "old_ip", old, "lease", int64(r.lease))
 	r.revokeStale(context.Background(), r.cfg.OpTimeout)

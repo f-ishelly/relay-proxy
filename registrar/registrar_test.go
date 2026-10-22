@@ -71,12 +71,44 @@ func TestNodeIDFileAndRejectBadConfig(t *testing.T) {
 	if r.cfg.NodeID != "626220" {
 		t.Fatalf("node id %q", r.cfg.NodeID)
 	}
-	if r.cfg.AssumedDial != DefaultAssumedDial || r.cfg.AssumedEgressCheck != DefaultAssumedEgressCheck || r.cfg.InspectionInterval != DefaultInspectionInterval {
-		t.Fatalf("planning defaults dial=%s check=%s inspect=%s", r.cfg.AssumedDial, r.cfg.AssumedEgressCheck, r.cfg.InspectionInterval)
+	if r.cfg.AssumedDial+r.cfg.AssumedEgressCheck != 5*time.Second || r.cfg.AssumedRedialFailureRate != DefaultAssumedRedialFailureRate {
+		t.Fatalf("redial planning dial=%s check=%s rate=%v", r.cfg.AssumedDial, r.cfg.AssumedEgressCheck, r.cfg.AssumedRedialFailureRate)
+	}
+	if r.cfg.InspectionInterval != time.Minute || r.cfg.ResourceFaultAction != ResourceFaultDeregister {
+		t.Fatalf("inspect=%s resource=%s", r.cfg.InspectionInterval, r.cfg.ResourceFaultAction)
 	}
 	cfg.NodeID = "bad/id"
 	if _, err := New(cfg); err == nil {
 		t.Fatal("expected invalid node id")
+	}
+	cfg.NodeID = "626220"
+	cfg.ResourceFaultAction = "lower-weight"
+	if _, err := New(cfg); err == nil {
+		t.Fatal("expected invalid resource action")
+	}
+}
+
+func TestNodeIDEnvOverridesFile(t *testing.T) {
+	dir := t.TempDir()
+	idFile := filepath.Join(dir, "id")
+	if err := os.WriteFile(idFile, []byte("from-file\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(NodeIDEnv, "from-env")
+	cfg := DefaultConfig()
+	cfg.NodeIDFile = idFile
+	cfg.Endpoints = []string{"127.0.0.1:1"}
+	cfg.IntranetAddr = "10.0.8.26:8080"
+	cfg.ProxyPort = 8080
+	cfg.ProbeAddr = "127.0.0.1:8080"
+	cfg.StateFile = filepath.Join(dir, "state.json")
+	cfg.LocalIP = func() string { return "" }
+	r, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.cfg.NodeID != "from-env" {
+		t.Fatalf("node id %q", r.cfg.NodeID)
 	}
 }
 
@@ -593,7 +625,7 @@ func TestAcceptance4_ProbeAndNetCheck(t *testing.T) {
 	}
 
 	t2 := time.Now()
-	if err := g.reg.Report(context.Background(), false, "100.64.0.1"); err != nil {
+	if err := g.reg.Report(context.Background(), Report{NetOK: false, ResourcesOK: true, EgressIP: "100.64.0.1"}); err != nil {
 		t.Fatal(err)
 	}
 	waitUntil(t, time.Second, func() bool {
@@ -605,7 +637,7 @@ func TestAcceptance4_ProbeAndNetCheck(t *testing.T) {
 	} else {
 		t.Logf("net_ok=false -> delete %s", d)
 	}
-	if err := g.reg.Report(context.Background(), true, "100.64.0.1"); err != nil {
+	if err := g.reg.Report(context.Background(), Report{NetOK: true, ResourcesOK: true, EgressIP: "100.64.0.1"}); err != nil {
 		t.Fatal(err)
 	}
 	waitUntil(t, time.Second, func() bool {
@@ -793,12 +825,97 @@ func TestIgnoreAdminNetCheck(t *testing.T) {
 	g := newRig(t, 1, "626220", func(cfg *Config) { cfg.IgnoreAdminNetCheck = true })
 	g.ready("100.64.0.1")
 	g.waitKey(true, 2*time.Second)
-	if err := g.reg.Report(context.Background(), false, "100.64.0.1"); err != nil {
+	if err := g.reg.Report(context.Background(), Report{NetOK: false, ResourcesOK: true, EgressIP: "100.64.0.1"}); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(300 * time.Millisecond)
 	if _, _, _, ok := g.kv(g.reg.key); !ok {
 		t.Fatal("ignored net check still deleted the key")
+	}
+}
+
+func TestRedialSameEgressNotRegistered(t *testing.T) {
+	g := newRig(t, 1, "626220", nil)
+	g.ready("100.64.0.1")
+	g.waitKey(true, 2*time.Second)
+	if err := g.reg.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.reg.Ready(context.Background(), "100.64.0.1"); !errors.Is(err, ErrEgressUnchanged) {
+		t.Fatalf("err=%v", err)
+	}
+	if _, _, _, ok := g.kv(g.reg.key); ok {
+		t.Fatal("unchanged egress registered")
+	}
+	if !g.reg.Status().Drained {
+		t.Fatal("failed egress check cleared drained")
+	}
+
+	g.reg.abandon()
+	again, err := New(g.reg.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = again.Stop(context.Background()) })
+	if err := again.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(400 * time.Millisecond)
+	if _, _, _, ok := g.kv(again.key); ok {
+		t.Fatal("restart registered the old egress")
+	}
+	if err := again.Ready(context.Background(), "100.64.0.1"); !errors.Is(err, ErrEgressUnchanged) {
+		t.Fatalf("after restart err=%v", err)
+	}
+	g.ip.set("100.64.0.2")
+	if err := again.Ready(context.Background(), "100.64.0.2"); err != nil {
+		t.Fatal(err)
+	}
+	g.reg = again
+	if _, _, val, ok := g.kv(again.key); !ok || val.EgressIP != "100.64.0.2" {
+		t.Fatalf("new egress ok=%v val=%+v", ok, val)
+	}
+}
+
+func TestResourceFaultDeregistersThenRestores(t *testing.T) {
+	g := newRig(t, 1, "626220", nil)
+	g.ready("100.64.0.1")
+	lease, _, _ := g.waitKey(true, 2*time.Second)
+	if err := g.reg.Report(context.Background(), Report{NetOK: true, ResourcesOK: false, EgressIP: "100.64.0.1"}); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, time.Second, func() bool {
+		_, _, _, ok := g.kv(g.reg.key)
+		return !ok
+	})
+	if g.reg.Status().ResourcesOK {
+		t.Fatal("resources still ok")
+	}
+	if err := g.reg.Report(context.Background(), Report{NetOK: true, ResourcesOK: true, EgressIP: "100.64.0.1"}); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, time.Second, func() bool {
+		_, _, _, ok := g.kv(g.reg.key)
+		return ok
+	})
+	if got, _, _, _ := g.kv(g.reg.key); got != lease {
+		t.Fatalf("lease after resource recovery %d want %d", got, lease)
+	}
+}
+
+func TestResourceFaultIgnoreKeepsKey(t *testing.T) {
+	g := newRig(t, 1, "626220", func(cfg *Config) { cfg.ResourceFaultAction = ResourceFaultIgnore })
+	g.ready("100.64.0.1")
+	g.waitKey(true, 2*time.Second)
+	if err := g.reg.Report(context.Background(), Report{NetOK: true, ResourcesOK: false, EgressIP: "100.64.0.1"}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if _, _, _, ok := g.kv(g.reg.key); !ok {
+		t.Fatal("ignored resource fault deleted the key")
+	}
+	if g.reg.Status().ResourcesOK {
+		t.Fatal("status hid the resource fault")
 	}
 }
 

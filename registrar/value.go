@@ -19,13 +19,14 @@ func Key(nodeID string) string { return "/relay/l2/" + nodeID }
 
 // Status 是本进程看到的注册状态，不额外读 etcd。
 type Status struct {
-	Key      string `json:"key"`
-	NodeID   string `json:"node_id"`
-	LeaseID  int64  `json:"lease_id"`
-	Addr     string `json:"addr"`
-	EgressIP string `json:"egress_ip"`
-	Drained  bool   `json:"drained"`
-	ProbeOK  bool   `json:"probe_ok"`
-	NetOK    bool   `json:"net_ok"`
-	WantIP   string `json:"want_ip"`
+	Key         string `json:"key"`
+	NodeID      string `json:"node_id"`
+	LeaseID     int64  `json:"lease_id"`
+	Addr        string `json:"addr"`
+	EgressIP    string `json:"egress_ip"`
+	Drained     bool   `json:"drained"`
+	ProbeOK     bool   `json:"probe_ok"`
+	NetOK       bool   `json:"net_ok"`
+	ResourcesOK bool   `json:"resources_ok"`
+	WantIP      string `json:"want_ip"`
 }

@@ -8,11 +8,13 @@ import (
 
 // diskState 落在 StateFile。drained 必须在 Delete 之前写下去，崩溃后才不会把旧出口又注册上。
 type diskState struct {
-	NodeID     string  `json:"node_id"`
-	Lease      int64   `json:"lease"`
-	PrevLeases []int64 `json:"prev_leases,omitempty"`
-	Drained    bool    `json:"drained"`
-	IP         string  `json:"ip"`
+	NodeID          string  `json:"node_id"`
+	Lease           int64   `json:"lease"`
+	PrevLeases      []int64 `json:"prev_leases,omitempty"`
+	Drained         bool    `json:"drained"`
+	IP              string  `json:"ip"`
+	PrevEgress      string  `json:"prev_egress,omitempty"`
+	ExpectNewEgress bool    `json:"expect_new_egress,omitempty"`
 }
 
 func (r *Registrar) saveLocked() {
@@ -27,11 +29,13 @@ func (r *Registrar) saveLocked() {
 		ip = ""
 	}
 	st := diskState{
-		NodeID:     r.cfg.NodeID,
-		Lease:      int64(r.lease),
-		PrevLeases: append([]int64(nil), r.stale...),
-		Drained:    r.drained,
-		IP:         ip,
+		NodeID:          r.cfg.NodeID,
+		Lease:           int64(r.lease),
+		PrevLeases:      append([]int64(nil), r.stale...),
+		Drained:         r.drained,
+		IP:              ip,
+		PrevEgress:      r.prevEgress,
+		ExpectNewEgress: r.expectNewEgress,
 	}
 	b, err := json.Marshal(st)
 	if err != nil {

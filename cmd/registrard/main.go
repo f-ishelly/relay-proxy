@@ -1,6 +1,5 @@
-// Command registrard 是 admin 不方便直接链接 Go 时的薄适配层。
-// 它把本机 HTTP 调用转成 registrar.Start / Drain / Ready / Report / Stop。
-// 推荐路径仍然是 admin 进程内直接调用这个包。
+// Command registrard 是备选适配层。admin 是 Go 程序，主路径是进程内调用 registrar。
+// 只有暂时不能改 admin 时，才用这个进程把本机 HTTP 转成 Start / Drain / Ready / Report / Stop。
 package main
 
 import (
@@ -22,34 +21,36 @@ import (
 )
 
 type fileConfig struct {
-	Endpoints            []string `json:"endpoints"`
-	NodeID               string   `json:"node_id"`
-	NodeIDFile           string   `json:"node_id_file"`
-	ProxyPort            int      `json:"proxy_port"`
-	ControlPort          int      `json:"control_port"`
-	IntranetAddr         string   `json:"intranet_addr"`
-	ProbeAddr            string   `json:"probe_addr"`
-	ProbeUser            string   `json:"probe_user"`
-	ProbePass            string   `json:"probe_pass"`
-	IPSource             string   `json:"ip_source"`
-	API                  string   `json:"api"`
-	StateFile            string   `json:"state_file"`
-	TTLSeconds           int64    `json:"ttl_seconds"`
-	RenewEveryMS         int      `json:"renew_every_ms"`
-	ProbeEveryMS         int      `json:"probe_every_ms"`
-	ProbeTimeoutMS       int      `json:"probe_timeout_ms"`
-	FailThreshold        int      `json:"fail_threshold"`
-	RiseThreshold        int      `json:"rise_threshold"`
-	IPGuardEveryMS       int      `json:"ip_guard_every_ms"`
-	AZ                   string   `json:"az"`
-	Weight               int      `json:"weight"`
-	Version              string   `json:"version"`
-	AssumedDialMS        int      `json:"assumed_dial_ms"`
-	AssumedEgressCheckMS int      `json:"assumed_egress_check_ms"`
-	InspectionIntervalMS int      `json:"inspection_interval_ms"`
-	IgnoreAdminNetCheck  bool     `json:"ignore_admin_net_check"`
-	DrainAttemptMS       int      `json:"drain_attempt_ms"`
-	DrainBudgetMS        int      `json:"drain_budget_ms"`
+	Endpoints                []string `json:"endpoints"`
+	NodeID                   string   `json:"node_id"`
+	NodeIDFile               string   `json:"node_id_file"`
+	ProxyPort                int      `json:"proxy_port"`
+	ControlPort              int      `json:"control_port"`
+	IntranetAddr             string   `json:"intranet_addr"`
+	ProbeAddr                string   `json:"probe_addr"`
+	ProbeUser                string   `json:"probe_user"`
+	ProbePass                string   `json:"probe_pass"`
+	IPSource                 string   `json:"ip_source"`
+	API                      string   `json:"api"`
+	StateFile                string   `json:"state_file"`
+	TTLSeconds               int64    `json:"ttl_seconds"`
+	RenewEveryMS             int      `json:"renew_every_ms"`
+	ProbeEveryMS             int      `json:"probe_every_ms"`
+	ProbeTimeoutMS           int      `json:"probe_timeout_ms"`
+	FailThreshold            int      `json:"fail_threshold"`
+	RiseThreshold            int      `json:"rise_threshold"`
+	IPGuardEveryMS           int      `json:"ip_guard_every_ms"`
+	AZ                       string   `json:"az"`
+	Weight                   int      `json:"weight"`
+	Version                  string   `json:"version"`
+	AssumedDialMS            int      `json:"assumed_dial_ms"`
+	AssumedEgressCheckMS     int      `json:"assumed_egress_check_ms"`
+	AssumedRedialFailureRate float64  `json:"assumed_redial_failure_rate"`
+	InspectionIntervalMS     int      `json:"inspection_interval_ms"`
+	IgnoreAdminNetCheck      bool     `json:"ignore_admin_net_check"`
+	ResourceFaultAction      string   `json:"resource_fault_action"`
+	DrainAttemptMS           int      `json:"drain_attempt_ms"`
+	DrainBudgetMS            int      `json:"drain_budget_ms"`
 }
 
 func main() {
@@ -87,6 +88,10 @@ func main() {
 	cfg.Weight = fc.Weight
 	cfg.Version = fc.Version
 	cfg.IgnoreAdminNetCheck = fc.IgnoreAdminNetCheck
+	cfg.ResourceFaultAction = fc.ResourceFaultAction
+	if fc.AssumedRedialFailureRate > 0 {
+		cfg.AssumedRedialFailureRate = fc.AssumedRedialFailureRate
+	}
 	cfg.LocalIP = func() string { return readIP(fc.IPSource) }
 	cfg.Logger = registrar.JSONLogger{Out: os.Stdout}
 	cfg.OnAlert = func(a registrar.Alert) {
@@ -150,14 +155,15 @@ func main() {
 			return
 		}
 		var body struct {
-			EgressIP string `json:"egress_ip"`
-			NetOK    *bool  `json:"net_ok"`
+			EgressIP    string `json:"egress_ip"`
+			NetOK       *bool  `json:"net_ok"`
+			ResourcesOK *bool  `json:"resources_ok"`
 		}
-		if err := json.NewDecoder(rq.Body).Decode(&body); err != nil || body.NetOK == nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "err": "net_ok required"})
+		if err := json.NewDecoder(rq.Body).Decode(&body); err != nil || body.NetOK == nil || body.ResourcesOK == nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "err": "net_ok and resources_ok required"})
 			return
 		}
-		err := reg.Report(context.Background(), *body.NetOK, body.EgressIP)
+		err := reg.Report(context.Background(), registrar.Report{NetOK: *body.NetOK, ResourcesOK: *body.ResourcesOK, EgressIP: body.EgressIP})
 		if err != nil {
 			writeResult(w, err)
 			return
@@ -190,7 +196,7 @@ func writeResult(w http.ResponseWriter, err error) {
 	switch {
 	case err == nil:
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
-	case errors.Is(err, registrar.ErrEgressMismatch), errors.Is(err, registrar.ErrNodeConflict):
+	case errors.Is(err, registrar.ErrEgressMismatch), errors.Is(err, registrar.ErrEgressUnchanged), errors.Is(err, registrar.ErrNodeConflict):
 		writeJSON(w, http.StatusConflict, map[string]any{"ok": false, "err": err.Error()})
 	case errors.Is(err, registrar.ErrNotRegistered), errors.Is(err, registrar.ErrDrainTimeout):
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "err": err.Error()})
