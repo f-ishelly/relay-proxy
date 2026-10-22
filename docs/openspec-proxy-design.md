@@ -1,9 +1,10 @@
 # OpenSpec 设计文档：多级高性能隧道代理（Pro 模式）
 
-- **文档版本**：v0.3（预研阶段）
+- **文档版本**：v0.4（预研阶段）
 - **日期**：2026-10-22
 - **状态**：Draft / 可进入 PoC
 - **目标**：参考商业隧道代理 Pro 模式，设计“一级代理 + 二级代理”多级转发系统，支持通过 `username` 指定二级节点、TLS 指纹透传、应用层与 eBPF 监控、etcd 自动服务发现。
+- **v0.4 变更**：落地 L2 向 etcd 的注册（issue #5）。每台 ADSL 主机一个 gost，注册逻辑内嵌进该主机已有的 admin（本仓库的 Go 包 `registrar`）。key 改为 `/relay/l2/{nodeId}`，`value.addr` 是内网地址，出口 IP 只作信息。每台主机一个 lease（TTL 10s，每 3s 续租）。重拨前 Delete key、lease 保留，出口校验通过后用同一个 lease Put。详见 §8。
 - **v0.3 变更**：M1 PoC 的可观测改为 L1 应用层 Prometheus 指标。L1 用 `prometheus/client_golang` 暴露 `proxy_conn_active`、`proxy_connect_latency_ms`、`proxy_upstream_fail_total`，以及本地拒绝计数 `proxy_client_reject_total`。eBPF 只采集内核指标，移到 M2。两类来源和告警在 §7 分开。与 v0.2.1 的半关闭和 10s 应答等待合在同一份数据面上打点。`node_id` 失败关闭：只有 `Resolve` 返回 `ErrNoHealthyAddr` 时保留原来的 ID，其余解析错误记 `unknown`。
 - **v0.2.1 变更**：修正 §10 的隧道拆除和 L2 应答等待。某一方向 `io.Copy` 返回错误（对端 RST 或写失败）时立刻完全关闭两端。干净 EOF 只 `CloseWrite`。反方向是空闲读超时而不是一次性截止：默认 30s（`halfCloseIdleTimeout`，可改），每次成功读到字节都重新计时，客户端先 FIN 和上游先 FIN 用同一套。整条隧道另有空闲兜底，默认 5 分钟（`tunnelIdleTimeout`，可改），任一方向有数据就重新计时；gost 的 `idleTimeout` 默认是 0，不靠它收尸。等待 L2 `200` 的默认上限是 10s，因为 gost 先拨通源站再应答。可观测性改版另记为 v0.3，本版不改 §7。
 - **v0.2 变更**：补上 v0.1 的链路缺口。L1 用第二次 HTTP `CONNECT` 把目标 `host:port` 交给 L2；L2 定为 gost v3 的 HTTP 正向代理，不再使用 HAProxy / Envoy 的纯 TCP 模式。对比与理由见附录 A。
@@ -29,7 +30,7 @@
 - 不做 HTTPS MITM 解密与内容审计。
 - 不做复杂计费系统（仅预留指标）。
 - 不做跨地域智能调度（初版可基于静态策略 + etcd 健康状态）。
-- 不在本文件决定明文 HTTP（非 CONNECT）的头部处理、L1↔L2 传输加密方式，以及 etcd 注册进程的实现形态。
+- 不在本文件决定明文 HTTP（非 CONNECT）的头部处理，以及 L1↔L2 传输加密方式。etcd 注册的实现形态已在 §8 定下来：admin 进程内嵌 `registrar`，不再使用独立的 HAProxy / Envoy 注册 sidecar。
 
 ---
 
@@ -78,7 +79,7 @@ L1 与 L2 的职责不同，不能拿同一类软件硬套。
 - **二级代理（开箱即用）**：gost v3，`handler: http` + `listener: tcp`。关闭 sniffing、MITM 与压缩。这是 v1 的确定选择。
 - **认证**：一份共享口令。L2 的 `auth.username` 写成客户端访问本节点时使用的用户名（含 `@node_id`），`auth.password` 与客户端登录 L1 的密码相同。L1 转发这同一组凭据。L2 只校验它，不从用户名里做选路。v1 每个 L2 节点只对应一个客户端用户名；若以后同一节点要接受多个用户名，需要把 `auth` 换成 gost 的多用户认证配置。
 - **出口拒绝**：L2 在解析之后、拨号之前拒绝环回与链路本地。RFC1918 及其他私网地址本版放行，此范围以后可以再收紧。见附录 A.5。
-- **服务发现**：etcd。注册地址是该实例的 HTTP `CONNECT` 监听地址。
+- **服务发现**：etcd。L1 拨的地址是 `value.addr`（内网 IP:gost 端口），不随 ADSL 重拨变化。注册方式见 §8。
 - **监控**：M1 由 L1 暴露应用层 Prometheus 指标；M2 用 eBPF 采集内核指标。两者都进 Prometheus + Grafana。见 §7。
 - **同接口替换项**（不改变 L1 的 CONNECT）：要更高连接密度用 3proxy；要 Envoy 级指标或 L1↔L2 的 HTTP/2 多路复用时，用锁死配置的 Envoy DFP。二者都不是 v1 的 L2。红线见附录 A.5，替换条件见附录 A.6。
 
@@ -152,7 +153,7 @@ flowchart LR
 
 - **AuthParser**：解析客户端 `Proxy-Authorization`，用全系统共享口令完成认证，并保留用户名与密码供转发。
 - **RouteResolver**：解析 `username` 中 node_id 并在本地路由表匹配。
-- **EtcdWatcher**：维护 `node_id -> upstream_addr[]` 的本地缓存。`upstream_addr` 是 gost 的 HTTP 监听地址。
+- **EtcdWatcher**：Watch `/relay/l2/`，维护 `node_id -> addr`。`addr` 是 value 里的内网 `host:port`。key 存在即可路由，不读状态字段。见 §8.2。
 - **TunnelForwarder**：向选定 L2 写 `CONNECT host:port`，`Proxy-Authorization` 使用客户端刚刚提交的同一组用户名和密码。确认 `200` 后与客户端双向原样转发。不在这条路径上 `tls.Dial`。
 - **Metrics/Trace**：M1 在 L1 进程内暴露应用层 Prometheus 指标。M2 的 eBPF 内核指标另行采集，不在转发路径上计算。见 §7。
 
@@ -426,29 +427,85 @@ M2 在一级与二级节点部署 eBPF Agent（如 Cilium，或自研 exporter�
 - RTT 分布相对该节点基线明显升高。
 - run queue latency 持续高于该节点基线。这是调度延迟，与上面的 CONNECT P95 分开看。
 
-发现与摘除走 etcd lease（§8.1），单独执行，不读 §7.1 或 §7.2 的时间序列：
+发现与摘除走 etcd lease（§8），单独执行，不读 §7.1 或 §7.2 的时间序列：
 
-- 二级节点心跳丢失超过 3 个周期则自动摘除。TTL 10s，心跳 3s。
+- 进程还在时，重拨、出口校验失败、gost 探测失败、巡检失败、ppp 地址变化都是 Delete key，不等 TTL。
+- 进程消失（admin 被杀或主机断电）才等 lease 到期。TTL 10s，每 3s 续租；大约 3 次续租没到就会摘除。etcd 切主会把未到期的 lease 续满，这种情况下最长大约 16s。
 
 ---
 
 ## 8. etcd 自动服务发现设计
 
-### 8.1 注册模型
+### 8.1 注册模型（已实现）
 
-- Key：`/relay/l2/{node_id}/{instance_id}`
-- Value：`{addr, az, weight, capability, version}`
-- `addr`：该实例的 HTTP `CONNECT` 监听地址（`host:port`），供 L1 拨号。
-- Lease：TTL 10s，心跳 3s 续租。
+注册跑在每台 ADSL 主机已有的 admin 里，不另起 sidecar。实现是本仓库的 Go 包 `registrar`，入口是 `Start`、`Drain`、`Ready`、`Report`、`Stop`。gost v3 仍是独立的 systemd 服务，只做 §3.2 / 附录 A.5 的 HTTP `CONNECT`。admin 原有的重拨 API 和定期上报保留；重拨是进程内先 `Drain`，再挂断拨号，出口校验通过后才 `Ready`。
 
-### 8.2 一级消费逻辑
+admin 若不能链接 Go，用 `cmd/registrard` 把同一组调用暴露在 `127.0.0.1`。`example/admin` 是进程内调用的参考。
 
-- 启动时全量拉取。
-- Watch 增量更新到本地内存路由表。
-- 路由选择：
-  1) 精确 node_id
-  2) 多实例时按权重/最少连接
-  3) 不可用则快速失败
+- Key：`/relay/l2/{nodeId}`，例如 `/relay/l2/626220`。一台主机一个 gost，不再使用 `{instance_id}`。
+- Lease：每台主机一个，TTL 10s，每 3s `KeepAliveOnce`。重拨不 `Revoke`，同一次在线期间 lease ID 不变。
+- 客户端：`Config.Endpoints` 原样传给 etcd，`AutoSyncInterval = 0`，避免成员列表被自动改写。生产环境必须列出全部成员，否则切主时连在已死成员上的 lease 会过期。
+
+Value：
+
+```json
+{
+  "addr": "10.0.8.26:8080",
+  "egress_ip": "100.64.12.34",
+  "proxy_port": 8080,
+  "control_port": 17001,
+  "node_id": "626220",
+  "az": "az01",
+  "weight": 100,
+  "capability": "http-connect",
+  "version": "gost-3.3.1",
+  "registered_at": 1792655781744
+}
+```
+
+`addr` 是 L1 拨的内网地址，重拨前后不变。`egress_ip` 只作信息。`weight` 会写进 value；v1 每个 nodeId 只有一个 key，L1 不用再做多实例均衡。
+
+写入用事务：key 不存在、lease 属于本进程、lease 是本机状态文件里的上一任，或该 lease 已经失效，才允许 Put / Delete。否则视为 nodeId 冲突，不覆盖，并调用 `OnAlert`（`kind = node_id_conflict`）。
+
+状态文件（例如 `/var/lib/relay-registrar/{nodeId}.json`）记录 lease、`drained` 和当前出口。`Drain` 先把 `drained` 落盘，再删 key。拨号过程中崩溃重启，在校验通过前不会 Put。上次在线且本机 ppp 地址未变时，新进程 Grant 新 lease，用事务盖住原 key，再撤销旧 lease，Watch 不会看到 DELETE。
+
+### 8.2 生命周期
+
+| 调用 | 行为 |
+| --- | --- |
+| `Start` | 连接配置里的全部成员并 Grant。之后每 3s 续租、每 1s 探测 gost、每 500ms 检查 ppp 地址。探测未通过不 Put |
+| `Drain` | 同步 Delete 本 key。单次超时 700ms，最多重试 6s，etcd 确认后才返回。lease 继续续租 |
+| `Ready(egressIP)` | 本机 ppp 地址必须等于 `egressIP`，且 gost 探测已通过，才用当前 lease Put |
+| `Report(netOK, egressIP)` | 巡检失败则 Delete，恢复后 Put。`drained` 期间忽略。上报正文不写 etcd |
+| `Stop` | `Revoke` lease。进程被杀或断电时没有这一步，key 等 TTL |
+
+后台探测向本机 gost 发带口令的 `CONNECT 127.0.0.1:1`，期望 `403`（撞上附录 A.5 的出口拒绝）。连续 3 次失败就 Delete，连续 2 次成功再 Put，单次超时 800ms。ppp 守卫发现已注册出口和本机地址不一致，或链路断开（`LocalIP` 返回空），立刻 Delete 并进入 `drained`，直到下一次 `Ready`。
+
+下线用 Delete，不用 `status=draining`。key 在即可路由，不依赖每个 L1 都正确过滤状态。两种写法的 etcd 写入次数相同，都是一次重拨两次写。
+
+### 8.3 L1 消费
+
+- 启动时按前缀 `/relay/l2/` 全量拉取，之后 Watch 同一前缀。断线后从最后看到的 revision 续上。
+- key 存在即可路由，拨 `value.addr`。不要拨 `egress_ip`。
+- 拨号超时取 1–2s。主机断电后 key 还会留到 TTL：本仓库内嵌 etcd 上，进程消失约 10.3s 后 key 消失；消失 3s 后再切主，约 14.5s（验收上限 16s，etcd 会在选主时把 lease 续满）。超时太长会把这段空窗坐满。§10 示例里的 `dialUpstream` 仍是 3s，那是数据面草图；接上 EtcdWatcher 时用 1–2s。
+- 路由就是精确的 `node_id`。没有健康地址则快速失败。v1 不做多实例权重选择。
+
+### 8.4 尚未在生产确认的默认值
+
+这些不阻塞实现，都已做成配置。拨号和巡检的时钟在 admin，registrar 不替它睡眠。
+
+| 问题 | 默认 | 哪里改 |
+| --- | --- | --- |
+| 典型拨号、出口校验要多久 | 3s、300ms | `AssumedDial`、`AssumedEgressCheck`。只给 admin 和 `example/admin` 的演示循环用 |
+| 巡检多久一次、查什么 | 期望每 2s 调用一次 `Report`；admin 把结论收成 `netOK`，registrar 信任它 | `InspectionInterval`。巡检不可靠时设 `IgnoreAdminNetCheck`。探测间隔、失败/恢复阈值、地址守卫间隔另有字段 |
+| 定期上报发往哪里，要不要和 etcd value 对齐 | 不外发，也不把上报正文写入 etcd。L1 只读注册 value | `OnReport` 交给 admin 原有上报通道 |
+| 断电、断线多频繁 | 不因此改策略。进程消失后还能被拨到的时间由 TTL 决定 | `TTL` 10s，`RenewInterval` 3s |
+| nodeId 存在哪里，谁保证唯一 | 调用方传入，或从 `NodeIDFile` 读。本包不分配。冲突则拒绝覆盖并告警 | `NodeID`、`NodeIDFile`、`OnAlert` |
+| admin 用什么语言 | Go 直接嵌包。其他语言跑 `cmd/registrard`，调本机 HTTP | 无单独开关 |
+
+### 8.5 本仓库里怎么验证
+
+`go test ./registrar/` 用内嵌 etcd 覆盖验收里的计划内重拨、校验失败与崩溃恢复、未 `Drain` 的地址变化、gost 挂死与巡检失败、切主时在线节点不删 key 且 `Drain` 在 3s 内完成、进程消失后的 TTL / 切主上限，以及 nodeId 冲突。压测入口是 `cmd/loadgen` 和 `scripts/loadtest.sh`：本进程拉起 3 个 etcd 成员，每个客户端都配置全部成员，统计续租错误、lease 丢失和 Watch 上的 DELETE。
 
 ---
 
@@ -458,8 +515,8 @@ M2 在一级与二级节点部署 eBPF Agent（如 Cilium，或自研 exporter�
 
 - K8s（推荐）或 VM。
 - 一级代理：Deployment（无状态，多副本）。
-- 二级代理：DaemonSet（按出口 IP 绑定）或 Deployment（按节点池部署）。进程为 gost，监听 HTTP `CONNECT`。
-- etcd：独立 3~5 节点集群（建议与业务隔离）。
+- 二级代理：2000–4000 台 ADSL 主机。每台一个 gost v3 systemd 服务，监听内网地址；admin 进程内嵌 §8 的 registrar，保留原有重拨 API 和定期上报。
+- etcd：3 节点，走内网，与拨号出口分开。registrar 和 L1 的客户端都配置全部成员。
 - 监控：Prometheus 抓取 L1 管理地址上的 `/metrics`（M1 应用层指标）。M2 另外部署 eBPF Agent。Grafana + Loki（可选）。
 
 ### 9.2 发布策略
@@ -852,7 +909,7 @@ func readConnectStatus(r *bufio.Reader) (int, string, error) {
 ## 12. 风险与对策
 
 1. **风险：二级节点不可用导致路由失败**
-   - 对策：etcd TTL + 主动探活 + 快速摘除。
+   - 对策：重拨、探测失败和巡检失败时 Delete key；进程消失时靠 lease TTL 摘除。见 §8。
 2. **风险：高并发下文件句柄与端口耗尽**
    - 对策：ulimit、`net.ipv4.ip_local_port_range`、按出口拆分 L2。单源地址到单 L2 的 HTTP/1.1 并发大约受临时端口数量限制；超出后再评估 Envoy 的 HTTP/2 `CONNECT` 多路复用。
 3. **风险：TLS 指纹透传被链路设备或错误的 L2 配置破坏**
