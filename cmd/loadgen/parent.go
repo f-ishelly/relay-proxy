@@ -194,7 +194,9 @@ func runParent(lg *runLog, out io.Writer, hosts, procs int, ttl int64, renew, ke
 		"leader_killed":   killed != "",
 		"leader_endpoint": killed,
 	}
-	sumInto(agg, summaries, "registered", "ready_err", "drain_ok", "drain_err", "keepalive_ok", "keepalive_err", "lease_lost", "watch_put", "watch_del")
+	sumInto(agg, summaries, "registered", "ready_err", "drain_ok", "drain_err", "keepalive_ok", "keepalive_err", "lease_lost")
+	// 每个进程都 Watch 了整个 /relay/l2/ 前缀，把次数加总会乘上进程数。取最大的那份。
+	maxInto(agg, summaries, "watch_put", "watch_del")
 	b, _ := json.Marshal(agg)
 	fmt.Fprintln(out, string(b))
 	reg, _ := asInt(agg["registered"])
@@ -207,6 +209,21 @@ func runParent(lg *runLog, out io.Writer, hosts, procs int, ttl int64, renew, ke
 		return 1
 	}
 	return 0
+}
+
+func maxInto(dst map[string]any, rows []map[string]any, keys ...string) {
+	for _, k := range keys {
+		var n int
+		for _, row := range rows {
+			if row == nil {
+				continue
+			}
+			if v, ok := asInt(row[k]); ok && v > n {
+				n = v
+			}
+		}
+		dst[k] = n
+	}
 }
 
 func sumInto(dst map[string]any, rows []map[string]any, keys ...string) {
