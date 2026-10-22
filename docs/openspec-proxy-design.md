@@ -258,7 +258,7 @@ L2 不负责这些指标。gost 自带的 metrics/observer 不在 M1 范围内�
 
 标签取值有上界：
 
-- `node_id`：本地路由表中已有的二级节点 ID，包含在表里但当前没有健康地址的节点。用户名里写出、但路由表从未收录的 ID 不进入标签，固定为 `unknown`。§10 的 `Resolve` 用 `ErrUnknownNode` 区分这两种失败。
+- `node_id`：本地路由表中已有的二级节点 ID，包含在表里但当前没有健康地址的节点。用户名里写出、但路由表从未收录的 ID 不进入标签，固定为 `unknown`。§10 只在 `Resolve` 返回 `ErrNoHealthyAddr` 时保留原来的 ID。`ErrUnknownNode` 以及其他任何错误都记 `unknown`，避免把用户名里的任意 ID 写进标签。两种失败的 `reason` 都是 `no_upstream`。
 - `reason`（`proxy_upstream_fail_total`）：`no_upstream`、`dial`、`l2_write`、`l2_deadline`、`l2_response`、`l2_status`、`l2_auth`。常量导出，§10 在另一个包里按 `l1metrics.ReasonDial` 这种名字使用。
 - `reason`（`proxy_client_reject_total`）：`auth`、`no_node`、`bad_target`、`bad_credential`。这个计数没有 `node_id`，避免把未收录的 ID 或用户名写进标签。
 
@@ -281,7 +281,7 @@ L2 不负责这些指标。gost 自带的 metrics/observer 不在 M1 范围内�
 | 口令为空或不匹配，本地 `407`，不拨 L2 | 不增加 | 不观察 | 不变 | `reason="auth"` |
 | 用户名没有 `node_id`，本地 `400` | 不增加 | 不观察 | 不变 | `reason="no_node"` |
 | `target` 不是 `host:port`（缺少端口等），本地 `400` | 不增加 | 不观察 | 不变 | `reason="bad_target"` |
-| §5.2 `G -- 否`；§10 `Resolve` 失败并写 `502`。错误是 `ErrUnknownNode` 时 `node_id="unknown"`；其他错误表示节点已知但没有健康地址，用该 ID | `reason="no_upstream"` | 不观察。尚未拨号 | 不变 | 不增加 |
+| §5.2 `G -- 否`；§10 `Resolve` 失败并写 `502`。只有 `ErrNoHealthyAddr` 保留该 ID；`ErrUnknownNode` 以及其他错误都是 `node_id="unknown"` | `reason="no_upstream"` | 不观察。尚未拨号 | 不变 | 不增加 |
 | §10 `dialUpstream` 失败并写 `502`。默认实现是 `net.DialTimeout` 3s | `reason="dial"` | 不观察 | 不变 | 不增加 |
 | §10 `upstreamConn.Write` 失败并写 `502` | `reason="l2_write"` | 不观察 | 不变 | 不增加 |
 | §10 `SetReadDeadline` 失败并写 `502`。包括设上 `l2ResponseTimeout`，以及读完后清掉截止时间 | `reason="l2_deadline"` | 不观察 | 不变 | 不增加 |
@@ -296,7 +296,7 @@ L2 不负责这些指标。gost 自带的 metrics/observer 不在 M1 范围内�
 下面是注册与打点函数。打点落在 §10 `handleConnect` 的这些位置，常量都是导出的，另一个包可以引用：
 
 1. 本地 `400` / `407`：按上表调用 `RejectClient(ReasonRejectBadCredential)`、`RejectClient(ReasonRejectAuth)`、`RejectClient(ReasonRejectNoNode)` 或 `RejectClient(ReasonRejectBadTarget)`，再 `reply`。不调用 `Fail502`。
-2. `Resolve` 失败：`inTable := !errors.Is(err, ErrUnknownNode)`，然后 `Fail502(NodeLabel(inTable, nodeID), ReasonNoUpstream)`，再 `badGateway`。
+2. `Resolve` 失败：`inTable := errors.Is(err, ErrNoHealthyAddr)`，然后 `Fail502(NodeLabel(inTable, nodeID), ReasonNoUpstream)`，再 `badGateway`。不是 `ErrNoHealthyAddr` 的错误，`inTable` 为 false，标签是 `unknown`。
 3. 拨号前 `started := time.Now()`。`dialUpstream` 失败：`Fail502(nodeID, ReasonDial)`，再 `badGateway`。
 4. `upstreamConn.Write` 失败：`Fail502(nodeID, ReasonL2Write)`，再 `badGateway`。
 5. `SetReadDeadline` 失败：`Fail502(nodeID, ReasonL2Deadline)`，再 `badGateway`。
@@ -483,9 +483,17 @@ M2 在一级与二级节点部署 eBPF Agent（如 Cilium，或自研 exporter�
 
 ```go
 // ErrUnknownNode 表示本地路由表从未收录该 node_id。
-// 节点已知、但当前没有健康地址时，Resolve 返回别的错误，标签仍用原来的 ID。
 var ErrUnknownNode = errors.New("unknown node")
 
+// ErrNoHealthyAddr 表示该 node_id 已在路由表里，但当前没有健康地址。
+// 只有这个错误保留原来的 node_id 标签。
+var ErrNoHealthyAddr = errors.New("no healthy address")
+
+// Resolver 按 node_id 给出一个健康的 L2 地址。
+// 从未收录返回 ErrUnknownNode；已收录但没有健康地址返回 ErrNoHealthyAddr。
+// 调用方只在 errors.Is(err, ErrNoHealthyAddr) 时把原来的 node_id 写入标签。
+// 其他错误，包括 ErrUnknownNode 和任何未预期的错误，都记 node_id="unknown"。
+// 这两种失败的 reason 都是 no_upstream。
 type Resolver interface {
     Resolve(nodeID string) (addr string, err error)
 }
@@ -581,7 +589,7 @@ func handleConnect(clientConn net.Conn, username, password, target string, resol
 
     upstreamAddr, err := resolver.Resolve(nodeID)
     if err != nil {
-        inTable := !errors.Is(err, ErrUnknownNode)
+        inTable := errors.Is(err, ErrNoHealthyAddr)
         l1metrics.Fail502(l1metrics.NodeLabel(inTable, nodeID), l1metrics.ReasonNoUpstream)
         return badGateway(fmt.Errorf("resolve node %s failed: %w", nodeID, err))
     }
