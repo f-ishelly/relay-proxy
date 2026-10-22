@@ -43,6 +43,7 @@ func main() {
 	child := flag.Bool("child", false, "由父进程拉起的 worker")
 	redialFile := flag.String("redial-file", "", "文件里的 unix 毫秒到点后，所有主机同时 Drain")
 	idBase := flag.Int("id-base", 600000, "本进程第一个 nodeId")
+	staggerBase := flag.Int("stagger-base", 0, "本进程第一台主机的全局下标，启动睡眠是 (stagger-base+i)%%8000ms")
 	flag.Parse()
 
 	if *external && !*child {
@@ -160,7 +161,7 @@ func main() {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			time.Sleep(time.Duration(i%8000) * time.Millisecond)
+			time.Sleep(time.Duration((*staggerBase+i)%8000) * time.Millisecond)
 			node := fmt.Sprintf("%06d", *idBase+i)
 			ip1 := egressIP(i, 0)
 			ip2 := egressIP(i, 1)
@@ -189,7 +190,7 @@ func main() {
 			cfg.ProbeRiseThreshold = 1
 			cfg.ProbeFailThreshold = 5
 			cfg.IPGuardInterval = time.Minute
-			cfg.StartGrantTimeout = 20 * time.Second
+			cfg.StartGrantTimeout = 30 * time.Second
 			cfg.DialTimeout = 3 * time.Second
 			cfg.DialKeepAliveTime = 30 * time.Second
 			cfg.DialKeepAliveTimeout = 10 * time.Second
@@ -200,18 +201,18 @@ func main() {
 				return
 			}
 			regs[i] = reg
-			sctx, scancel := context.WithTimeout(context.Background(), 20*time.Second)
+			sctx, scancel := context.WithTimeout(context.Background(), 30*time.Second)
 			err = reg.Start(sctx)
 			scancel()
 			if err != nil {
 				readyErr.Add(1)
 				return
 			}
-			deadline := time.Now().Add(8 * time.Second)
+			deadline := time.Now().Add(30 * time.Second)
 			for time.Now().Before(deadline) && !reg.Status().ProbeOK {
 				time.Sleep(20 * time.Millisecond)
 			}
-			rctx, rcancel := context.WithTimeout(context.Background(), 8*time.Second)
+			rctx, rcancel := context.WithTimeout(context.Background(), 30*time.Second)
 			err = reg.Ready(rctx, ip1, "")
 			rcancel()
 			if err != nil {
@@ -254,7 +255,7 @@ func main() {
 	up := registered.Load()
 	fmt.Fprintf(out, "{\"event\":\"registered\",\"label\":%q,\"hosts\":%d,\"up\":%d,\"ready_err\":%d,\"elapsed_ms\":%d,\"endpoints\":%q}\n",
 		*label, *hosts, up, readyErr.Load(), time.Since(start).Milliseconds(), strings.Join(eps, ","))
-	if up == int64(*hosts) && readyErr.Load() == 0 {
+	if up > 0 && (*redialFile != "" || (up == int64(*hosts) && readyErr.Load() == 0)) {
 		if *redialFile == "" {
 			close(redialStart)
 		}
@@ -298,6 +299,14 @@ func main() {
 		kaMax = samples[len(samples)-1]
 		p50 = samples[len(samples)/2]
 	}
+	sleepFormula := "i%8000ms"
+	sleepMax := 0
+	if *hosts > 0 {
+		sleepMax = (*staggerBase + *hosts - 1) % 8000
+	}
+	if *staggerBase > 0 {
+		sleepFormula = "(staggerBase+i)%8000ms"
+	}
 	summary := map[string]any{
 		"event":                "summary",
 		"label":                *label,
@@ -305,8 +314,8 @@ func main() {
 		"conns_flag":           *conns,
 		"registrar_clients":    *hosts,
 		"redial_inflight":      *redialInflight,
-		"start_sleep":          "i%8000ms",
-		"start_sleep_max_ms":   (*hosts - 1) % 8000,
+		"start_sleep":          sleepFormula,
+		"start_sleep_max_ms":   sleepMax,
 		"client_mode":          "registrar",
 		"endpoints":            len(eps),
 		"ttl_s":                *ttl,

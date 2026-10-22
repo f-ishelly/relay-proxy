@@ -522,7 +522,7 @@ Value：
 
 `go test ./registrar/` 用内嵌 etcd 覆盖验收里的计划内重拨、重拨后出口 IP 没变时不注册、校验失败与崩溃恢复、未 `Drain` 的地址变化、gost 挂死与外网/资源巡检失败、切主时在线节点不删 key 且 `Drain` 在 3s 内完成、进程消失后的 TTL / 切主上限、nodeId 冲突，以及 etcd 单次操作延迟 1.5s 时续租间隔仍低于 TTL。压测入口是 `cmd/loadgen` 和 `scripts/loadtest.sh`。
 
-启动错开是 `i % 8000ms`。`hosts=4000` 时下标最大是 3999，所以实际错开是 0–3999ms，不是 8s。loadgen 把这个公式和 `start_sleep_max_ms` 写进 summary。`-redial-inflight 0` 表示不限制同时进行的 `Drain`+`Ready`。
+启动错开是 `(staggerBase+i) % 8000ms`。单进程 `staggerBase` 为 0，公式就是 `i % 8000ms`。`hosts=4000` 时下标最大是 3999，所以实际错开是 0–3999ms，不是 8s。多进程时父进程把已经分出去的主机数当作 `staggerBase`，4000 台仍然铺在这 4s 里，而不是每个进程各自从 0 再铺一遍。loadgen 把公式和 `start_sleep_max_ms` 写进 summary。`-redial-inflight 0` 表示不限制同时进行的 `Drain`+`Ready`。
 
 续租和 `Drain` 不再共用一把锁。锁拆开之前，单进程、内嵌 etcd、4000 路不限并发、同一时刻 `Drain`，会把续租堵住：`docs/acceptance/acceptance7-unbounded-before.log` 由 loadgen 在干净工作区上自己写入（commit `7c4cd62`），`lease_lost` 为 4000。修复之后的同形运行和多进程外部 etcd 运行也由工具写头，分别在 `acceptance7-unbounded-after.log` 和 `acceptance7.log`。验收 7 是多个 OS 进程（默认 8）对 3 个独立 etcd 进程，不限并发，重拨时刻对齐，然后停掉 leader。日志头里的 commit、`git status`、Go 版本、开始和结束时间都是运行时写的，不要手改。
 

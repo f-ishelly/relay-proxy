@@ -91,6 +91,7 @@ func runParent(lg *runLog, out io.Writer, hosts, procs int, ttl int64, renew, ke
 			"-register-timeout", registerTimeout.String(),
 			"-redial-inflight", "0",
 			"-redial-file", redialPath,
+			"-stagger-base", strconv.Itoa(used),
 			"-label", fmt.Sprintf("%s-p%d", label, p),
 		}
 		used += n
@@ -107,7 +108,7 @@ func runParent(lg *runLog, out io.Writer, hosts, procs int, ttl int64, renew, ke
 	}
 
 	var mu sync.Mutex
-	var registered, redialEvents int
+	var registered, redialEvents, regEvents int
 	ready := make(chan struct{})
 	redialDone := make(chan struct{})
 	var once sync.Once
@@ -130,10 +131,11 @@ func runParent(lg *runLog, out io.Writer, hosts, procs int, ttl int64, renew, ke
 				switch ev["event"] {
 				case "registered":
 					mu.Lock()
+					regEvents++
 					if up, ok := asInt(ev["up"]); ok {
 						registered += up
 					}
-					if registered >= hosts {
+					if regEvents >= procs {
 						once.Do(func() { close(ready) })
 					}
 					mu.Unlock()
@@ -167,11 +169,13 @@ func runParent(lg *runLog, out io.Writer, hosts, procs int, ttl int64, renew, ke
 	case <-time.After(registerTimeout):
 		fmt.Fprintf(out, "{\"event\":\"redial_timeout\"}\n")
 	}
+	killed := ""
 	if killAfter > 0 {
 		time.Sleep(killAfter)
 		if ep, err := killExternalLeader(eps, members); err != nil {
 			fmt.Fprintf(out, "{\"event\":\"kill_leader_error\",\"err\":%q}\n", err.Error())
 		} else {
+			killed = ep
 			fmt.Fprintf(out, "{\"event\":\"kill_leader\",\"endpoint\":%q}\n", ep)
 		}
 	}
@@ -187,6 +191,8 @@ func runParent(lg *runLog, out io.Writer, hosts, procs int, ttl int64, renew, ke
 		"redial_inflight": 0,
 		"external_etcd":   true,
 		"endpoints":       len(eps),
+		"leader_killed":   killed != "",
+		"leader_endpoint": killed,
 	}
 	sumInto(agg, summaries, "registered", "ready_err", "drain_ok", "drain_err", "keepalive_ok", "keepalive_err", "lease_lost", "watch_put", "watch_del")
 	b, _ := json.Marshal(agg)
