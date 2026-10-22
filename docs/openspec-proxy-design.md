@@ -1,9 +1,10 @@
 # OpenSpec 设计文档：多级高性能隧道代理（Pro 模式）
 
-- **文档版本**：v0.2（预研阶段）
-- **日期**：2026-10-21
+- **文档版本**：v0.2.1（预研阶段）
+- **日期**：2026-10-22
 - **状态**：Draft / 可进入 PoC
 - **目标**：参考商业隧道代理 Pro 模式，设计“一级代理 + 二级代理”多级转发系统，支持通过 `username` 指定二级节点、TLS 指纹透传、eBPF 监控、etcd 自动服务发现。
+- **v0.2.1 变更**：修正 §10 的隧道拆除和 L2 应答等待。某一方向 `io.Copy` 返回错误（对端 RST 或写失败）时立刻完全关闭两端。干净 EOF 只 `CloseWrite`，并给反方向一个空闲读超时，避免对端既不写完也不关闭时 handler 一直挂着。等待 L2 `200` 的默认上限改为 10s，因为 gost 先拨通源站再应答。可观测性改版另记为 v0.3，本版不改 §7。
 - **v0.2 变更**：补上 v0.1 的链路缺口。L1 用第二次 HTTP `CONNECT` 把目标 `host:port` 交给 L2；L2 定为 gost v3 的 HTTP 正向代理，不再使用 HAProxy / Envoy 的纯 TCP 模式。对比与理由见附录 A。
 - **已确认**：v1 的 L2 就是 gost v3，3proxy 与锁死配置的 Envoy 只作为同接口替换项。出口拒绝范围只有环回和链路本地，不含 RFC1918。L1→L2 使用客户端登录 L1 的那一份共享口令，不轮换。
 
@@ -311,7 +312,7 @@ flowchart TD
 
 ## 10. Go 使用示例（一级代理核心逻辑）
 
-下面是 L1 处理 CONNECT 的数据面，共享口令校验就在这个函数里完成。口令先做 SHA-256，再用 `subtle.ConstantTimeCompare` 与全系统共享口令比较；为空或不匹配时直接回 `407`，不拨 L2。用户名以最后一个 `@` 切分，`node_id` 是它后面的那一段，因此用户名本身可以含 `@`。目标不是 `host:port`，或切不出 `node_id`，回 `400`。通过后再向 L2 发第二次 `CONNECT`，`Proxy-Authorization` 使用客户端提交的同一组用户名和密码。读取 L2 应答带有截止时间，读完无论成败都清掉，避免静默的 L2 占住 goroutine 和文件描述符。L2 返回 `407` 时，连同 `Proxy-Authenticate` 交给客户端；解析节点、拨号、读应答失败，以及除 `200`/`407` 以外的状态，先写 `502` 再返回错误（见 §5.1）。确认 `200` 后才应答客户端。之后两个方向各自拷贝：某一方向读到 EOF 只对对端 `CloseWrite`，两个方向都结束后再完全关闭。出口网段拒绝在 L2 解析之后做，不在本函数里。示例不包含 etcd。涉及 `bufio`、`crypto/sha256`、`crypto/subtle`、`encoding/base64`、`fmt`、`io`、`net`、`net/http`、`strconv`、`strings`、`time`。
+下面是 L1 处理 CONNECT 的数据面，共享口令校验就在这个函数里完成。口令先做 SHA-256，再用 `subtle.ConstantTimeCompare` 与全系统共享口令比较；为空或不匹配时直接回 `407`，不拨 L2。用户名以最后一个 `@` 切分，`node_id` 是它后面的那一段，因此用户名本身可以含 `@`。目标不是 `host:port`，或切不出 `node_id`，回 `400`。通过后再向 L2 发第二次 `CONNECT`，`Proxy-Authorization` 使用客户端提交的同一组用户名和密码。读取 L2 应答的默认上限是 10 秒（`l2ResponseTimeout`，部署时可改）。gost 要先拨通源站才回 `200`，2 秒会把 2.5 秒才拨通的源站误判成 `502`。读完无论成败都清掉这个截止时间，隧道阶段不再受它限制。客户端若在等待期间先断开，L1 关掉这条上游连接，读立刻返回，不必坐满 10 秒。L2 返回 `407` 时，连同 `Proxy-Authenticate` 交给客户端；解析节点、拨号、读应答失败，以及除 `200`/`407` 以外的状态，先写 `502` 再返回错误（见 §5.1）。确认 `200` 后才应答客户端。之后两个方向各自拷贝：`io.Copy` 返回非 nil 错误时立刻完全关闭两端，另一方向不会继续堵着；干净 EOF 只对对端 `CloseWrite`，并给反方向设空闲读超时（`halfCloseIdleTimeout`，示例 500ms，可改），对端若既不写完也不关闭，超时后仍释放这条隧道。两个方向都结束后再由 defer 完全关闭。出口网段拒绝在 L2 解析之后做，不在本函数里。示例不包含 etcd。涉及 `bufio`、`crypto/sha256`、`crypto/subtle`、`encoding/base64`、`fmt`、`io`、`net`、`net/http`、`strconv`、`strings`、`time`。
 
 ```go
 type Resolver interface {
@@ -322,11 +323,15 @@ type Resolver interface {
 // 生产环境从配置注入；示例写成常量。
 var sharedSecret = "s3cret"
 
-// l2ResponseTimeout 限制等待 L2 CONNECT 状态行的时间。TCP 已连通但 L2 不回答时，
-// 没有这个截止时间，读会一直阻塞，goroutine 和文件描述符都退不掉。
-// 读完应答后必须清掉，后面的隧道拷贝不再受它限制。
-// 示例取 2s，与一次建连等待同一量级；源站拨号较慢时再调大。
-const l2ResponseTimeout = 2 * time.Second
+// l2ResponseTimeout 是等待 L2 CONNECT 状态行的上限，部署时可改这个变量。
+// gost 在拨通源站之后才回 200。2s 会把 2.5s 才拨通的源站写成 502。
+// 默认 10s，覆盖一次较慢的源站拨号。读完应答后必须清掉，隧道拷贝不再受它限制。
+var l2ResponseTimeout = 10 * time.Second
+
+// halfCloseIdleTimeout 是半关闭之后等待反方向结束的上限，部署时可改。
+// 干净 EOF 只 CloseWrite。反方向的对端若既不写完也不关闭，没有这个截止时间，
+// handler 会一直堵在另一个 io.Copy 上。io.Copy 返回非 nil 错误时不走这里，而是立刻完全关闭两端。
+var halfCloseIdleTimeout = 500 * time.Millisecond
 
 // username 格式示例: appuser@node-az01-003。
 // node_id 取最后一个 '@' 之后的部分，用户名本身可以含 '@'（例如 user@corp@node1 → node1）。
@@ -408,17 +413,51 @@ func handleConnect(clientConn net.Conn, username, password, target string, resol
         return badGateway(err)
     }
 
-    if err := upstreamConn.SetReadDeadline(time.Now().Add(l2ResponseTimeout)); err != nil {
-        return badGateway(err)
+    // 此后只有 clientPump 读 clientConn，隧道从 clientPipe 读，避免两个读端抢数据。
+    // 等待 L2 时客户端先断开，则关掉 upstream，让状态行读取立刻返回。
+    clientPipe, clientPumpW := io.Pipe()
+    defer clientPipe.Close()
+    clientGone := make(chan struct{})
+    go func() {
+        _, copyErr := io.Copy(clientPumpW, clientConn)
+        _ = clientPumpW.CloseWithError(copyErr)
+        close(clientGone)
+    }()
+
+    type l2Status struct {
+        code               int
+        proxyAuthenticate  string
+        br                 *bufio.Reader
+        err                error
     }
-    br := bufio.NewReader(upstreamConn)
-    code, proxyAuthenticate, err := readConnectStatus(br)
-    if clearErr := upstreamConn.SetReadDeadline(time.Time{}); clearErr != nil && err == nil {
-        err = clearErr
+    statusc := make(chan l2Status, 1)
+    go func() {
+        var st l2Status
+        if st.err = upstreamConn.SetReadDeadline(time.Now().Add(l2ResponseTimeout)); st.err != nil {
+            statusc <- st
+            return
+        }
+        st.br = bufio.NewReader(upstreamConn)
+        st.code, st.proxyAuthenticate, st.err = readConnectStatus(st.br)
+        if clearErr := upstreamConn.SetReadDeadline(time.Time{}); clearErr != nil && st.err == nil {
+            st.err = clearErr
+        }
+        statusc <- st
+    }()
+    var st l2Status
+    select {
+    case st = <-statusc:
+    case <-clientGone:
+        upstreamConn.Close()
+        st = <-statusc
+        if st.err == nil {
+            st.err = fmt.Errorf("client closed during l2 handshake")
+        }
     }
-    if err != nil {
-        return badGateway(err)
+    if st.err != nil {
+        return badGateway(st.err)
     }
+    code, proxyAuthenticate, br := st.code, st.proxyAuthenticate, st.br
     if code == http.StatusProxyAuthRequired {
         challenge := proxyAuthenticate
         if challenge == "" || strings.ContainsAny(challenge, "\r\n") {
@@ -437,18 +476,29 @@ func handleConnect(clientConn net.Conn, username, password, target string, resol
 
     // br 可能已经缓冲了与 200 粘在一起的后续字节，转发必须从 br 读，不能另起一次 net.Conn 读。
     // 从这里开始不再解析 HTTP，也不建立 TLS。io.Copy 会保持字节内容；是否换成 splice 不影响 JA3/JA4。
-    // 某一方向读到 EOF 时只 CloseWrite 对端，让对端把已经缓冲的响应写回来；两个方向都结束后再由 defer 完全关闭。
+    // 读或写出错：完全关闭两端，另一方向的 io.Copy 会立刻返回。
+    // 干净 EOF：只 CloseWrite，让对端把已经缓冲的响应写回来，并给本连接的读端设空闲截止时间。
+    // 对端若不结束，反方向会在 halfCloseIdleTimeout 后超时返回，再走上面的完全关闭。
     errc := make(chan error, 2)
-    go func() {
-        _, copyErr := io.Copy(upstreamConn, clientConn)
-        closeWrite(upstreamConn)
-        errc <- copyErr
-    }()
-    go func() {
-        _, copyErr := io.Copy(clientConn, br)
-        closeWrite(clientConn)
-        errc <- copyErr
-    }()
+    relay := func(dst net.Conn, src io.Reader) {
+        _, copyErr := io.Copy(dst, src)
+        if copyErr != nil {
+            clientConn.Close()
+            upstreamConn.Close()
+            errc <- copyErr
+            return
+        }
+        if werr := closeWrite(dst); werr != nil {
+            clientConn.Close()
+            upstreamConn.Close()
+            errc <- werr
+            return
+        }
+        _ = dst.SetReadDeadline(time.Now().Add(halfCloseIdleTimeout))
+        errc <- nil
+    }
+    go func() { relay(upstreamConn, clientPipe) }()
+    go func() { relay(clientConn, br) }()
     err1 := <-errc
     err2 := <-errc
     if err1 != nil {
@@ -458,12 +508,11 @@ func handleConnect(clientConn net.Conn, username, password, target string, resol
 }
 
 // closeWrite 关闭写端，使对端读到 EOF，同时保留本端读端。不是 TCP 连接时退化为完全关闭。
-func closeWrite(conn net.Conn) {
+func closeWrite(conn net.Conn) error {
     if cw, ok := conn.(interface{ CloseWrite() error }); ok {
-        _ = cw.CloseWrite()
-        return
+        return cw.CloseWrite()
     }
-    _ = conn.Close()
+    return conn.Close()
 }
 
 func readConnectStatus(r *bufio.Reader) (int, string, error) {
