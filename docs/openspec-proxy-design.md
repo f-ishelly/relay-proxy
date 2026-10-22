@@ -1,9 +1,10 @@
 # OpenSpec 设计文档：多级高性能隧道代理（Pro 模式）
 
-- **文档版本**：v0.2.1（预研阶段）
+- **文档版本**：v0.3（预研阶段）
 - **日期**：2026-10-22
 - **状态**：Draft / 可进入 PoC
-- **目标**：参考商业隧道代理 Pro 模式，设计“一级代理 + 二级代理”多级转发系统，支持通过 `username` 指定二级节点、TLS 指纹透传、eBPF 监控、etcd 自动服务发现。
+- **目标**：参考商业隧道代理 Pro 模式，设计“一级代理 + 二级代理”多级转发系统，支持通过 `username` 指定二级节点、TLS 指纹透传、应用层与 eBPF 监控、etcd 自动服务发现。
+- **v0.3 变更**：M1 PoC 的可观测改为 L1 应用层 Prometheus 指标。L1 用 `prometheus/client_golang` 暴露 `proxy_conn_active`、`proxy_connect_latency_ms`、`proxy_upstream_fail_total`，以及本地拒绝计数 `proxy_client_reject_total`。eBPF 只采集内核指标，移到 M2。两类来源和告警在 §7 分开。与 v0.2.1 的半关闭和 10s 应答等待合在同一份数据面上打点。`node_id` 失败关闭：只有 `Resolve` 返回 `ErrNoHealthyAddr` 时保留原来的 ID，其余解析错误记 `unknown`。
 - **v0.2.1 变更**：修正 §10 的隧道拆除和 L2 应答等待。某一方向 `io.Copy` 返回错误（对端 RST 或写失败）时立刻完全关闭两端。干净 EOF 只 `CloseWrite`。反方向是空闲读超时而不是一次性截止：默认 30s（`halfCloseIdleTimeout`，可改），每次成功读到字节都重新计时，客户端先 FIN 和上游先 FIN 用同一套。整条隧道另有空闲兜底，默认 5 分钟（`tunnelIdleTimeout`，可改），任一方向有数据就重新计时；gost 的 `idleTimeout` 默认是 0，不靠它收尸。等待 L2 `200` 的默认上限是 10s，因为 gost 先拨通源站再应答。可观测性改版另记为 v0.3，本版不改 §7。
 - **v0.2 变更**：补上 v0.1 的链路缺口。L1 用第二次 HTTP `CONNECT` 把目标 `host:port` 交给 L2；L2 定为 gost v3 的 HTTP 正向代理，不再使用 HAProxy / Envoy 的纯 TCP 模式。对比与理由见附录 A。
 - **已确认**：v1 的 L2 就是 gost v3，3proxy 与锁死配置的 Envoy 只作为同接口替换项。出口拒绝范围只有环回和链路本地，不含 RFC1918。L1→L2 使用客户端登录 L1 的那一份共享口令，不轮换。
@@ -19,7 +20,7 @@
 2. 初版通过认证用户名参数指定二级代理节点 ID。
 3. 一级代理将流量转发到指定二级代理，再由二级代理访问目标站点。目标 `host:port` 由 L1 在第二次 `CONNECT` 中显式交给 L2。
 4. 对目标网站的 TLS 指纹信息透传（不在一级/二级进行 TLS 中间人解密，也不重新生成 ClientHello）。
-5. 使用 eBPF 做高性能、低侵入的网络与系统指标监控。
+5. 可观测分两层：M1 由 L1 暴露应用层 Prometheus 指标（建连时延、活跃隧道、上游失败、本地拒绝）；M2 用 eBPF 采集内核网络与系统指标。
 6. 二级节点采用开源高性能代理方案；一级节点基于开源方案二次开发。
 7. 通过 etcd 实现二级节点自动注册、发现、健康感知。
 
@@ -78,7 +79,7 @@ L1 与 L2 的职责不同，不能拿同一类软件硬套。
 - **认证**：一份共享口令。L2 的 `auth.username` 写成客户端访问本节点时使用的用户名（含 `@node_id`），`auth.password` 与客户端登录 L1 的密码相同。L1 转发这同一组凭据。L2 只校验它，不从用户名里做选路。v1 每个 L2 节点只对应一个客户端用户名；若以后同一节点要接受多个用户名，需要把 `auth` 换成 gost 的多用户认证配置。
 - **出口拒绝**：L2 在解析之后、拨号之前拒绝环回与链路本地。RFC1918 及其他私网地址本版放行，此范围以后可以再收紧。见附录 A.5。
 - **服务发现**：etcd。注册地址是该实例的 HTTP `CONNECT` 监听地址。
-- **监控**：eBPF + Prometheus + Grafana。
+- **监控**：M1 由 L1 暴露应用层 Prometheus 指标；M2 用 eBPF 采集内核指标。两者都进 Prometheus + Grafana。见 §7。
 - **同接口替换项**（不改变 L1 的 CONNECT）：要更高连接密度用 3proxy；要 Envoy 级指标或 L1↔L2 的 HTTP/2 多路复用时，用锁死配置的 Envoy DFP。二者都不是 v1 的 L2。红线见附录 A.5，替换条件见附录 A.6。
 
 gost 的配置形态：
@@ -134,16 +135,16 @@ flowchart LR
     L2N -->|TCP 原样转发| T
 
     subgraph Obs[可观测体系]
-      BPF[eBPF Agent]
+      BPF[eBPF Agent\nM2 内核指标]
       P[Prometheus]
       G[Grafana]
     end
 
-    L1 -. metrics .-> P
+    L1 -. 应用层指标 .-> P
     L2A -. metrics .-> P
     L2B -. metrics .-> P
     L2N -. metrics .-> P
-    BPF -. kernel/net metrics .-> P
+    BPF -. 内核指标 .-> P
     P --> G
 ```
 
@@ -153,7 +154,7 @@ flowchart LR
 - **RouteResolver**：解析 `username` 中 node_id 并在本地路由表匹配。
 - **EtcdWatcher**：维护 `node_id -> upstream_addr[]` 的本地缓存。`upstream_addr` 是 gost 的 HTTP 监听地址。
 - **TunnelForwarder**：向选定 L2 写 `CONNECT host:port`，`Proxy-Authorization` 使用客户端刚刚提交的同一组用户名和密码。确认 `200` 后与客户端双向原样转发。不在这条路径上 `tls.Dial`。
-- **Metrics/Trace**：暴露 Prometheus 指标，关联 eBPF 内核维度数据。
+- **Metrics/Trace**：M1 在 L1 进程内暴露应用层 Prometheus 指标。M2 的 eBPF 内核指标另行采集，不在转发路径上计算。见 §7。
 
 ---
 
@@ -184,7 +185,7 @@ sequenceDiagram
     T-->>U: TLS ServerHello 及后续记录（经 L2、L1 原样返回）
 ```
 
-L1 必须先收到 L2 的 `200`（L2 已经与目标完成 TCP 握手），再向客户端回 `200`。在此之前客户端不应发出 ClientHello。客户端口令为空或不匹配时，L1 直接回 `407`，不拨 L2。目标不是 `host:port`（缺少端口），或用户名里没有 `node_id`，回 `400`。L2 返回 `407` 时，L1 把 `407` 和 `Proxy-Authenticate` 交给客户端，不改写成 `502`。L2 的其他非 2xx、应答超时或拨号失败才转为 `502`。这些失败路径上都不会开始传输隧道字节。
+L1 必须先收到 L2 的 `200`（L2 已经与目标完成 TCP 握手），再向客户端回 `200`。在此之前客户端不应发出 ClientHello。客户端口令为空或不匹配时，L1 直接回 `407`，不拨 L2，计入 `proxy_client_reject_total{reason="auth"}`。目标不是 `host:port`（缺少端口）回 `400`，`reason="bad_target"`；用户名里没有 `node_id` 回 `400`，`reason="no_node"`。用户名或口令含 CR/LF 也是本地 `400`，`reason="bad_credential"`。这些本地 400/407 都不拨 L2。L2 返回 `407` 时，L1 把 `407` 和 `Proxy-Authenticate` 交给客户端，不改写成 `502`，计入 `proxy_upstream_fail_total{reason="l2_auth"}`。L2 的其他非 2xx、应答超时或拨号失败才转为 `502`，按 §7.1 的 `reason` 计入 `proxy_upstream_fail_total`。等待状态行时的读超时是 `reason="l2_response"`。这些失败路径上都不会开始传输隧道字节。建连时延和活跃隧道的打点见 §7.1。
 
 ### 5.2 流程图（路由决策）
 
@@ -209,6 +210,8 @@ flowchart TD
     J -- 其他或超时 --> Z
     K --> I[双向原样转发并记录指标]
 ```
+
+图中的 `X`、`Y`、`Z`、`H`、`J`、`K` 与 §7.1 对应。`X`（本地 407）和 `Y`（本地 400）计入 `proxy_client_reject_total`，不拨 L2。进入 `Z` 的 `502` 计入 `proxy_upstream_fail_total`，`reason` 按路径分开。`J -- 407` 不进入 `Z`，单独记 `reason="l2_auth"`。`proxy_connect_latency_ms` 在 `J` 为 200 时观察，区间从 `H` 拨号到读到 L2 的 `200`。`proxy_conn_active` 在 `K` 向客户端写出 `200` 之后随隧道增减；客户端断开后，这个 gauge 最长还会多停半关闭空闲（默认 30s）或隧道空闲（默认 5 分钟）。标签、桶，以及和 §10 每一处回写的对应，见 §7.1。
 
 ---
 
@@ -240,28 +243,192 @@ flowchart TD
 
 ---
 
-## 7. eBPF 监控方案
+## 7. 可观测性
 
-### 7.1 采集范围
+指标有两个来源，都进 Prometheus，采集位置不同。
 
-- 连接维度：建连速率、活跃连接数、连接时长分布。
-- 网络维度：重传率、RTT 分布、丢包指标（内核侧统计）。
-- 系统维度：CPU run queue、软中断、socket backlog。
+- **应用层（M1）**：L1 进程用 `prometheus/client_golang` 暴露 `proxy_conn_active`、`proxy_connect_latency_ms`、`proxy_upstream_fail_total` 和 `proxy_client_reject_total`。这些指标在 L1 的请求路径上更新。前三项是 §7.3 的 SLI。
+- **内核（M2）**：eBPF Agent 采集 `kernel_tcp_retrans_total`、RTT、run queue latency 等内核网络与系统指标。
 
-### 7.2 技术实现
+### 7.1 应用层指标（M1）
 
-- 在一级与二级节点部署 eBPF Agent（如 Cilium/自研 bpf exporter）。
-- 暴露 Prometheus 指标：
-  - `proxy_conn_active`
-  - `proxy_connect_latency_ms_bucket`
-  - `proxy_upstream_fail_total`
-  - `kernel_tcp_retrans_total`
+L1 注册下面四项，并在独立的管理监听地址上提供 `/metrics`。管理端口与代理端口分开，不接受 `CONNECT`，也不检查 `Proxy-Authorization`。每个 L1 副本暴露自己的值，集群总量由 Prometheus 聚合。默认 registry 同时导出 client_golang 自带的 Go 运行时和进程指标。本节的 SLI 是 `proxy_conn_active`、`proxy_connect_latency_ms`、`proxy_upstream_fail_total`。`proxy_client_reject_total` 只计拨号 L2 之前的本地拒绝，不进 §7.3 的失败率。
+
+L2 不负责这些指标。gost 自带的 metrics/observer 不在 M1 范围内。本版只覆盖 CONNECT 隧道；明文 HTTP 的计数不在本文件决定。
+
+标签取值有上界：
+
+- `node_id`：本地路由表中已有的二级节点 ID，包含在表里但当前没有健康地址的节点。用户名里写出、但路由表从未收录的 ID 不进入标签，固定为 `unknown`。§10 只在 `Resolve` 返回 `ErrNoHealthyAddr` 时保留原来的 ID。`ErrUnknownNode`、其他任何错误，以及成功但地址为空，都记 `unknown`，避免把用户名里的任意 ID 写进标签。这些失败的 `reason` 都是 `no_upstream`。
+- `reason`（`proxy_upstream_fail_total`）：`no_upstream`、`dial`、`l2_write`、`l2_deadline`、`l2_response`、`l2_status`、`l2_auth`。常量导出，§10 在另一个包里按 `l1metrics.ReasonDial` 这种名字使用。
+- `reason`（`proxy_client_reject_total`）：`auth`、`no_node`、`bad_target`、`bad_credential`。这个计数没有 `node_id`，避免把未收录的 ID 或用户名写进标签。
+
+不使用目标主机、URL、用户名、源地址或错误原文做标签。
+
+| 指标 | 类型 | 标签 | 含义 |
+| --- | --- | --- | --- |
+| `proxy_conn_active` | Gauge | `node_id` | 已经向客户端写出 `200`、`handleConnect` 尚未返回的隧道数。客户端断开后 gauge 仍可能多计这条隧道：半关闭后反方向空闲最长再等 `halfCloseIdleTimeout`（默认 30s）；两边都没有字节时由 `tunnelIdleTimeout`（默认 5 分钟）收尸 |
+| `proxy_connect_latency_ms` | Histogram | `node_id` | L2 返回 `200` 时，从开始拨号 L2 到读完该状态的毫秒数。抓取文本里的桶列为 `proxy_connect_latency_ms_bucket`，同族还有 `_sum` 与 `_count` |
+| `proxy_upstream_fail_total` | Counter | `node_id`, `reason` | 没有建成隧道的上游结果。除 `l2_auth` 外，客户端收到的都是 `502`。`l2_auth` 是 L2 返回的 `407`，客户端看到的仍是 `407` |
+| `proxy_client_reject_total` | Counter | `reason` | L1 在拨 L2 之前返回的本地 `400` / `407` |
+
+`proxy_connect_latency_ms` 的桶上界（毫秒）：`5, 10, 25, 50, 100, 200, 500, 1000, 3000, 10000`。`200` 与 §7.3 的成功建连 P95 阈值对齐，`3000` 与 §10 的 `DialTimeout`（3s）对齐。成功样本的等待不止这 3s：§10 还要等 L2 的状态行，默认 `l2ResponseTimeout` 为 10s，gost 先拨通源站才回 `200`。因此 3s 到 10s 的成功建连会落入 `10000` 这个桶，该桶会有样本。拨号时间加上这 10s 仍可能超过 10000ms，那些观察落在 `+Inf` 桶。失败路径不观察，不进任何桶。
+
+计时起点是 §10 拨号 L2 之前，对应 §5.2 的节点 `H`。拨号函数是 `dialUpstream`，默认就是 `net.DialTimeout("tcp", addr, 3*time.Second)`。`node_id` 在拨号及之后来自路由表命中项。
+
+| 位置 | `proxy_upstream_fail_total` | `proxy_connect_latency_ms` | `proxy_conn_active` | `proxy_client_reject_total` |
+| --- | --- | --- | --- | --- |
+| 用户名或口令含 CR/LF，本地 `400` | 不增加 | 不观察 | 不变 | `reason="bad_credential"` |
+| 口令为空或不匹配，本地 `407`，不拨 L2 | 不增加 | 不观察 | 不变 | `reason="auth"` |
+| 用户名没有 `node_id`，本地 `400` | 不增加 | 不观察 | 不变 | `reason="no_node"` |
+| `target` 不是 `host:port`（缺少端口等），本地 `400` | 不增加 | 不观察 | 不变 | `reason="bad_target"` |
+| §5.2 `G -- 否`；§10 `Resolve` 失败或返回空地址并写 `502`。只有 `ErrNoHealthyAddr` 保留该 ID；`ErrUnknownNode`、其他错误和空地址都是 `node_id="unknown"` | `reason="no_upstream"` | 不观察。尚未拨号 | 不变 | 不增加 |
+| §10 `dialUpstream` 失败并写 `502`。默认实现是 `net.DialTimeout` 3s | `reason="dial"` | 不观察 | 不变 | 不增加 |
+| §10 `upstreamConn.Write` 失败并写 `502` | `reason="l2_write"` | 不观察 | 不变 | 不增加 |
+| §10 `SetReadDeadline` 失败并写 `502`。包括设上 `l2ResponseTimeout`，以及读完后清掉截止时间 | `reason="l2_deadline"` | 不观察 | 不变 | 不增加 |
+| §10 读取 L2 状态行失败并写 `502`，包括读超时。等待期间客户端先断开、导致这次读取失败，也走这里 | `reason="l2_response"` | 不观察 | 不变 | 不增加 |
+| §5.2 `J -- 407`；§10 L2 返回 `407`，原样交给客户端 | `reason="l2_auth"` | 不观察 | 不变 | 不增加 |
+| §5.1 L2 的其他非 2xx；§5.2 `J -- 其他或超时` 里的非 2xx；§10 状态码不是 200 也不是 407，并写 `502` | `reason="l2_status"` | 不观察 | 不变 | 不增加 |
+| L2 返回 200 | 不增加 | 观察，在写客户端 `200` 之前 | 不变 | 不增加 |
+| §5.1 / §10 向客户端写出 `200` 成功，随后两侧拷贝 | 不增加 | 不再观察 | 写出成功后 `Inc`；`handleConnect` 返回时 `Dec`。返回可能晚于客户端断开最多 30s（半关闭空闲）或 5 分钟（隧道空闲） | 不增加 |
+
+`502` 与 L2 的 `407`（`l2_auth`）进入 `proxy_upstream_fail_total`。时延直方图只收录 L2 已返回 `200` 的尝试。本地 `400` / `407` 只进入 `proxy_client_reject_total`。
+
+下面是注册与打点函数。打点落在 §10 `handleConnect` 的这些位置，常量都是导出的，另一个包可以引用：
+
+1. 本地 `400` / `407`：按上表调用 `RejectClient(ReasonRejectBadCredential)`、`RejectClient(ReasonRejectAuth)`、`RejectClient(ReasonRejectNoNode)` 或 `RejectClient(ReasonRejectBadTarget)`，再 `reply`。不调用 `Fail502`。
+2. `Resolve` 失败，或返回的地址为空：`inTable := errors.Is(err, ErrNoHealthyAddr)`（空地址时 `err` 为 nil，`inTable` 为 false），然后 `Fail502(NodeLabel(inTable, nodeID), ReasonNoUpstream)`，再 `badGateway`。不是 `ErrNoHealthyAddr` 的错误，以及空地址，标签都是 `unknown`。
+3. 拨号前 `started := time.Now()`。`dialUpstream` 失败：`Fail502(nodeID, ReasonDial)`，再 `badGateway`。
+4. `upstreamConn.Write` 失败：`Fail502(nodeID, ReasonL2Write)`，再 `badGateway`。
+5. `SetReadDeadline` 失败：`Fail502(nodeID, ReasonL2Deadline)`，再 `badGateway`。
+6. 读取状态行失败，含读超时，以及等待期间客户端先断开导致的读失败：`Fail502(nodeID, ReasonL2Response)`，再 `badGateway`。
+7. 状态码是 407：`Fail502(nodeID, ReasonL2Auth)`，再把 `407` 和 `Proxy-Authenticate` 交给客户端。
+8. 状态码不是 200 也不是 407：`Fail502(nodeID, ReasonL2Status)`，再 `badGateway`。
+9. 状态码是 200：先 `ObserveConnect(nodeID, started)`，再写客户端 `200`。写成功后 `defer EnterTunnel(nodeID)()`，然后进入两侧拷贝。
+
+```go
+package l1metrics
+
+import (
+	"net/http"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+)
+
+const (
+	// NodeUnknown 是路由表从未收录的 node_id 在标签里的固定值。
+	NodeUnknown = "unknown"
+
+	ReasonNoUpstream = "no_upstream"
+	ReasonDial       = "dial"
+	ReasonL2Write    = "l2_write"
+	ReasonL2Deadline = "l2_deadline"
+	ReasonL2Response = "l2_response"
+	ReasonL2Status   = "l2_status"
+	ReasonL2Auth     = "l2_auth"
+
+	ReasonRejectAuth          = "auth"
+	ReasonRejectNoNode        = "no_node"
+	ReasonRejectBadTarget     = "bad_target"
+	ReasonRejectBadCredential = "bad_credential"
+)
+
+var (
+	proxyConnActive = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "proxy_conn_active",
+		Help: "已经向客户端返回 200、handleConnect 尚未返回的 L1 隧道数。客户端断开后最多滞后 30s（半关闭空闲）或 5 分钟（隧道空闲）。",
+	}, []string{"node_id"})
+
+	proxyConnectLatency = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "proxy_connect_latency_ms",
+		Help:    "L2 返回 200 的 CONNECT 所经过的毫秒数，从开始拨号 L2 算起。",
+		Buckets: []float64{5, 10, 25, 50, 100, 200, 500, 1000, 3000, 10000},
+	}, []string{"node_id"})
+
+	proxyUpstreamFail = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "proxy_upstream_fail_total",
+		Help: "没有建成隧道的上游结果。l2_auth 对应交给客户端的 L2 407，其余 reason 对应 502。",
+	}, []string{"node_id", "reason"})
+
+	proxyClientReject = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "proxy_client_reject_total",
+		Help: "拨号 L2 之前，L1 本地返回 400 或 407 的次数。",
+	}, []string{"reason"})
+)
+
+func init() {
+	prometheus.MustRegister(proxyConnActive, proxyConnectLatency, proxyUpstreamFail, proxyClientReject)
+}
+
+// Mount 在管理 mux 上暴露 /metrics。该 mux 使用独立监听地址，不挂在代理端口上。
+func Mount(mux *http.ServeMux) {
+	mux.Handle("/metrics", promhttp.Handler())
+}
+
+// NodeLabel 只接受路由表里已有的 node_id。未收录或空字符串折叠为 unknown。
+func NodeLabel(inTable bool, nodeID string) string {
+	if !inTable || nodeID == "" {
+		return NodeUnknown
+	}
+	return nodeID
+}
+
+// Fail502 增加 proxy_upstream_fail_total。
+// ReasonNoUpstream、ReasonDial、ReasonL2Write、ReasonL2Deadline、ReasonL2Response、ReasonL2Status
+// 由调用方接着对客户端写 502。ReasonL2Auth 时调用方把 L2 的 407 原样交还，不改写成 502。
+func Fail502(nodeID, reason string) {
+	proxyUpstreamFail.WithLabelValues(nodeID, reason).Inc()
+}
+
+// RejectClient 记录一次拨号 L2 之前的本地 400 或 407。
+// reason 取 ReasonRejectAuth、ReasonRejectNoNode、ReasonRejectBadTarget、ReasonRejectBadCredential。
+func RejectClient(reason string) {
+	proxyClientReject.WithLabelValues(reason).Inc()
+}
+
+// ObserveConnect 记录从 started 到 L2 返回 200 的毫秒数。失败路径不调用。
+func ObserveConnect(nodeID string, started time.Time) {
+	elapsed := float64(time.Since(started)) / float64(time.Millisecond)
+	proxyConnectLatency.WithLabelValues(nodeID).Observe(elapsed)
+}
+
+// EnterTunnel 在向客户端写出 200 成功之后调用。返回值在 handleConnect 返回时把 gauge 减一。
+// 客户端断开后，减一仍可能再等半关闭空闲（默认 30s）或隧道空闲（默认 5 分钟）。
+func EnterTunnel(nodeID string) (leave func()) {
+	gauge := proxyConnActive.WithLabelValues(nodeID)
+	gauge.Inc()
+	return gauge.Dec
+}
+```
+
+### 7.2 内核指标（M2，eBPF）
+
+M2 在一级与二级节点部署 eBPF Agent（如 Cilium，或自研 exporter），采集内核看到的网络与系统指标。连接数、CONNECT 时延和上游失败以 §7.1 为准。
+
+- `kernel_tcp_retrans_total`：内核统计的 TCP 重传次数（Counter）。
+- RTT：TCP RTT 分布。
+- run queue latency：CPU 运行队列延迟。
+- 同层还包括丢包、软中断和 socket backlog。
+
+应用层建连时延包含 L2 拨号、出口 DNS 和源站 TCP 握手。内核 RTT 是本机 TCP 栈看到的往返时间。两个数分开告警。
 
 ### 7.3 告警建议
 
-- 5 分钟连接失败率 > 2%。
-- P95 CONNECT 建连时延 > 200ms。
-- 二级节点心跳丢失 > 3 个周期自动摘除。
+应用层（M1，只用 §7.1 的三项）：
+
+- 5 分钟上游失败率 > 2%。分子是 `sum(increase(proxy_upstream_fail_total[5m]))`，包含 `l2_write`、`l2_deadline` 和 `l2_auth`。分母是该分子加上 `sum(increase(proxy_connect_latency_ms_count[5m]))`。`_count` 只包含 L2 已返回 `200` 的尝试，所以和失败计数相加就是全部已结束的上游尝试。`proxy_client_reject_total` 不进入这个比率。
+- 成功建连的 P95 > 200ms：`histogram_quantile(0.95, sum by (le) (rate(proxy_connect_latency_ms_bucket[5m])))`。直方图里只有 L2 返回 `200` 的样本。按节点告警时改为 `sum by (le, node_id)`。
+
+内核（M2，eBPF）：
+
+- `kernel_tcp_retrans_total` 的 5 分钟增量相对该节点基线明显升高。
+- RTT 分布相对该节点基线明显升高。
+- run queue latency 持续高于该节点基线。这是调度延迟，与上面的 CONNECT P95 分开看。
+
+发现与摘除走 etcd lease（§8.1），单独执行，不读 §7.1 或 §7.2 的时间序列：
+
+- 二级节点心跳丢失超过 3 个周期则自动摘除。TTL 10s，心跳 3s。
 
 ---
 
@@ -293,13 +460,13 @@ flowchart TD
 - 一级代理：Deployment（无状态，多副本）。
 - 二级代理：DaemonSet（按出口 IP 绑定）或 Deployment（按节点池部署）。进程为 gost，监听 HTTP `CONNECT`。
 - etcd：独立 3~5 节点集群（建议与业务隔离）。
-- 监控：Prometheus + Grafana + Loki（可选）。
+- 监控：Prometheus 抓取 L1 管理地址上的 `/metrics`（M1 应用层指标）。M2 另外部署 eBPF Agent。Grafana + Loki（可选）。
 
 ### 9.2 发布策略
 
 1. 先部署二级节点并注册 etcd。
 2. 发布一级代理灰度（5% 流量）。
-3. 对比关键 SLI（成功率/时延/错误码），并做一次 ClientHello 字节比对。
+3. 对比关键 SLI（成功率/时延/错误码，取自 M1 应用层指标），并做一次 ClientHello 字节比对。
 4. 全量切换。
 
 ### 9.3 容灾策略
@@ -312,9 +479,24 @@ flowchart TD
 
 ## 10. Go 使用示例（一级代理核心逻辑）
 
-下面是 L1 处理 CONNECT 的数据面，共享口令校验就在这个函数里完成。口令先做 SHA-256，再用 `subtle.ConstantTimeCompare` 与全系统共享口令比较；为空或不匹配时直接回 `407`，不拨 L2。用户名以最后一个 `@` 切分，`node_id` 是它后面的那一段，因此用户名本身可以含 `@`。目标不是 `host:port`，或切不出 `node_id`，回 `400`。通过后再向 L2 发第二次 `CONNECT`，`Proxy-Authorization` 使用客户端提交的同一组用户名和密码。读取 L2 应答的默认上限是 10 秒（`l2ResponseTimeout`，部署时可改）。gost 要先拨通源站才回 `200`，2 秒会把 2.5 秒才拨通的源站误判成 `502`。读完无论成败都清掉这个截止时间，隧道阶段不再受它限制。客户端若在等待期间先断开，L1 关掉这条上游连接，读立刻返回，不必坐满 10 秒。L2 返回 `407` 时，连同 `Proxy-Authenticate` 交给客户端；解析节点、拨号、读应答失败，以及除 `200`/`407` 以外的状态，先写 `502` 再返回错误（见 §5.1）。确认 `200` 后才应答客户端。之后两个方向各自拷贝：`io.Copy` 返回非 nil 错误时立刻完全关闭两端，另一方向不会继续堵着；干净 EOF 只对对端 `CloseWrite`。反方向接着用空闲读超时（`halfCloseIdleTimeout`，默认 30s，可改）：每次成功读到字节都把截止时间重新拨到「现在 + 30s」，不是从 `CloseWrite` 那一刻起只拨一次。间隔只要短于这个值，响应可以很慢，也可以一直分片；连续这段时间没有字节才放弃。客户端先 FIN 和上游先 FIN 走同一套。整条隧道另有兜底（`tunnelIdleTimeout`，默认 5 分钟，可改）：任一方向读到字节都重新计时，两边都安静这么久才关闭。gost 的 `idleTimeout` 默认是 0，这条兜底不能省。两个方向都结束后再由 defer 完全关闭。出口网段拒绝在 L2 解析之后做，不在本函数里。示例不包含 etcd。涉及 `bufio`、`crypto/sha256`、`crypto/subtle`、`encoding/base64`、`fmt`、`io`、`net`、`net/http`、`strconv`、`strings`、`sync`、`sync/atomic`、`time`。
+下面是 L1 处理 CONNECT 的数据面，共享口令校验就在这个函数里完成。口令先做 SHA-256，再用 `subtle.ConstantTimeCompare` 与全系统共享口令比较；为空或不匹配时直接回 `407`，不拨 L2。用户名以最后一个 `@` 切分，`node_id` 是它后面的那一段，因此用户名本身可以含 `@`。目标不是 `host:port`，或切不出 `node_id`，回 `400`。通过后再向 L2 发第二次 `CONNECT`，`Proxy-Authorization` 使用客户端提交的同一组用户名和密码。读取 L2 应答的默认上限是 10 秒（`l2ResponseTimeout`，部署时可改）。gost 要先拨通源站才回 `200`，2 秒会把 2.5 秒才拨通的源站误判成 `502`。读完无论成败都清掉这个截止时间，隧道阶段不再受它限制。客户端若在等待期间先断开，L1 关掉这条上游连接，读立刻返回，不必坐满 10 秒。L2 返回 `407` 时，连同 `Proxy-Authenticate` 交给客户端；解析节点、拨号、向 L2 写出 `CONNECT`、设置或清除读截止时间、读应答失败，以及除 `200`/`407` 以外的状态，先写 `502` 再返回错误（见 §5.1）。确认 `200` 后才应答客户端。之后两个方向各自拷贝：`io.Copy` 返回非 nil 错误时立刻完全关闭两端，另一方向不会继续堵着；干净 EOF 只对对端 `CloseWrite`。反方向接着用空闲读超时（`halfCloseIdleTimeout`，默认 30s，可改）：每次成功读到字节都把截止时间重新拨到「现在 + 30s」，不是从 `CloseWrite` 那一刻起只拨一次。间隔只要短于这个值，响应可以很慢，也可以一直分片；连续这段时间没有字节才放弃。客户端先 FIN 和上游先 FIN 走同一套。整条隧道另有兜底（`tunnelIdleTimeout`，默认 5 分钟，可改）：任一方向读到字节都重新计时，两边都安静这么久才关闭。gost 的 `idleTimeout` 默认是 0，这条兜底不能省。两个方向都结束后再由 defer 完全关闭。出口网段拒绝在 L2 解析之后做，不在本函数里。示例不包含 etcd。打点使用 §7.1 导出的函数，按包名 `l1metrics` 调用：本地 `400` / `407` 走 `RejectClient`；对客户端的 `502`，以及原样交还的 L2 `407`，走 `Fail502`；L2 返回 `200` 后先 `ObserveConnect`，向客户端写出 `200` 成功后再 `EnterTunnel`。`upstreamConn.Write` 失败和 `SetReadDeadline` 失败都回 `502`，`reason` 分别是 `l2_write`、`l2_deadline`。涉及 `bufio`、`crypto/sha256`、`crypto/subtle`、`encoding/base64`、`errors`、`fmt`、`io`、`net`、`net/http`、`strconv`、`strings`、`sync`、`sync/atomic`、`time`。
 
 ```go
+// ErrUnknownNode 表示本地路由表从未收录该 node_id。
+var ErrUnknownNode = errors.New("unknown node")
+
+// ErrNoHealthyAddr 表示该 node_id 已在路由表里，但当前没有健康地址。
+// 只有这个错误保留原来的 node_id 标签。
+var ErrNoHealthyAddr = errors.New("no healthy address")
+
+// Resolver 按 node_id 给出一个健康的 L2 地址。
+// 成功必须返回非空地址。返回 ("", nil) 按解析失败处理：502，node_id="unknown"，reason 为 no_upstream。
+// 从未收录返回 ErrUnknownNode；已收录但没有健康地址返回 ErrNoHealthyAddr。
+// 调用方只在 errors.Is(err, ErrNoHealthyAddr) 时把原来的 node_id 写入标签。
+// 其他错误，包括 ErrUnknownNode 和任何未预期的错误，都记 node_id="unknown"。
+// 这两种失败的 reason 都是 no_upstream。
+// 经 errors.Join 同时带上 ErrNoHealthyAddr 的错误也会留下原来的 ID，
+// 例如 errors.Join(ErrUnknownNode, ErrNoHealthyAddr)。Resolver 不得把这两个哨兵 Join 在一起。
 type Resolver interface {
     Resolve(nodeID string) (addr string, err error)
 }
@@ -336,6 +518,11 @@ var halfCloseIdleTimeout = 30 * time.Second
 // tunnelIdleTimeout 是整条隧道的空闲兜底，部署时可改。任一方向读到字节都重新计时。
 // gost 的 idleTimeout 默认是 0（不限制），L1 不能靠它把两边都安静的隧道收掉。默认 5 分钟。
 var tunnelIdleTimeout = 5 * time.Minute
+
+// dialUpstream 拨向选定 L2 的 HTTP 监听地址。默认 TCP，超时 3s。
+var dialUpstream = func(addr string) (net.Conn, error) {
+    return net.DialTimeout("tcp", addr, 3*time.Second)
+}
 
 // username 格式示例: appuser@node-az01-003。
 // node_id 取最后一个 '@' 之后的部分，用户名本身可以含 '@'（例如 user@corp@node1 → node1）。
@@ -378,33 +565,45 @@ func handleConnect(clientConn net.Conn, username, password, target string, resol
     }
 
     if strings.ContainsAny(username, "\r\n") || strings.ContainsAny(password, "\r\n") {
+        l1metrics.RejectClient(l1metrics.ReasonRejectBadCredential)
         return reply(http.StatusBadRequest, "Bad Request", "", fmt.Errorf("invalid credential"))
     }
     if !sharedPasswordOK(password) {
+        l1metrics.RejectClient(l1metrics.ReasonRejectAuth)
         return reply(http.StatusProxyAuthRequired, "Proxy Authentication Required",
             `Proxy-Authenticate: Basic realm="relay"`, fmt.Errorf("invalid credential"))
     }
 
     _, nodeID, err := parseNodeID(username)
     if err != nil {
+        l1metrics.RejectClient(l1metrics.ReasonRejectNoNode)
         return reply(http.StatusBadRequest, "Bad Request", "", err)
     }
 
     host, port, err := net.SplitHostPort(target)
     if err != nil || host == "" || strings.ContainsAny(host, " \r\n/") {
+        l1metrics.RejectClient(l1metrics.ReasonRejectBadTarget)
         return reply(http.StatusBadRequest, "Bad Request", "", fmt.Errorf("invalid connect target"))
     }
     if _, err := strconv.Atoi(port); err != nil {
+        l1metrics.RejectClient(l1metrics.ReasonRejectBadTarget)
         return reply(http.StatusBadRequest, "Bad Request", "", fmt.Errorf("invalid connect target"))
     }
 
     upstreamAddr, err := resolver.Resolve(nodeID)
-    if err != nil {
+    if err != nil || upstreamAddr == "" {
+        inTable := errors.Is(err, ErrNoHealthyAddr)
+        l1metrics.Fail502(l1metrics.NodeLabel(inTable, nodeID), l1metrics.ReasonNoUpstream)
+        if err == nil {
+            err = errors.New("empty address")
+        }
         return badGateway(fmt.Errorf("resolve node %s failed: %w", nodeID, err))
     }
 
-    upstreamConn, err := net.DialTimeout("tcp", upstreamAddr, 3*time.Second)
+    started := time.Now()
+    upstreamConn, err := dialUpstream(upstreamAddr)
     if err != nil {
+        l1metrics.Fail502(nodeID, l1metrics.ReasonDial)
         return badGateway(fmt.Errorf("connect l2 failed: %w", err))
     }
     defer upstreamConn.Close()
@@ -414,6 +613,7 @@ func handleConnect(clientConn net.Conn, username, password, target string, resol
         "Host: " + target + "\r\n" +
         "Proxy-Authorization: Basic " + token + "\r\n\r\n"
     if _, err := upstreamConn.Write([]byte(req)); err != nil {
+        l1metrics.Fail502(nodeID, l1metrics.ReasonL2Write)
         return badGateway(err)
     }
 
@@ -434,15 +634,17 @@ func handleConnect(clientConn net.Conn, username, password, target string, resol
     }()
 
     type l2Status struct {
-        code               int
-        proxyAuthenticate  string
-        br                 *bufio.Reader
-        err                error
+        code              int
+        proxyAuthenticate string
+        br                *bufio.Reader
+        err               error
+        deadline          bool
     }
     statusc := make(chan l2Status, 1)
     go func() {
         var st l2Status
         if st.err = upstreamConn.SetReadDeadline(time.Now().Add(l2ResponseTimeout)); st.err != nil {
+            st.deadline = true
             statusc <- st
             return
         }
@@ -450,6 +652,7 @@ func handleConnect(clientConn net.Conn, username, password, target string, resol
         st.code, st.proxyAuthenticate, st.err = readConnectStatus(st.br)
         if clearErr := upstreamConn.SetReadDeadline(time.Time{}); clearErr != nil && st.err == nil {
             st.err = clearErr
+            st.deadline = true
         }
         statusc <- st
     }()
@@ -464,6 +667,11 @@ func handleConnect(clientConn net.Conn, username, password, target string, resol
         }
     }
     if st.err != nil {
+        if st.deadline {
+            l1metrics.Fail502(nodeID, l1metrics.ReasonL2Deadline)
+        } else {
+            l1metrics.Fail502(nodeID, l1metrics.ReasonL2Response)
+        }
         return badGateway(st.err)
     }
     code, proxyAuthenticate, br := st.code, st.proxyAuthenticate, st.br
@@ -472,16 +680,20 @@ func handleConnect(clientConn net.Conn, username, password, target string, resol
         if challenge == "" || strings.ContainsAny(challenge, "\r\n") {
             challenge = `Basic realm="relay"`
         }
+        l1metrics.Fail502(nodeID, l1metrics.ReasonL2Auth)
         return reply(http.StatusProxyAuthRequired, "Proxy Authentication Required",
             "Proxy-Authenticate: "+challenge, fmt.Errorf("l2 connect status 407"))
     }
     if code != http.StatusOK {
+        l1metrics.Fail502(nodeID, l1metrics.ReasonL2Status)
         return badGateway(fmt.Errorf("l2 connect status %d", code))
     }
 
+    l1metrics.ObserveConnect(nodeID, started)
     if _, err := io.WriteString(clientConn, "HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
         return err
     }
+    defer l1metrics.EnterTunnel(nodeID)()
 
     // br 可能已经缓冲了与 200 粘在一起的后续字节，转发必须从 br 读，不能另起一次 net.Conn 读。
     // 从这里开始不再解析 HTTP，也不建立 TLS。io.Copy 会保持字节内容；是否换成 splice 不影响 JA3/JA4。
@@ -631,8 +843,8 @@ func readConnectStatus(r *bufio.Reader) (int, string, error) {
 
 ## 11. 里程碑建议
 
-- **M1（1~2 周）**：PoC 跑通（L1 向 gost 发 `CONNECT`、etcd、username 指定路由、ClientHello 字节比对）。
-- **M2（2~4 周）**：eBPF 指标 + Prometheus 看板 + 告警。
+- **M1（1~2 周）**：PoC 跑通（L1 向 gost 发 `CONNECT`、etcd、username 指定路由、ClientHello 字节比对），并用 `prometheus/client_golang` 暴露 §7.1 的应用层指标（三项 SLI，另加 `proxy_client_reject_total`）。应用层告警见 §7.3。
+- **M2（2~4 周）**：部署 eBPF Agent，采集 `kernel_tcp_retrans_total`、RTT、run queue latency 等内核指标，接入 Prometheus 看板与 §7.3 的内核告警。
 - **M3（4~6 周）**：压测调优、故障演练、灰度发布。
 
 ---
@@ -658,12 +870,12 @@ func readConnectStatus(r *bufio.Reader) (int, string, error) {
 
 - 一级采用 Go 二开，可快速承载定制路由逻辑，并以 HTTP `CONNECT` 把目标交给已选中的 L2。
 - 二级采用 gost v3 的 HTTP 正向代理。默认路径就是隧道字节转发，能保住客户端 TLS 指纹；3proxy 与锁死配置的 Envoy DFP 是同一接口上的替换项。
-- etcd + eBPF + Prometheus 组合满足生产级发现与观测需求。
+- etcd 负责二级节点发现。观测分两层：M1 用 L1 应用层 Prometheus 指标覆盖建连、活跃隧道、上游失败和本地拒绝，M2 用 eBPF 补内核网络与系统指标。
 
 建议进入 PoC 实施，优先验证三件事：
 1. username 路由稳定性，以及 L2 `200` 之后才向客户端应答；
 2. 客户端与目标侧 ClientHello / JA3 / JA4 一致；
-3. 高并发下连接成功率与时延目标。
+3. 高并发下连接成功率与时延目标，用 §7.1 的三项 SLI 核对。
 
 ---
 
