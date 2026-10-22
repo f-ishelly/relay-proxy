@@ -1,4 +1,17 @@
-{"event":"registered","label":"acceptance7","hosts":4000,"up":4000,"grant_err":0,"elapsed_ms":4008,"endpoints":"http://127.0.0.1:42581,http://127.0.0.1:33669,http://127.0.0.1:39089"}
-{"event":"redial","label":"acceptance7","drain_ok":4000,"drain_err":0,"elapsed_ms":7387}
-{"event":"kill_leader","endpoint":"http://127.0.0.1:39089","t_ms":9393}
-{"conns":64,"drain_err":0,"drain_ok":4000,"elapsed_ms":29700,"endpoints":3,"event":"summary","grant_err":0,"hosts":4000,"keepalive_err":0,"keepalive_ok":28000,"keepalive_raw_err":2,"keepalive_raw_sample":"etcdserver: server stopped","label":"acceptance7","leader_killed":true,"lease_lost":0,"registered":4000,"renew_ms":3000,"ttl_s":10,"watch_del":4000,"watch_put":8000}
+commit 8f03b0c
+go go1.22.2 linux/amd64
+logged_at 2026-10-22T15:58:42Z
+command go run ./cmd/loadgen -embed -label acceptance7 -hosts 4000 -ttl 10 -renew 3s -kill-after 2s -keep 20s -register-timeout 180s
+
+previous keepalive_ok of exactly 28000
+The previous loadgen did not call registrar. After each host's hand-written redial it started a 3s ticker. The first tick is one period later. The process then slept 2s + 20s = 22s after the slowest redial. Seven ticks need 21s and eight need 24s, so a host whose ticker started within 3s of the slowest finish records exactly 7 successes. Those redials shared 64 clients and finished in a cluster (registered at 4008ms, all redials done at 7387ms), which is why the total was exactly 7*4000. The txn compared LeaseValue, not ModRevision. That count was not registrar's renew loop.
+
+this run
+Each host is a registrar. It calls Drain, then Ready with a new egress. Renewals are the registrar's own KeepAliveOnce loop, counted from the ka_ok event. keepalive_ok is 41903, per host min 10 / p50 10 / max 11. The start stagger is 8s, about two renew intervals, which is the 10 vs 11 split. It is not a fixed multiple of 4000.
+Drain holds the registrar lock, so 4000 simultaneous Drain calls stall keepalive and the 10s TTL expires. An unbounded attempt lost 3999 leases (drain_err 4000). This run caps Drain+Ready at 64 in flight (-redial-inflight). That cap is only in the load generator.
+keepalive_err is 6, sample "etcdserver: server stopped", from killing the leader. lease_lost is 0. watch_del equals the 4000 planned drains. watch_put is 8000: one create plus one put after Ready.
+
+{"event":"registered","label":"acceptance7","hosts":4000,"up":4000,"ready_err":0,"elapsed_ms":5701,"endpoints":"http://127.0.0.1:46453,http://127.0.0.1:37263,http://127.0.0.1:34643"}
+{"event":"redial","label":"acceptance7","drain_ok":4000,"drain_err":0,"elapsed_ms":13947}
+{"event":"kill_leader","endpoint":"http://127.0.0.1:34643","t_ms":15951}
+{"client_mode":"registrar","conns_flag":32,"drain_err":0,"drain_ok":4000,"elapsed_ms":36252,"endpoints":3,"event":"summary","hosts":4000,"keepalive_err":6,"keepalive_err_sample":"etcdserver: server stopped","keepalive_ok":41903,"keepalive_ok_max":11,"keepalive_ok_min":10,"keepalive_ok_p50":10,"label":"acceptance7","leader_killed":true,"lease_lost":0,"ready_err":0,"redial_inflight":64,"registered":4000,"registrar_clients":4000,"renew_ms":3000,"ttl_s":10,"watch_del":4000,"watch_put":8000}

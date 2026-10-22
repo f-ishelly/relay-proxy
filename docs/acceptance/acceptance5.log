@@ -1,5 +1,46 @@
+commit 8f03b0c (registrar sources match 54f3793; this test does not use loadgen)
+go go1.22.2 linux/amd64
+logged_at 2026-10-22T15:58:42Z
+command go test -count=10 -timeout 15m -run '^TestAcceptance5_LeaderFailoverDrain$' -v ./registrar/
+samples 10
+unit ms
+min 443.848
+p50 546.553
+max 1245.346
+sorted_ms 443.848 524.604 541.301 546.407 546.496 546.610 644.292 647.777 939.371 1245.346
+limit 3000ms
+pass 10
+fail 0
+
 === RUN   TestAcceptance5_LeaderFailoverDrain
-    registrar_test.go:692: Drain during failover 612.06862ms
---- PASS: TestAcceptance5_LeaderFailoverDrain (5.14s)
+    registrar_test.go:692: Drain during failover 524.603626ms
+--- PASS: TestAcceptance5_LeaderFailoverDrain (5.13s)
+=== RUN   TestAcceptance5_LeaderFailoverDrain
+    registrar_test.go:692: Drain during failover 1.245345934s
+--- PASS: TestAcceptance5_LeaderFailoverDrain (5.83s)
+=== RUN   TestAcceptance5_LeaderFailoverDrain
+    registrar_test.go:692: Drain during failover 546.406609ms
+--- PASS: TestAcceptance5_LeaderFailoverDrain (5.13s)
+=== RUN   TestAcceptance5_LeaderFailoverDrain
+    registrar_test.go:692: Drain during failover 644.291843ms
+--- PASS: TestAcceptance5_LeaderFailoverDrain (5.03s)
+=== RUN   TestAcceptance5_LeaderFailoverDrain
+    registrar_test.go:692: Drain during failover 939.370638ms
+--- PASS: TestAcceptance5_LeaderFailoverDrain (4.33s)
+=== RUN   TestAcceptance5_LeaderFailoverDrain
+    registrar_test.go:692: Drain during failover 546.495654ms
+--- PASS: TestAcceptance5_LeaderFailoverDrain (4.83s)
+=== RUN   TestAcceptance5_LeaderFailoverDrain
+    registrar_test.go:692: Drain during failover 546.609788ms
+--- PASS: TestAcceptance5_LeaderFailoverDrain (4.92s)
+=== RUN   TestAcceptance5_LeaderFailoverDrain
+    registrar_test.go:692: Drain during failover 647.776816ms
+--- PASS: TestAcceptance5_LeaderFailoverDrain (5.12s)
+=== RUN   TestAcceptance5_LeaderFailoverDrain
+    registrar_test.go:692: Drain during failover 443.847547ms
+--- PASS: TestAcceptance5_LeaderFailoverDrain (4.93s)
+=== RUN   TestAcceptance5_LeaderFailoverDrain
+    registrar_test.go:692: Drain during failover 541.301274ms
+--- PASS: TestAcceptance5_LeaderFailoverDrain (4.92s)
 PASS
-ok  	github.com/f-ishelly/relay-proxy/registrar	6.185s
+ok  	github.com/f-ishelly/relay-proxy/registrar	50.188s
