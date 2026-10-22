@@ -78,6 +78,9 @@ const AlertNodeConflict = "node_id_conflict"
 // AlertForeignInstance 表示 key 或重拨标记属于另一个实例（克隆或另一台同 nodeId 的虚拟机）。
 const AlertForeignInstance = "foreign_instance"
 
+// AlertEpochHoldExpired 表示持有者 drained 太久，已经停止续租重拨标记。标记会在一个 EpochTTL 内自己过期。
+const AlertEpochHoldExpired = "epoch_hold_expired"
+
 // Alert 是给 admin 打日志或接告警用的。OnAlert 在独立 goroutine 里调用。
 type Alert struct {
 	Kind       string
@@ -178,8 +181,12 @@ type Config struct {
 	RenewInterval time.Duration
 	// EpochTTL 是 /relay/l2-epoch/{nodeId} 的租期。它不挂在业务 lease 上，业务 lease 丢失时标记还在。
 	// 默认是业务 TTL 的 3 倍，且不少于 DefaultEpochTTL。进程退出后，别人要等这条租约到期才能在空窗里创建 key。
-	EpochTTL             time.Duration
-	EpochRenewInterval   time.Duration
+	EpochTTL           time.Duration
+	EpochRenewInterval time.Duration
+	// MaxDrained 是持有者停在 drained、一直不调用 Ready 时，最多继续续租重拨标记多久。
+	// 超过之后停止续租，打 AlertEpochHoldExpired，标记在剩余的 EpochTTL 内过期，别的实例才能创建。
+	// 0 表示用 10×EpochTTL（EpochTTL 为 30s 时是 5 分钟）。
+	MaxDrained           time.Duration
 	OpTimeout            time.Duration
 	BackgroundTimeout    time.Duration
 	DrainAttempt         time.Duration
@@ -296,6 +303,9 @@ func applyDefaults(c *Config) {
 			c.EpochRenewInterval = c.EpochTTL / 3
 		}
 	}
+	if c.MaxDrained == 0 {
+		c.MaxDrained = 10 * c.EpochTTL
+	}
 	if c.OpTimeout == 0 {
 		c.OpTimeout = d.OpTimeout
 	}
@@ -384,6 +394,9 @@ func validate(c *Config) error {
 	}
 	if c.EpochRenewInterval <= 0 || c.EpochRenewInterval >= c.EpochTTL {
 		return fmt.Errorf("%w: epoch renew interval must be >0 and < epoch ttl", ErrInvalidConfig)
+	}
+	if c.MaxDrained <= 0 {
+		return fmt.Errorf("%w: max drained duration", ErrInvalidConfig)
 	}
 	if c.DrainAttempt <= 0 || c.DrainBudget < c.DrainAttempt {
 		return fmt.Errorf("%w: drain budget", ErrInvalidConfig)

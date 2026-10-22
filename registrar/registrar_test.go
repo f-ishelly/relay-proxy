@@ -1085,6 +1085,7 @@ func TestClientDeadlineReclaimsOwnLease(t *testing.T) {
 	g.ready("100.64.0.1")
 	lease, create, _ := g.waitKey(true, 2*time.Second)
 	t0 := time.Now()
+	// 服务端租约还活着、只是客户端截止时间到了。真正的 Revoke 会让 etcd 删掉 key，测不到这条「不能 DELETE」。
 	g.reg.mu.Lock()
 	g.reg.loseLeaseLocked(errors.New("client deadline"))
 	g.reg.mu.Unlock()
@@ -1452,7 +1453,7 @@ func TestEpochSurvivesExternalLeaseRevoke(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	waitUntil(t, 4*time.Second, func() bool { return g.reg.Status().LeaseID == 0 })
+	waitUntil(t, 13*time.Second, func() bool { return g.reg.Status().LeaseID == 0 })
 	ctx, cancel = context.WithTimeout(context.Background(), 2*time.Second)
 	resp, err = g.cli.Get(ctx, EpochKey("626220"))
 	cancel()
@@ -1502,11 +1503,14 @@ func TestEpochSurvivesMainLeaseLossWhileDrained(t *testing.T) {
 	if err := g.reg.Drain(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	g.reg.mu.Lock()
-	g.reg.loseLeaseLocked(errors.New("client deadline"))
-	g.reg.mu.Unlock()
-	time.Sleep(400 * time.Millisecond)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	_, err := g.cli.Revoke(ctx, clientv3.LeaseID(mainLease))
+	cancel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, 13*time.Second, func() bool { return g.reg.Status().LeaseID != mainLease })
+	ctx, cancel = context.WithTimeout(context.Background(), 2*time.Second)
 	resp, err := g.cli.Get(ctx, EpochKey("626220"))
 	cancel()
 	if err != nil || len(resp.Kvs) != 1 {
@@ -1584,27 +1588,32 @@ func TestReportSkipsRegistrationAfterLostState(t *testing.T) {
 	if _, _, _, ok := g.kv(again.key); ok {
 		t.Fatal("Report re-registered the old egress after the state file was lost")
 	}
-	// 状态文件丢了，但标记上的内网地址和 machine-id 还是这台机器。不报 foreign_instance。
-	// 不带上一任出口不能注册；带上一个不同的 prevEgress 可以通过。
+	// 状态文件丢了，标记上的内网地址和 machine-id 还是这台机器。不报 foreign_instance，
+	// 但在标记过期前也不能接管，即使调用方给了一个不同的 prevEgress。
 	alerts := make(chan Alert, 4)
+	again.mu.Lock()
 	again.cfg.OnAlert = func(a Alert) { alerts <- a }
+	again.mu.Unlock()
 	g.ip.set("100.64.0.8")
-	if err := again.Ready(context.Background(), "100.64.0.8", ""); !errors.Is(err, ErrEgressUnconfirmed) {
+	if err := again.Ready(context.Background(), "100.64.0.8", ""); !errors.Is(err, ErrNodeConflict) {
 		t.Fatalf("same-host epoch without prev err=%v", err)
 	}
+	if err := again.Ready(context.Background(), "100.64.0.8", "100.64.0.1"); !errors.Is(err, ErrNodeConflict) {
+		t.Fatalf("same-host epoch with a new prev err=%v", err)
+	}
 	if _, _, _, ok := g.kv(again.key); ok {
-		t.Fatal("Ready wrote a key without confirming the previous egress")
+		t.Fatal("same-host clone registered during the owner's redial gap")
 	}
 	select {
 	case a := <-alerts:
 		t.Fatalf("same-host leftover raised %s", a.Kind)
 	default:
 	}
-	if err := again.Ready(context.Background(), "100.64.0.8", "100.64.0.1"); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, val, ok := g.kv(again.key); !ok || val.EgressIP != "100.64.0.8" {
-		t.Fatalf("same-host ready ok=%v val=%+v", ok, val)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	resp, err := g.cli.Get(ctx, EpochKey("626220"))
+	cancel()
+	if err != nil || len(resp.Kvs) != 1 {
+		t.Fatalf("owner epoch removed by same-host clone err=%v n=%d", err, len(resp.Kvs))
 	}
 }
 
@@ -1642,6 +1651,411 @@ func newRigOn(t *testing.T, base *rig, nodeID string) *rig {
 	}
 	waitUntil(t, 3*time.Second, func() bool { return reg.Status().ProbeOK })
 	return g
+}
+
+func TestExternalLeaseRevokeThenReady(t *testing.T) {
+	g := newRig(t, 1, "626220", nil)
+	g.ready("100.64.0.1")
+	lease, _, _ := g.waitKey(true, 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	_, err := g.cli.Revoke(ctx, clientv3.LeaseID(lease))
+	cancel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// KeepAliveOnce 在租约已撤销时会一直重试，直到本次调用超时。registrar 要等到自己记下的 deadline 才放弃这条 lease。
+	// 放弃之后控制循环会再 Grant，所以新的 LeaseID 可能已经不是 0。
+	waitUntil(t, 13*time.Second, func() bool { return g.reg.Status().LeaseID != lease })
+	if err := g.reg.Ready(context.Background(), "100.64.0.1", ""); err != nil {
+		t.Fatal(err)
+	}
+	got, _, val, ok := g.kv(g.reg.key)
+	if !ok || got == lease || val.EgressIP != "100.64.0.1" {
+		t.Fatalf("ready after revoke ok=%v lease %d->%d val=%+v", ok, lease, got, val)
+	}
+	ttl, err := leaseTTL(g.cli, lease)
+	if err != nil && !leaseMissing(err) {
+		t.Fatalf("old lease ttl: %v", err)
+	}
+	if err == nil && ttl > 0 {
+		t.Fatalf("revoked lease %d still live ttl=%d", lease, ttl)
+	}
+}
+
+func TestSameHostCloneDoesNotTakeOver(t *testing.T) {
+	g := newRig(t, 1, "626220", func(cfg *Config) { cfg.MachineID = "host-a" })
+	g.ready("100.64.0.1")
+	g.waitKey(true, 2*time.Second)
+	if err := g.reg.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	before, err := g.cli.Get(ctx, EpochKey("626220"))
+	cancel()
+	if err != nil || len(before.Kvs) != 1 {
+		t.Fatalf("epoch missing err=%v", err)
+	}
+	original := string(before.Kvs[0].Value)
+
+	cfg := g.reg.cfg
+	cfg.StateFile = filepath.Join(t.TempDir(), "clone.json")
+	cfg.MachineID = "host-a"
+	cfg.LocalIP = func() string { return "100.64.0.8" }
+	alerts := make(chan Alert, 2)
+	cfg.OnAlert = func(a Alert) { alerts <- a }
+	clone, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = clone.Stop(context.Background()) })
+	if err := clone.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, 3*time.Second, func() bool { return clone.Status().ProbeOK })
+	if err := clone.Ready(context.Background(), "100.64.0.8", "100.64.0.1"); !errors.Is(err, ErrNodeConflict) {
+		t.Fatalf("clone ready err=%v", err)
+	}
+	if _, _, _, ok := g.kv(g.reg.key); ok {
+		t.Fatal("clone took the key during the redial gap")
+	}
+	select {
+	case a := <-alerts:
+		t.Fatalf("same-host clone raised %s", a.Kind)
+	default:
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), 2*time.Second)
+	after, err := g.cli.Get(ctx, EpochKey("626220"))
+	cancel()
+	if err != nil || len(after.Kvs) != 1 || string(after.Kvs[0].Value) != original {
+		t.Fatalf("owner marker changed err=%v", err)
+	}
+	g.ip.set("100.64.0.2")
+	if err := g.reg.Ready(context.Background(), "100.64.0.2", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, val, ok := g.kv(g.reg.key); !ok || val.EgressIP != "100.64.0.2" {
+		t.Fatalf("owner return ok=%v val=%+v", ok, val)
+	}
+}
+
+func TestCopiedStateDifferentAddrIsForeign(t *testing.T) {
+	g := newRig(t, 1, "626220", func(cfg *Config) { cfg.MachineID = "host-a" })
+	g.ready("100.64.0.1")
+	_, _, owner := g.waitKey(true, 2*time.Second)
+	if err := g.reg.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(g.reg.cfg.StateFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := g.reg.cfg
+	cfg.StateFile = filepath.Join(t.TempDir(), "copied.json")
+	cfg.MachineID = "host-a"
+	cfg.IntranetAddr = "10.9.9.9:8080"
+	cfg.ProxyPort = 8080
+	cfg.LocalIP = func() string { return "100.64.9.9" }
+	alerts := make(chan Alert, 2)
+	cfg.OnAlert = func(a Alert) { alerts <- a }
+	if err := os.WriteFile(cfg.StateFile, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	clone, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = clone.Stop(context.Background()) })
+	if err := clone.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, 3*time.Second, func() bool { return clone.Status().ProbeOK })
+	if clone.instanceID != owner.InstanceID {
+		t.Fatalf("copied state instance %s want %s", clone.instanceID, owner.InstanceID)
+	}
+	if err := clone.Ready(context.Background(), "100.64.9.9", "100.64.0.1"); !errors.Is(err, ErrNodeConflict) {
+		t.Fatalf("copied state ready err=%v", err)
+	}
+	if _, _, _, ok := g.kv(g.reg.key); ok {
+		t.Fatal("copied state registered on a different addr")
+	}
+	select {
+	case a := <-alerts:
+		if a.Kind != AlertForeignInstance {
+			t.Fatalf("alert %+v", a)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no foreign alert for copied state on a different addr")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	resp, err := g.cli.Get(ctx, EpochKey("626220"))
+	cancel()
+	if err != nil || len(resp.Kvs) != 1 {
+		t.Fatalf("marker missing err=%v", err)
+	}
+	var ev epochValue
+	if json.Unmarshal(resp.Kvs[0].Value, &ev) != nil || ev.InstanceID != owner.InstanceID || ev.Addr != "10.0.8.26:8080" {
+		t.Fatalf("marker rewritten: %s", resp.Kvs[0].Value)
+	}
+}
+
+func TestMixedEpochMarkerFormats(t *testing.T) {
+	t.Run("old marker without addr", func(t *testing.T) {
+		g := newRig(t, 1, "626220", func(cfg *Config) { cfg.MachineID = "host-a" })
+		g.ready("100.64.0.1")
+		_, _, val := g.waitKey(true, 2*time.Second)
+		if err := g.reg.Drain(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		resp, err := g.cli.Get(ctx, EpochKey("626220"))
+		if err != nil || len(resp.Kvs) != 1 {
+			cancel()
+			t.Fatalf("epoch missing err=%v", err)
+		}
+		old, err := json.Marshal(epochValue{InstanceID: val.InstanceID, NodeID: "626220"})
+		if err != nil {
+			cancel()
+			t.Fatal(err)
+		}
+		_, err = g.cli.Put(ctx, EpochKey("626220"), string(old), clientv3.WithLease(clientv3.LeaseID(resp.Kvs[0].Lease)))
+		cancel()
+		if err != nil {
+			t.Fatal(err)
+		}
+		g.ip.set("100.64.0.2")
+		if err := g.reg.Ready(context.Background(), "100.64.0.2", ""); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, got, ok := g.kv(g.reg.key); !ok || got.EgressIP != "100.64.0.2" || got.InstanceID != val.InstanceID {
+			t.Fatalf("old marker reclaim ok=%v val=%+v", ok, got)
+		}
+		ctx, cancel = context.WithTimeout(context.Background(), 2*time.Second)
+		resp, err = g.cli.Get(ctx, EpochKey("626220"))
+		cancel()
+		if err != nil || len(resp.Kvs) != 0 {
+			t.Fatalf("old marker left behind n=%d err=%v", len(resp.Kvs), err)
+		}
+	})
+
+	t.Run("same instance different addr", func(t *testing.T) {
+		g := newRig(t, 1, "626220", func(cfg *Config) { cfg.MachineID = "host-a" })
+		g.ready("100.64.0.1")
+		_, _, val := g.waitKey(true, 2*time.Second)
+		if err := g.reg.Drain(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		resp, err := g.cli.Get(ctx, EpochKey("626220"))
+		if err != nil || len(resp.Kvs) != 1 {
+			cancel()
+			t.Fatalf("epoch missing err=%v", err)
+		}
+		body, err := json.Marshal(epochValue{
+			InstanceID: val.InstanceID,
+			NodeID:     "626220",
+			Addr:       "10.9.9.9:8080",
+			MachineID:  "host-a",
+		})
+		if err != nil {
+			cancel()
+			t.Fatal(err)
+		}
+		_, err = g.cli.Put(ctx, EpochKey("626220"), string(body), clientv3.WithLease(clientv3.LeaseID(resp.Kvs[0].Lease)))
+		cancel()
+		if err != nil {
+			t.Fatal(err)
+		}
+		alerts := make(chan Alert, 1)
+		g.reg.mu.Lock()
+		g.reg.cfg.OnAlert = func(a Alert) { alerts <- a }
+		g.reg.mu.Unlock()
+		g.ip.set("100.64.0.2")
+		if err := g.reg.Ready(context.Background(), "100.64.0.2", ""); !errors.Is(err, ErrNodeConflict) {
+			t.Fatalf("different addr ready err=%v", err)
+		}
+		if _, _, _, ok := g.kv(g.reg.key); ok {
+			t.Fatal("different addr marker admitted the owner")
+		}
+		select {
+		case a := <-alerts:
+			if a.Kind != AlertForeignInstance {
+				t.Fatalf("alert %+v", a)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("no foreign alert")
+		}
+		ctx, cancel = context.WithTimeout(context.Background(), 2*time.Second)
+		resp, err = g.cli.Get(ctx, EpochKey("626220"))
+		cancel()
+		if err != nil || len(resp.Kvs) != 1 || string(resp.Kvs[0].Value) != string(body) {
+			t.Fatalf("marker changed err=%v", err)
+		}
+	})
+}
+
+func TestDrainRetriesWhenEpochLeaseRevoked(t *testing.T) {
+	g := newRig(t, 1, "626220", func(cfg *Config) { cfg.MachineID = "host-a" })
+	g.ready("100.64.0.1")
+	g.waitKey(true, 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	gr, err := g.cli.Grant(ctx, 30)
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	if _, err := g.cli.Revoke(ctx, gr.ID); err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	cancel()
+	g.reg.mu.Lock()
+	g.reg.epochLease = gr.ID
+	g.reg.epochNextRenew = time.Now().Add(time.Hour)
+	g.reg.epochDeadline = time.Now().Add(time.Hour)
+	g.reg.mu.Unlock()
+	if err := g.reg.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, ok := g.kv(g.reg.key); ok {
+		t.Fatal("key still present after drain")
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), 2*time.Second)
+	resp, err := g.cli.Get(ctx, EpochKey("626220"))
+	cancel()
+	if err != nil || len(resp.Kvs) != 1 {
+		t.Fatalf("marker missing after revoked epoch lease err=%v n=%d", err, len(resp.Kvs))
+	}
+	if resp.Kvs[0].Lease == int64(gr.ID) {
+		t.Fatal("marker still on the revoked epoch lease")
+	}
+	ttl, err := leaseTTL(g.cli, resp.Kvs[0].Lease)
+	if err != nil || ttl <= 0 {
+		t.Fatalf("replacement epoch lease ttl=%d err=%v", ttl, err)
+	}
+}
+
+func TestDrainFallsBackWhenEpochGrantFails(t *testing.T) {
+	g := newRig(t, 1, "626220", func(cfg *Config) { cfg.MachineID = "host-a" })
+	g.ready("100.64.0.1")
+	g.waitKey(true, 2*time.Second)
+	g.reg.mu.Lock()
+	g.reg.epochGrant = func(context.Context, int64) (*clientv3.LeaseGrantResponse, error) {
+		return nil, errors.New("grant failed")
+	}
+	g.reg.mu.Unlock()
+	if err := g.reg.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, ok := g.kv(g.reg.key); ok {
+		t.Fatal("key still present when epoch grant failed")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	resp, err := g.cli.Get(ctx, EpochKey("626220"))
+	cancel()
+	if err != nil || len(resp.Kvs) != 0 {
+		n := 0
+		if resp != nil {
+			n = len(resp.Kvs)
+		}
+		t.Fatalf("fallback left a marker err=%v n=%d", err, n)
+	}
+	g.reg.mu.Lock()
+	id := g.reg.epochLease
+	g.reg.mu.Unlock()
+	if id != 0 {
+		t.Fatalf("failed grant left epoch lease %d", id)
+	}
+}
+
+func TestConflictRevokesUnusedEpochLease(t *testing.T) {
+	g := newRig(t, 1, "626220", func(cfg *Config) { cfg.MachineID = "host-a" })
+	g.ready("100.64.0.1")
+	g.waitKey(true, 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	before, err := g.cli.Leases(ctx)
+	cancel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.reg.mu.Lock()
+	err = g.reg.deleteKeyAndEpoch(context.Background(), 1)
+	id := g.reg.epochLease
+	g.reg.mu.Unlock()
+	if !errors.Is(err, errLostRace) {
+		t.Fatalf("stale mod err=%v", err)
+	}
+	if id != 0 {
+		t.Fatalf("unused epoch lease %d still renewing", id)
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), 2*time.Second)
+	after, err := g.cli.Leases(ctx)
+	cancel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after.Leases) != len(before.Leases) {
+		t.Fatalf("leases %d -> %d", len(before.Leases), len(after.Leases))
+	}
+	if _, _, _, ok := g.kv(g.reg.key); !ok {
+		t.Fatal("conflict path deleted the key")
+	}
+}
+
+func TestDrainedEpochHoldExpires(t *testing.T) {
+	alerts := make(chan Alert, 1)
+	g := newRig(t, 1, "626220", func(cfg *Config) {
+		cfg.MachineID = "host-a"
+		cfg.TTL = time.Second
+		cfg.RenewInterval = 400 * time.Millisecond
+		cfg.EpochTTL = 2 * time.Second
+		cfg.EpochRenewInterval = time.Second
+		cfg.MaxDrained = 400 * time.Millisecond
+		cfg.OnAlert = func(a Alert) {
+			select {
+			case alerts <- a:
+			default:
+			}
+		}
+	})
+	g.ready("100.64.0.1")
+	g.waitKey(true, 2*time.Second)
+	if err := g.reg.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case a := <-alerts:
+		if a.Kind != AlertEpochHoldExpired {
+			t.Fatalf("alert %+v", a)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("drained holder kept renewing the marker")
+	}
+	waitUntil(t, 6*time.Second, func() bool {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		resp, err := g.cli.Get(ctx, EpochKey("626220"))
+		return err == nil && len(resp.Kvs) == 0
+	})
+	cfg := g.reg.cfg
+	cfg.MachineID = "host-b"
+	cfg.StateFile = filepath.Join(t.TempDir(), "other.json")
+	cfg.OnAlert = func(Alert) {}
+	cfg.MaxDrained = 5 * time.Minute
+	other, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = other.Stop(context.Background()) })
+	if err := other.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, 3*time.Second, func() bool { return other.Status().ProbeOK })
+	if err := other.Ready(context.Background(), "100.64.0.1", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, ok := g.kv(other.key); !ok {
+		t.Fatal("other instance could not register after the marker expired")
+	}
 }
 
 func leaseTTL(cli *clientv3.Client, id int64) (int64, error) {

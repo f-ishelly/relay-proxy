@@ -463,15 +463,15 @@ Value：
 
 写入用事务：key 不存在、lease 属于本进程、lease 是本机状态文件里的上一任且 value 的 `instance_id` 也是本实例，或该 lease 已经失效，才允许 Put / Delete。否则视为 nodeId 冲突，不覆盖，并调用 `OnAlert`。活着的别人的 lease 用 `kind = node_id_conflict`。`instance_id` 对不上时用 `kind = foreign_instance`，并且不 Revoke 那条 lease。
 
-`instance_id` 是第一次启动时生成的随机数，和当时的 `/etc/machine-id` 一起写进状态文件，也写进 value。状态文件被拷到另一台机器（`machine-id` 不同）时，新进程不认里面的 lease，也不会把原机的 key 撤掉。`machine-id` 或 `instance_id` 有一边是空的，同样不认、不撤。即便 `machine-id` 也被一起拷走，撤销之前会先读当前 key：`value.addr` 不是本机 `IntranetAddr`，或 `instance_id` 对不上，或这两个字段有一个是空的，都不 Revoke，也不覆盖。只有地址和实例都对得上，才把状态文件里的 lease 当成自己的。克隆体如果连 `machine-id`、`instance_id`、内网地址全部相同，registrar 仍然分不出来，这是残留风险：克隆虚拟机时要重新生成 machine-id，不要把状态文件当成镜像的一部分。
+`instance_id` 是第一次启动时生成的随机数，和当时的 `/etc/machine-id` 一起写进状态文件，也写进 value。状态文件被拷到另一台机器（`machine-id` 不同）时，新进程不认里面的 lease，也不会把原机的 key 撤掉。`machine-id` 或 `instance_id` 有一边是空的，同样不认、不撤。即便 `machine-id` 也被一起拷走，撤销之前会先读当前 key：`value.addr` 不是本机 `IntranetAddr`，或 `instance_id` 对不上，或这两个字段有一个是空的，都不 Revoke，也不覆盖。只有地址和实例都对得上，才把状态文件里的 lease 当成自己的。没有状态文件时，仅 `machine-id` 和内网地址相同不够拿回 key，必须等重拨标记过期。克隆体如果连 `machine-id`、`instance_id`、内网地址全部相同，registrar 仍然分不出来，这是残留风险：克隆虚拟机时要重新生成 machine-id，不要把状态文件当成镜像的一部分。
 
 状态文件（例如 `/var/lib/relay-registrar/{nodeId}.json`）记录 instance、lease、`drained`、当前出口，以及计划内重拨前的出口（`prev_egress`）。写文件时先把临时文件 fsync，再 rename，然后 fsync 目录。没有 `machine_id` 或 `instance_id` 的旧状态文件视为身份不明：启动后保持 `drained`，不撤旧 lease，也不自动注册，要等 admin 调用 `Ready`。`example/admin` 在 `Start` 之后会调用 `Ready`。`cmd/registrard` 只是 HTTP 适配，启动时不调用 `Ready`，等原来的 admin `POST /v1/ready`。
 
-`Drain` 先把 `drained` 和“必须换出口”落盘。只有本进程登记过这个 key（写成功过，或状态文件认下了自己的身份）才会动 `/relay/l2-epoch/{nodeId}`。别人拿着同一个 nodeId 来 `Drain`，删不掉当前 key，也写不上标记；它自己的 lease 丢失同样不会写标记。持有者摘 key 时，标记和删除在同一次事务里：先确认业务 key 还是刚刚读到的那一版，再写上自己的标记并删除 key。别人提前留下的标记挡不住这次删除。key 已经不在时，持有者只会在标记不存在或本来就是自己的时候补写，不会盖掉别人的标记。刷新标记之后会撤销被换掉的那条 epoch lease。
+`Drain` 先把 `drained` 和“必须换出口”落盘。只有本进程登记过这个 key（写成功过，或状态文件认下了自己的身份）才会动 `/relay/l2-epoch/{nodeId}`。别人拿着同一个 nodeId 来 `Drain`，删不掉当前 key，也写不上标记；它自己的 lease 丢失同样不会写标记。持有者摘 key 时，标记和删除在同一次事务里：先确认业务 key 还是刚刚读到的那一版，再写上自己的标记并删除 key。别人提前留下的标记挡不住这次删除。客户端记着的 epoch lease 如果已经在服务端被撤销，这次事务会整笔失败；registrar 丢掉这个 lease id，重新 Grant，再提交一次。仍然失败才退回只删 key。刚 Grant 出来、事务又没写上标记的 lease 会马上 Revoke，不会留着空转续租。key 已经不在时，持有者只会在标记不存在或本来就是自己的时候补写，不会盖掉别人的标记。刷新标记之后会撤销被换掉的那条 epoch lease。
 
-标记不在 `/relay/l2/` 前缀下，L1 的 Watch 看不到。它挂在自己的 epoch lease 上（默认 max(30s, 3×业务 TTL)，业务 TTL 为 10s 时就是 30s；进程还活着就按 EpochRenewInterval 续租，默认 10s），正文是 `instance_id`、`node_id`、`addr`、`machine_id`。所以业务 lease 在 drained 期间丢失时，标记还在。创建业务 key，以及靠“lease 已死”这条路径覆盖残留 key，都要求标记不存在或属于本实例（同一 `instance_id`，或同一 `addr` + `machine_id`）。注册成功后只删除这些标记。
+标记不在 `/relay/l2/` 前缀下，L1 的 Watch 看不到。它挂在自己的 epoch lease 上（默认 max(30s, 3×业务 TTL)，业务 TTL 为 10s 时就是 30s；进程还活着就按 EpochRenewInterval 续租，默认 10s），正文是 `instance_id`、`node_id`、`addr`、`machine_id`。所以业务 lease 在 drained 期间丢失时，标记还在。创建业务 key，以及靠“lease 已死”这条路径覆盖残留 key，都要求标记不存在，或属于本实例：`instance_id` 相同，并且标记里的 `addr` 为空（旧格式）或等于本机 `IntranetAddr`。只凭相同的 `addr` 和 `machine_id` 不能注册。注册成功后只删除本实例的这些标记。
 
-重拨中崩溃并且状态文件也丢了时，新进程的 `instance_id` 是新的，但标记上的内网地址和 `machine_id` 如果仍是这台机器，就不报 `foreign_instance`。`Ready` 必须带上一个不同的上一任出口才能注册；不带则是 `ErrEgressUnconfirmed`，不是 nodeId 冲突。地址或 machine-id 对不上的标记仍是 `foreign_instance`，空窗最多再留一个 EpochTTL。进程退出后 epoch lease 不再续租，到期之后别的实例才能创建。这是残留风险。
+重拨中崩溃并且状态文件也丢了时，新进程的 `instance_id` 是新的。标记上的内网地址和 `machine_id` 如果仍是这台机器，就不报 `foreign_instance`，但在标记过期之前仍然拒绝注册：`Ready` 即使带了不同的 `prevEgress` 也返回 `ErrNodeConflict`，也不会删掉持有者的标记。拷走状态文件、因此 `instance_id` 相同、但 `IntranetAddr` 已经不同的机器不算持有者，按 `foreign_instance` 拒绝。地址或 machine-id 对不上的标记同样是 `foreign_instance`。持有者一直停在 drained、不再调用 `Ready` 时，标记最多再续 `MaxDrained`（默认 10×EpochTTL；EpochTTL 为 30s 时是 5 分钟），然后停止续租并 `OnAlert`（`kind = epoch_hold_expired`），标记在剩余的一个 EpochTTL 内自己过期。进程退出后 epoch lease 不再续租。这是残留风险。
 
 上次在线且本机 ppp 地址未变、状态文件也属于本机时，新进程 Grant 新 lease，用事务盖住原 key，再撤销旧 lease，Watch 不会看到 DELETE。这是进程重启，不是重拨，不要求出口变化。客户端如果误以为自己的 lease 已经丢失（例如切主后本地截止时间到了，服务端租约其实还在），旧 lease 会留在本实例的上一任列表里，重新 Put 时认领，而不是报成和自己冲突。
 
@@ -480,8 +480,8 @@ Value：
 | 调用 | 行为 |
 | --- | --- |
 | `Start` | 连接配置里的全部成员并 Grant。之后每 3s 续租、每 1s 探测 gost、每 500ms 检查 ppp 地址。探测未通过不 Put |
-| `Drain` | 同步 Delete 本 key。单次超时 700ms，最多重试 6s，etcd 确认后才返回。业务 lease 继续续租。记下重拨前的出口。还没注册过就 `Drain` 时没有出口可记，也不写 epoch 标记，之后的 `Ready` 必须由调用方传入一个不同的 `prevEgress`。登记过的持有者在同一次事务里写自己的标记并删除 key；别人的标记不会让这次删除失败 |
-| `Ready(egressIP, prevEgress)` | 本机 ppp 地址必须等于 `egressIP`，且 gost 探测已通过，才 Put。创建 key 的事务会同时看 epoch 标记；lease 已死的覆盖也看。重拨中：状态文件里的上一任出口和调用方传入的 `prevEgress` 都用来比对，相同则 `ErrEgressUnchanged`。状态文件损坏、`node_id` 对不上，或文件整个缺失时，都先按 `drained` 处理，`Report` 不能注册。损坏或 `node_id` 不符时，不传 `prevEgress` 得到 `ErrEgressUnconfirmed`。文件缺失且没有本机留下的标记时，和第一次启动无法区分：`Ready` 不传 `prevEgress` 会注册。文件缺失但标记上的地址和 machine-id 是本机时，不传上一任出口得到 `ErrEgressUnconfirmed`，不报 `foreign_instance` |
+| `Drain` | 同步 Delete 本 key。单次超时 700ms，最多重试 6s，etcd 确认后才返回。业务 lease 继续续租。记下重拨前的出口。还没注册过就 `Drain` 时没有出口可记，也不写 epoch 标记，之后的 `Ready` 必须由调用方传入一个不同的 `prevEgress`。登记过的持有者在同一次事务里写自己的标记并删除 key；别人的标记不会让这次删除失败。epoch lease 已在服务端撤销时，重新 Grant 并再试一次合并事务，然后才退回只删 key。没写上标记的新 lease 会撤销。停在 drained 超过 `MaxDrained` 后不再续租标记 |
+| `Ready(egressIP, prevEgress)` | 本机 ppp 地址必须等于 `egressIP`，且 gost 探测已通过，才 Put。创建 key 的事务会同时看 epoch 标记；lease 已死的覆盖也看。能穿过标记的只有本实例：`instance_id` 相同，且 `addr` 为空或等于本机内网地址。重拨中：状态文件里的上一任出口和调用方传入的 `prevEgress` 都用来比对，相同则 `ErrEgressUnchanged`。状态文件损坏、`node_id` 对不上，或文件整个缺失时，都先按 `drained` 处理，`Report` 不能注册。损坏或 `node_id` 不符时，不传 `prevEgress` 得到 `ErrEgressUnconfirmed`。文件缺失且没有标记时，和第一次启动无法区分：`Ready` 不传 `prevEgress` 会注册。文件缺失但标记上的地址和 machine-id 是本机时，不报 `foreign_instance`，标记过期前 `Ready` 返回 `ErrNodeConflict`，不同的 `prevEgress` 也不能接管。`instance_id` 相同但 `addr` 不同，按 `foreign_instance` 拒绝 |
 | `Report` | 每分钟一次。零值表示健康。`NetFault` 表示访问外部失败，`CPUFault` / `MemFault` 表示 CPU 或内存异常。任一故障则 Delete，恢复后（再传零值或没有故障位）Put。`drained` 期间，以及还没有一次通过出口校验的 `Ready`（或本机接管）时，忽略，不会把出口写进 etcd。上报正文不写 etcd |
 | `Stop` | `Revoke` lease。进程被杀或宿主机异常时没有这一步，key 等 TTL |
 
@@ -511,11 +511,12 @@ Value：
 | 计划外掉线 | 节点是虚拟机，只有宿主机异常时才发生，而且很少。同一宿主机上的一批节点会一起过期。不因此改 TTL | `TTL` 10s，`RenewInterval` 3s。L1 要承受批量 DELETE，见 §8.3 |
 | nodeId | 环境变量 `RELAY_NODE_ID`，运维保证唯一。变量存在但只有空白是配置错误，不会改去读文件。事务冲突检测保留作兜底 | `NodeID` 可直接传入；为空且环境变量未设置时才读 `NodeIDFile`。告警走 `OnAlert` |
 | admin 语言 | Go。主路径是进程内调用 `registrar`。`cmd/registrard` 只是备选，启动时不调用 `Ready` | `example/admin` 在 `Start` 之后调用 `Ready` |
-| 旧状态文件 | 没有 `machine_id` 或 `instance_id` 时保持 `drained`，不撤旧 lease，直到 `Ready` | 无自动升级开关 |
+| 旧状态文件 | 没有 `machine_id` 或 `instance_id` 时保持 `drained`，不撤旧 lease，直到 `Ready`。旧 epoch 标记如果只有 `instance_id` 和 `node_id`、没有 `addr`，仍然算本实例；带了 `addr` 就必须和本机内网地址一致 | 无自动升级开关 |
+| drained 期间的标记 | 持有者停在 drained 时继续续租标记，默认最多 10×EpochTTL（30s 时为 5 分钟）。到期停止续租，`OnAlert` 的 kind 为 `epoch_hold_expired`，标记再在一个 EpochTTL 内过期 | `MaxDrained` |
 
 ### 8.5 本仓库里怎么验证
 
-`go test ./registrar/` 用内嵌 etcd 覆盖验收里的计划内重拨、重拨后出口 IP 没变时不注册、校验失败与崩溃恢复、未 `Drain` 的地址变化、gost 挂死与外网/资源巡检失败、切主时在线节点不删 key 且 `Drain` 在 3s 内完成、进程消失后的 TTL / 切主上限，以及 nodeId 冲突。压测入口是 `cmd/loadgen` 和 `scripts/loadtest.sh`：本进程拉起 3 个 etcd 成员，每个客户端都配置全部成员。全部注册之后，每台逻辑主机做一次带 epoch 标记的 Drain 再写回原 lease，然后才切主；统计续租错误、lease 丢失，以及和这次 Drain 数量一致的 Watch DELETE。最近一次验收 5、验收 7 的输出在 `docs/acceptance/`。
+`go test ./registrar/` 用内嵌 etcd 覆盖验收里的计划内重拨、重拨后出口 IP 没变时不注册、校验失败与崩溃恢复、未 `Drain` 的地址变化、gost 挂死与外网/资源巡检失败、切主时在线节点不删 key 且 `Drain` 在 3s 内完成、进程消失后的 TTL / 切主上限，以及 nodeId 冲突。压测入口是 `cmd/loadgen` 和 `scripts/loadtest.sh`：本进程拉起 3 个 etcd 成员。每台逻辑主机是一个 `registrar` 实例，客户端配置全部成员，注册后调用 `Drain` 再 `Ready`，然后才切主。续租次数来自 registrar 自己的续租循环。Watch DELETE 次数等于这次 `Drain` 的次数；多出来的 DELETE 才是 lease 过期。最近一次验收 5、验收 7 的输出在 `docs/acceptance/`。
 
 ---
 
