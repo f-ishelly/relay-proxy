@@ -17,8 +17,8 @@ reg, err := registrar.New(cfg)
 err = reg.Start(ctx)
 err = reg.Drain(ctx) // 确认删除后再挂断
 // dial + egress check，合计约 5s。出口没变就不要 Ready。
-err = reg.Ready(ctx, egressIP)
-err = reg.Report(ctx, registrar.Report{NetOK: netOK, ResourcesOK: resourcesOK, EgressIP: egressIP})
+err = reg.Ready(ctx, egressIP, prevEgress)
+err = reg.Report(ctx, registrar.Report{NetFault: !netOK, CPUFault: cpuFault, MemFault: memFault, EgressIP: egressIP})
 err = reg.Stop(ctx)
 ```
 

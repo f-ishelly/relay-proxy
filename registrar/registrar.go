@@ -20,6 +20,8 @@ var (
 	ErrEgressMismatch = errors.New("egress ip mismatch")
 	// ErrEgressUnchanged 表示计划内重拨后，外部看到的出口 IP 和重拨前相同。视为校验失败，不注册。
 	ErrEgressUnchanged = errors.New("egress ip unchanged")
+	// ErrEgressUnconfirmed 表示这次 Ready 处在重拨中，但没有可靠的重拨前出口可以比对。
+	ErrEgressUnconfirmed = errors.New("previous egress unconfirmed")
 	// ErrNotRegistered 表示探测未通过，或 etcd 里还没有这次 Ready 的 key。
 	ErrNotRegistered = errors.New("not registered")
 	// ErrStopped 表示已经 Stop。
@@ -47,10 +49,13 @@ type Registrar struct {
 
 	lease           clientv3.LeaseID
 	stale           []int64
+	instanceID      string
+	machineID       string
 	regIP           string
 	resumeIP        string
 	prevEgress      string
 	expectNewEgress bool
+	stateUntrusted  bool
 	drained         bool
 	wantIP          string
 	netOK           bool
@@ -176,8 +181,9 @@ func (r *Registrar) Drain(ctx context.Context) error {
 	return fmt.Errorf("%w: %v", ErrDrainTimeout, err)
 }
 
-// Ready 在出口校验通过后调用。本机 ppp 地址必须等于 egressIP，且 gost 探测已通过，才会 Put。
-func (r *Registrar) Ready(ctx context.Context, egressIP string) error {
+// Ready 在出口校验通过后调用。prevEgress 是调用方看到的重拨前出口，用来和状态文件互相确认。
+// 本机 ppp 地址必须等于 egressIP，且 gost 探测已通过，才会 Put。
+func (r *Registrar) Ready(ctx context.Context, egressIP, prevEgress string) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -187,14 +193,14 @@ func (r *Registrar) Ready(ctx context.Context, egressIP string) error {
 		return ErrStopped
 	}
 	lip := r.cfg.LocalIP()
-	r.event("api_ready", "ip", egressIP, "local_ip", lip, "prev_egress", r.prevEgress)
+	r.event("api_ready", "ip", egressIP, "local_ip", lip, "prev_egress", r.prevEgress, "given_prev", prevEgress)
 	if egressIP == "" || lip != egressIP {
 		return fmt.Errorf("%w: local %q", ErrEgressMismatch, lip)
 	}
-	// 计划内重拨的目的就是换出口。外部看到的地址没变，就是校验失败。
-	if r.expectNewEgress && r.prevEgress != "" && egressIP == r.prevEgress {
-		return fmt.Errorf("%w: %s", ErrEgressUnchanged, egressIP)
+	if err := r.checkEgressChange(egressIP, prevEgress); err != nil {
+		return err
 	}
+	r.stateUntrusted = false
 	r.drained = false
 	r.wantIP = egressIP
 	r.netOK = true
@@ -212,6 +218,25 @@ func (r *Registrar) Ready(ctx context.Context, egressIP string) error {
 	return nil
 }
 
+// checkEgressChange 在锁内调用。重拨后出口必须变化；对不上或无法确认时不注册。
+func (r *Registrar) checkEgressChange(egressIP, prevEgress string) error {
+	needConfirm := r.expectNewEgress || r.stateUntrusted
+	baseline := r.prevEgress
+	if baseline != "" && prevEgress != "" && prevEgress != baseline {
+		return fmt.Errorf("%w: state %q caller %q", ErrEgressUnconfirmed, baseline, prevEgress)
+	}
+	if baseline == "" {
+		baseline = prevEgress
+	}
+	if needConfirm && baseline == "" {
+		return fmt.Errorf("%w: pass the egress from before this redial", ErrEgressUnconfirmed)
+	}
+	if baseline != "" && egressIP == baseline && (r.expectNewEgress || prevEgress != "" || r.stateUntrusted) {
+		return fmt.Errorf("%w: %s", ErrEgressUnchanged, egressIP)
+	}
+	return nil
+}
+
 // Report 接收 admin 每分钟一次的巡检。外网不通，或（默认）CPU/内存异常，都删除 key；恢复后 Put。
 // drained 期间忽略。上报正文不写 etcd；只有注册状态需要变化时才动 key。
 func (r *Registrar) Report(ctx context.Context, rep Report) error {
@@ -224,24 +249,24 @@ func (r *Registrar) Report(ctx context.Context, rep Report) error {
 		return ErrStopped
 	}
 	ev := ReportEvent{
-		NetOK: rep.NetOK, ResourcesOK: rep.ResourcesOK, EgressIP: rep.EgressIP,
-		Drained: r.drained, At: time.Now(),
+		NetFault: rep.NetFault, CPUFault: rep.CPUFault, MemFault: rep.MemFault,
+		EgressIP: rep.EgressIP, Drained: r.drained, At: time.Now(),
 	}
 	if r.cfg.OnReport != nil {
 		cb := r.cfg.OnReport
 		go cb(ev)
 	}
 	if r.drained {
-		r.event("api_report", "ip", rep.EgressIP, "net_ok", rep.NetOK, "resources_ok", rep.ResourcesOK, "ignored", true)
+		r.event("api_report", "ip", rep.EgressIP, "net_fault", rep.NetFault, "cpu_fault", rep.CPUFault, "mem_fault", rep.MemFault, "ignored", true)
 		return nil
 	}
-	r.netOK = rep.NetOK
-	r.resourcesOK = rep.ResourcesOK
+	r.netOK = !rep.NetFault
+	r.resourcesOK = !rep.CPUFault && !rep.MemFault
 	if rep.EgressIP != "" {
 		r.wantIP = rep.EgressIP
 		r.resumeIP = rep.EgressIP
 	}
-	r.event("api_report", "ip", rep.EgressIP, "net_ok", rep.NetOK, "resources_ok", rep.ResourcesOK, "ignored", false)
+	r.event("api_report", "ip", rep.EgressIP, "net_fault", rep.NetFault, "cpu_fault", rep.CPUFault, "mem_fault", rep.MemFault, "ignored", false)
 	r.reconcile(ctx, "report", r.cfg.OpTimeout)
 	if errors.Is(r.lastErr, ErrNodeConflict) {
 		return ErrNodeConflict
@@ -332,30 +357,22 @@ func (r *Registrar) abandon() {
 }
 
 func (r *Registrar) bootstrap(ctx context.Context) error {
-	st, ok := loadState(r.cfg.StateFile, r.cfg.NodeID)
-	if ok {
-		stale := uniqueLeases(append([]int64{st.Lease}, st.PrevLeases...))
-		lip := r.cfg.LocalIP()
-		r.prevEgress = st.PrevEgress
-		r.expectNewEgress = st.ExpectNewEgress
-		if !st.Drained && st.IP != "" && st.IP == lip {
-			r.wantIP = st.IP
-			r.resumeIP = st.IP
-			if r.prevEgress == "" {
-				r.prevEgress = st.IP
-			}
-			r.expectNewEgress = false
-			r.stale = stale
-			r.drained = false
-			r.event("takeover_candidate", "ip", st.IP, "prev_leases", stale)
+	r.machineID = r.cfg.currentMachineID()
+	st, res := loadState(r.cfg.StateFile, r.cfg.NodeID)
+	switch res {
+	case stateMissing:
+		r.instanceID = newInstanceID()
+	case stateUntrusted:
+		r.instanceID = newInstanceID()
+		r.stateUntrusted = true
+		r.event("state_untrusted", "path", r.cfg.StateFile)
+	case stateOK:
+		if st.MachineID != "" && r.machineID != "" && st.MachineID != r.machineID {
+			// 状态文件连同 nodeId 被拷到了另一台机器。里面的 lease 不是我们的，不能 Revoke。
+			r.instanceID = newInstanceID()
+			r.event("foreign_state", "state_machine", st.MachineID, "machine", r.machineID)
 		} else {
-			r.drained = st.Drained || (st.IP != "" && st.IP != lip)
-			r.stale = stale
-			r.revokeStale(ctx, r.cfg.OpTimeout)
-			if r.drained {
-				r.resumeIP = ""
-			}
-			r.event("stale_not_resumed", "drained", r.drained, "state_ip", st.IP, "local_ip", lip, "expect_new_egress", r.expectNewEgress)
+			r.adoptState(ctx, st)
 		}
 	}
 	if err := r.grant(ctx); err != nil {
@@ -363,6 +380,37 @@ func (r *Registrar) bootstrap(ctx context.Context) error {
 	}
 	r.saveLocked()
 	return nil
+}
+
+func (r *Registrar) adoptState(ctx context.Context, st diskState) {
+	if st.InstanceID != "" {
+		r.instanceID = st.InstanceID
+	} else {
+		r.instanceID = newInstanceID()
+	}
+	stale := uniqueLeases(append([]int64{st.Lease}, st.PrevLeases...))
+	lip := r.cfg.LocalIP()
+	r.prevEgress = st.PrevEgress
+	r.expectNewEgress = st.ExpectNewEgress
+	if !st.Drained && st.IP != "" && st.IP == lip {
+		r.wantIP = st.IP
+		r.resumeIP = st.IP
+		if r.prevEgress == "" {
+			r.prevEgress = st.IP
+		}
+		r.expectNewEgress = false
+		r.stale = stale
+		r.drained = false
+		r.event("takeover_candidate", "ip", st.IP, "prev_leases", stale, "instance", r.instanceID)
+		return
+	}
+	r.drained = st.Drained || (st.IP != "" && st.IP != lip)
+	r.stale = stale
+	r.revokeStale(ctx, r.cfg.OpTimeout)
+	if r.drained {
+		r.resumeIP = ""
+	}
+	r.event("stale_not_resumed", "drained", r.drained, "state_ip", st.IP, "local_ip", lip, "expect_new_egress", r.expectNewEgress)
 }
 
 func (r *Registrar) grant(ctx context.Context) error {
@@ -495,14 +543,22 @@ func (r *Registrar) renew() {
 		return
 	}
 	if leaseMissing(err) || (err == nil && (resp == nil || resp.TTL <= 0)) || time.Now().After(r.deadline) {
-		r.event("lease_lost", "err", fmt.Sprint(err))
-		r.lease = 0
-		r.regIP = ""
-		r.saveLocked()
+		// 客户端以为租约没了，但切主后服务端可能还活着。先记进 stale，后面才能认领，而不是和自己冲突。
+		r.loseLeaseLocked(err)
 		return
 	}
 	r.event("ka_err", "err", err.Error())
 	r.nextRenew = time.Now().Add(500 * time.Millisecond)
+}
+
+func (r *Registrar) loseLeaseLocked(err error) {
+	if r.lease != 0 {
+		r.stale = uniqueLeases(append(r.stale, int64(r.lease)))
+	}
+	r.event("lease_lost", "err", fmt.Sprint(err), "kept_stale", r.stale)
+	r.lease = 0
+	r.regIP = ""
+	r.saveLocked()
 }
 
 func (r *Registrar) resourceFault() bool {
@@ -572,12 +628,16 @@ func (r *Registrar) put(ctx context.Context, ip, how string, timeout time.Durati
 			return err
 		}
 	}
+	if err := r.blockForeignCreate(ctx, timeout); err != nil {
+		return err
+	}
 	val := Value{
 		Addr:         r.cfg.IntranetAddr,
 		EgressIP:     ip,
 		ProxyPort:    r.cfg.ProxyPort,
 		ControlPort:  r.cfg.ControlPort,
 		NodeID:       r.cfg.NodeID,
+		InstanceID:   r.instanceID,
 		AZ:           r.cfg.AZ,
 		Weight:       r.cfg.Weight,
 		Capability:   r.cfg.Capability,
@@ -613,14 +673,14 @@ func (r *Registrar) put(ctx context.Context, ip, how string, timeout time.Durati
 			continue
 		}
 		kv := kvs[0]
-		reason, allow, aerr := r.allowWrite(c, kv.Lease)
+		reason, allow, aerr := r.allowWrite(c, kv.Lease, kv.Value)
 		if aerr != nil {
 			cancel()
 			return aerr
 		}
 		if !allow {
 			cancel()
-			r.alertConflict(kv.Lease)
+			r.alertDenied(kv.Lease, kv.Value, reason)
 			return ErrNodeConflict
 		}
 		tr2, err := r.cli.Txn(c).
@@ -651,16 +711,22 @@ func (r *Registrar) finishPut(ip, how, reason string) {
 	r.prevEgress = ip
 	r.expectNewEgress = false
 	r.conflictAlerted = false
-	r.event("registered", "how", how, "reason", reason, "ip", ip, "old_ip", old, "lease", int64(r.lease))
+	r.event("registered", "how", how, "reason", reason, "ip", ip, "old_ip", old, "lease", int64(r.lease), "instance", r.instanceID)
 	r.revokeStale(context.Background(), r.cfg.OpTimeout)
+	r.clearEpoch(context.Background())
 	r.saveLocked()
 }
 
-func (r *Registrar) allowWrite(ctx context.Context, lease int64) (string, bool, error) {
+func (r *Registrar) allowWrite(ctx context.Context, lease int64, raw []byte) (string, bool, error) {
 	switch {
 	case lease == int64(r.lease):
 		return "own_lease", true, nil
 	case leaseIn(r.stale, lease):
+		if inst := instanceIDOf(raw); inst != "" && inst != r.instanceID {
+			r.stale = removeLease(r.stale, lease)
+			r.saveLocked()
+			return "foreign", false, nil
+		}
 		return "stale_lease", true, nil
 	case lease == 0:
 		return "", false, nil
@@ -691,6 +757,12 @@ func (r *Registrar) deleteOwned(ctx context.Context, reason string, timeout time
 			return err
 		}
 		if len(resp.Kvs) == 0 {
+			if r.regIP != "" || r.drained || r.expectNewEgress {
+				if err := r.writeEpoch(c); err != nil {
+					cancel()
+					return err
+				}
+			}
 			cancel()
 			if r.regIP != "" {
 				r.event("unregistered", "reason", reason, "ip", r.regIP, "missing", true)
@@ -699,15 +771,19 @@ func (r *Registrar) deleteOwned(ctx context.Context, reason string, timeout time
 			return nil
 		}
 		kv := resp.Kvs[0]
-		_, allow, aerr := r.allowWrite(c, kv.Lease)
+		why, allow, aerr := r.allowWrite(c, kv.Lease, kv.Value)
 		if aerr != nil {
 			cancel()
 			return aerr
 		}
 		if !allow {
 			cancel()
-			r.alertConflict(kv.Lease)
+			r.alertDenied(kv.Lease, kv.Value, why)
 			return ErrNodeConflict
+		}
+		if err := r.writeEpoch(c); err != nil {
+			cancel()
+			return err
 		}
 		tr, err := r.cli.Txn(c).
 			If(clientv3.Compare(clientv3.ModRevision(r.key), "=", kv.ModRevision)).
@@ -774,20 +850,92 @@ func (r *Registrar) revokeStale(ctx context.Context, timeout time.Duration) {
 	r.stale = append([]int64(nil), left...)
 }
 
-func (r *Registrar) alertConflict(other int64) {
+func (r *Registrar) alertDenied(other int64, raw []byte, reason string) {
+	if reason == "foreign" {
+		r.alert(AlertForeignInstance, other, fmt.Sprintf("nodeId 冲突：%s 属于另一个实例 %s（lease %d），拒绝撤租或覆盖", r.key, instanceIDOf(raw), other))
+		return
+	}
+	r.alert(AlertNodeConflict, other, fmt.Sprintf("nodeId 冲突：拒绝覆盖 %s，对方 lease %d 仍有效", r.key, other))
+}
+
+func (r *Registrar) alertForeign(other int64, inst string) {
+	r.alert(AlertForeignInstance, other, fmt.Sprintf("nodeId 冲突：%s 的重拨标记属于另一个实例 %s（lease %d），拒绝在空窗里接管", r.key, inst, other))
+}
+
+func (r *Registrar) alert(kind string, other int64, msg string) {
 	if r.conflictAlerted && r.conflictLease == other {
 		return
 	}
 	r.conflictAlerted = true
 	r.conflictLease = other
-	msg := fmt.Sprintf("nodeId 冲突：拒绝覆盖 %s，对方 lease %d 仍有效", r.key, other)
-	r.event("conflict", "key", r.key, "other_lease", other, "msg", msg)
+	r.event("conflict", "key", r.key, "kind", kind, "other_lease", other, "msg", msg)
 	if r.cfg.OnAlert == nil {
 		return
 	}
-	a := Alert{Kind: AlertNodeConflict, NodeID: r.cfg.NodeID, Key: r.key, OtherLease: other, Message: msg}
+	a := Alert{Kind: kind, NodeID: r.cfg.NodeID, Key: r.key, OtherLease: other, Message: msg}
 	cb := r.cfg.OnAlert
 	go cb(a)
+}
+
+type epochValue struct {
+	InstanceID string `json:"instance_id"`
+	NodeID     string `json:"node_id"`
+	At         int64  `json:"at"`
+}
+
+func (r *Registrar) blockForeignCreate(ctx context.Context, timeout time.Duration) error {
+	c, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	cur, err := r.cli.Get(c, r.key)
+	if err != nil {
+		return err
+	}
+	if len(cur.Kvs) > 0 {
+		return nil
+	}
+	resp, err := r.cli.Get(c, EpochKey(r.cfg.NodeID))
+	if err != nil || len(resp.Kvs) == 0 {
+		return err
+	}
+	var ev epochValue
+	if json.Unmarshal(resp.Kvs[0].Value, &ev) != nil || ev.InstanceID == "" || ev.InstanceID == r.instanceID {
+		return nil
+	}
+	lease := resp.Kvs[0].Lease
+	if lease != 0 {
+		ttl, terr := r.cli.TimeToLive(c, clientv3.LeaseID(lease))
+		if leaseMissing(terr) || (terr == nil && (ttl == nil || ttl.TTL <= 0)) {
+			return nil
+		}
+		if terr != nil {
+			return terr
+		}
+	}
+	r.alertForeign(lease, ev.InstanceID)
+	return ErrNodeConflict
+}
+
+func (r *Registrar) writeEpoch(ctx context.Context) error {
+	if r.cli == nil || r.lease == 0 || r.instanceID == "" {
+		return nil
+	}
+	body, err := json.Marshal(epochValue{InstanceID: r.instanceID, NodeID: r.cfg.NodeID, At: time.Now().UnixMilli()})
+	if err != nil {
+		return err
+	}
+	_, err = r.cli.Put(ctx, EpochKey(r.cfg.NodeID), string(body), clientv3.WithLease(r.lease))
+	return err
+}
+
+func (r *Registrar) clearEpoch(ctx context.Context) {
+	if r.cli == nil {
+		return
+	}
+	c, cancel := context.WithTimeout(ctx, r.cfg.OpTimeout)
+	defer cancel()
+	if _, err := r.cli.Delete(c, EpochKey(r.cfg.NodeID)); err != nil {
+		r.event("epoch_delete_err", "err", err.Error())
+	}
 }
 
 func (r *Registrar) event(ev string, args ...any) {
@@ -799,6 +947,24 @@ func (r *Registrar) event(ev string, args ...any) {
 
 func leaseMissing(err error) bool {
 	return errors.Is(err, rpctypes.ErrLeaseNotFound)
+}
+
+func instanceIDOf(raw []byte) string {
+	var v Value
+	if json.Unmarshal(raw, &v) != nil {
+		return ""
+	}
+	return v.InstanceID
+}
+
+func removeLease(ids []int64, id int64) []int64 {
+	var out []int64
+	for _, v := range ids {
+		if v != id {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 func leaseIn(ids []int64, id int64) bool {

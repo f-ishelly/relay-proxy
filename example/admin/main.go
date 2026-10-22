@@ -92,7 +92,7 @@ func main() {
 	}
 	defer func() { fatal(reg.Stop(ctx)) }()
 
-	if err := readyRetry(ctx, reg, *egress); err != nil {
+	if err := readyRetry(ctx, reg, *egress, ""); err != nil {
 		fatal(err)
 	}
 	fmt.Println("在线", reg.Status().Key, "lease", reg.Status().LeaseID)
@@ -106,23 +106,23 @@ func main() {
 	if err := os.WriteFile(*ipFile, []byte(*nextEgress+"\n"), 0o600); err != nil {
 		fatal(err)
 	}
-	if err := readyRetry(ctx, reg, *nextEgress); err != nil {
+	if err := readyRetry(ctx, reg, *nextEgress, *egress); err != nil {
 		fatal(err)
 	}
 	fmt.Println("重拨后重新在线，lease", reg.Status().LeaseID)
 
 	// 巡检每分钟一次：外网、CPU、内存都正常才保持注册。
 	time.Sleep(cfg.InspectionInterval)
-	if err := reg.Report(ctx, registrar.Report{NetOK: true, ResourcesOK: true, EgressIP: *nextEgress}); err != nil {
+	if err := reg.Report(ctx, registrar.Report{EgressIP: *nextEgress}); err != nil {
 		fatal(err)
 	}
 	fmt.Println("上报完成", reg.Status())
 }
 
-func readyRetry(ctx context.Context, reg *registrar.Registrar, egress string) error {
+func readyRetry(ctx context.Context, reg *registrar.Registrar, egress, prev string) error {
 	var err error
 	for i := 0; i < 30; i++ {
-		err = reg.Ready(ctx, egress)
+		err = reg.Ready(ctx, egress, prev)
 		if err == nil || !errors.Is(err, registrar.ErrNotRegistered) {
 			return err
 		}
@@ -161,11 +161,11 @@ err = reg.Start(ctx)
 // 重拨 API。一次拨号加一次出口校验大约 5 秒，失败率低于 1%。
 err = reg.Drain(ctx) // etcd 确认删除后才挂断
 dial()
-egressIP, changed := egressCheck(prevEgress) // 外部看到的出口必须变
+egressIP, prevEgress, changed := egressCheck() // 外部看到的出口必须变
 if !changed {
     return // 不调用 Ready
 }
-err = reg.Ready(ctx, egressIP)
-// 每分钟巡检：外网、CPU、内存。资源异常默认也摘掉 key。
-err = reg.Report(ctx, registrar.Report{NetOK: netOK, ResourcesOK: resourcesOK, EgressIP: egressIP})
+err = reg.Ready(ctx, egressIP, prevEgress)
+// 每分钟巡检。零值表示健康；外网、CPU、内存故障要把对应字段设为 true。
+err = reg.Report(ctx, registrar.Report{NetFault: !netOK, CPUFault: cpuFault, MemFault: memFault, EgressIP: egressIP})
 err = reg.Stop(ctx)`

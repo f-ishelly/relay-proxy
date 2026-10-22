@@ -372,7 +372,7 @@ func newRig(t *testing.T, nodes int, nodeID string, tune func(*Config)) *rig {
 func (r *rig) ready(ip string) {
 	r.t.Helper()
 	r.ip.set(ip)
-	if err := r.reg.Ready(context.Background(), ip); err != nil {
+	if err := r.reg.Ready(context.Background(), ip, ""); err != nil {
 		r.t.Fatal(err)
 	}
 }
@@ -400,7 +400,7 @@ func TestAcceptance1_PlannedRedial(t *testing.T) {
 		next := "100.64.1." + itoa(i+2)
 		g.ip.set(next)
 		tr := time.Now()
-		if err := g.reg.Ready(context.Background(), next); err != nil {
+		if err := g.reg.Ready(context.Background(), next, ""); err != nil {
 			t.Fatal(err)
 		}
 		puts := g.w.since(tr, g.reg.key, "PUT")
@@ -431,7 +431,7 @@ func TestAcceptance2_EgressFailAndRestart(t *testing.T) {
 	if _, _, _, ok := g.kv(g.reg.key); ok {
 		t.Fatal("registered during failed egress check")
 	}
-	if err := g.reg.Ready(context.Background(), "100.64.9.9"); !errors.Is(err, ErrEgressMismatch) {
+	if err := g.reg.Ready(context.Background(), "100.64.9.9", ""); !errors.Is(err, ErrEgressMismatch) {
 		t.Fatalf("err=%v", err)
 	}
 	if _, _, _, ok := g.kv(g.reg.key); ok {
@@ -457,7 +457,7 @@ func TestAcceptance2_EgressFailAndRestart(t *testing.T) {
 		t.Fatal("drained flag not restored")
 	}
 	g.ip.set("100.64.0.8")
-	if err := again.Ready(context.Background(), "100.64.0.8"); err != nil {
+	if err := again.Ready(context.Background(), "100.64.0.8", ""); err != nil {
 		t.Fatal(err)
 	}
 	g.reg = again
@@ -472,9 +472,9 @@ func TestDrainedRestartRevokesLeftoverKey(t *testing.T) {
 	g.waitKey(true, 2*time.Second)
 	g.reg.abandon()
 	// 模拟 Drain 已经把 drained 落盘，但进程在 Delete 前消失：key 还在旧 lease 上。
-	st, ok := loadState(g.reg.cfg.StateFile, "626220")
-	if !ok || st.Lease == 0 {
-		t.Fatalf("state %+v ok=%v", st, ok)
+	st, res := loadState(g.reg.cfg.StateFile, "626220")
+	if res != stateOK || st.Lease == 0 {
+		t.Fatalf("state %+v res=%d", st, res)
 	}
 	st.Drained = true
 	st.IP = ""
@@ -568,7 +568,7 @@ func TestAcceptance3_UnannouncedIPChange(t *testing.T) {
 	t.Logf("ip change -> delete %s", elapsed)
 
 	g.ip.set("100.64.0.1")
-	if err := g.reg.Ready(context.Background(), "100.64.0.1"); err != nil {
+	if err := g.reg.Ready(context.Background(), "100.64.0.1", ""); err != nil {
 		t.Fatal(err)
 	}
 	g.waitKey(true, 2*time.Second)
@@ -625,7 +625,7 @@ func TestAcceptance4_ProbeAndNetCheck(t *testing.T) {
 	}
 
 	t2 := time.Now()
-	if err := g.reg.Report(context.Background(), Report{NetOK: false, ResourcesOK: true, EgressIP: "100.64.0.1"}); err != nil {
+	if err := g.reg.Report(context.Background(), Report{NetFault: true, EgressIP: "100.64.0.1"}); err != nil {
 		t.Fatal(err)
 	}
 	waitUntil(t, time.Second, func() bool {
@@ -637,7 +637,7 @@ func TestAcceptance4_ProbeAndNetCheck(t *testing.T) {
 	} else {
 		t.Logf("net_ok=false -> delete %s", d)
 	}
-	if err := g.reg.Report(context.Background(), Report{NetOK: true, ResourcesOK: true, EgressIP: "100.64.0.1"}); err != nil {
+	if err := g.reg.Report(context.Background(), Report{EgressIP: "100.64.0.1"}); err != nil {
 		t.Fatal(err)
 	}
 	waitUntil(t, time.Second, func() bool {
@@ -756,7 +756,7 @@ func TestAcceptance8_NodeConflict(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitUntil(t, 2*time.Second, func() bool { return other.Status().ProbeOK })
-	err = other.Ready(context.Background(), "100.64.0.1")
+	err = other.Ready(context.Background(), "100.64.0.1", "")
 	if !errors.Is(err, ErrNodeConflict) {
 		t.Fatalf("err=%v", err)
 	}
@@ -782,7 +782,7 @@ func TestAcceptance8_NodeConflict(t *testing.T) {
 		})
 		// other 之前冲突过，退避 5s。等退避结束再 Ready。
 		time.Sleep(5 * time.Second)
-		if err := other.Ready(context.Background(), "100.64.0.1"); err != nil {
+		if err := other.Ready(context.Background(), "100.64.0.1", ""); err != nil {
 			t.Fatal(err)
 		}
 		if _, _, val, ok := g.kv(g.reg.key); !ok || val.NodeID != "626220" {
@@ -812,7 +812,7 @@ func TestOwnLeasePutKeepsCreateRevision(t *testing.T) {
 	g.reg.mu.Lock()
 	g.reg.regIP = ""
 	g.reg.mu.Unlock()
-	if err := g.reg.Ready(context.Background(), "100.64.0.1"); err != nil {
+	if err := g.reg.Ready(context.Background(), "100.64.0.1", ""); err != nil {
 		t.Fatal(err)
 	}
 	got, gotCreate, _, ok := g.kv(g.reg.key)
@@ -825,7 +825,7 @@ func TestIgnoreAdminNetCheck(t *testing.T) {
 	g := newRig(t, 1, "626220", func(cfg *Config) { cfg.IgnoreAdminNetCheck = true })
 	g.ready("100.64.0.1")
 	g.waitKey(true, 2*time.Second)
-	if err := g.reg.Report(context.Background(), Report{NetOK: false, ResourcesOK: true, EgressIP: "100.64.0.1"}); err != nil {
+	if err := g.reg.Report(context.Background(), Report{NetFault: true, EgressIP: "100.64.0.1"}); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(300 * time.Millisecond)
@@ -841,7 +841,7 @@ func TestRedialSameEgressNotRegistered(t *testing.T) {
 	if err := g.reg.Drain(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if err := g.reg.Ready(context.Background(), "100.64.0.1"); !errors.Is(err, ErrEgressUnchanged) {
+	if err := g.reg.Ready(context.Background(), "100.64.0.1", ""); !errors.Is(err, ErrEgressUnchanged) {
 		t.Fatalf("err=%v", err)
 	}
 	if _, _, _, ok := g.kv(g.reg.key); ok {
@@ -864,11 +864,11 @@ func TestRedialSameEgressNotRegistered(t *testing.T) {
 	if _, _, _, ok := g.kv(again.key); ok {
 		t.Fatal("restart registered the old egress")
 	}
-	if err := again.Ready(context.Background(), "100.64.0.1"); !errors.Is(err, ErrEgressUnchanged) {
+	if err := again.Ready(context.Background(), "100.64.0.1", ""); !errors.Is(err, ErrEgressUnchanged) {
 		t.Fatalf("after restart err=%v", err)
 	}
 	g.ip.set("100.64.0.2")
-	if err := again.Ready(context.Background(), "100.64.0.2"); err != nil {
+	if err := again.Ready(context.Background(), "100.64.0.2", ""); err != nil {
 		t.Fatal(err)
 	}
 	g.reg = again
@@ -881,7 +881,7 @@ func TestResourceFaultDeregistersThenRestores(t *testing.T) {
 	g := newRig(t, 1, "626220", nil)
 	g.ready("100.64.0.1")
 	lease, _, _ := g.waitKey(true, 2*time.Second)
-	if err := g.reg.Report(context.Background(), Report{NetOK: true, ResourcesOK: false, EgressIP: "100.64.0.1"}); err != nil {
+	if err := g.reg.Report(context.Background(), Report{CPUFault: true, EgressIP: "100.64.0.1"}); err != nil {
 		t.Fatal(err)
 	}
 	waitUntil(t, time.Second, func() bool {
@@ -891,7 +891,7 @@ func TestResourceFaultDeregistersThenRestores(t *testing.T) {
 	if g.reg.Status().ResourcesOK {
 		t.Fatal("resources still ok")
 	}
-	if err := g.reg.Report(context.Background(), Report{NetOK: true, ResourcesOK: true, EgressIP: "100.64.0.1"}); err != nil {
+	if err := g.reg.Report(context.Background(), Report{EgressIP: "100.64.0.1"}); err != nil {
 		t.Fatal(err)
 	}
 	waitUntil(t, time.Second, func() bool {
@@ -907,7 +907,7 @@ func TestResourceFaultIgnoreKeepsKey(t *testing.T) {
 	g := newRig(t, 1, "626220", func(cfg *Config) { cfg.ResourceFaultAction = ResourceFaultIgnore })
 	g.ready("100.64.0.1")
 	g.waitKey(true, 2*time.Second)
-	if err := g.reg.Report(context.Background(), Report{NetOK: true, ResourcesOK: false, EgressIP: "100.64.0.1"}); err != nil {
+	if err := g.reg.Report(context.Background(), Report{CPUFault: true, EgressIP: "100.64.0.1"}); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(300 * time.Millisecond)
@@ -932,6 +932,253 @@ func TestStopRevokesImmediately(t *testing.T) {
 		return !ok
 	})
 	t.Logf("Stop -> delete %s", time.Since(t0))
+}
+
+func TestBlankNodeIDEnvDoesNotReadFile(t *testing.T) {
+	dir := t.TempDir()
+	idFile := filepath.Join(dir, "id")
+	if err := os.WriteFile(idFile, []byte("from-file\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(NodeIDEnv, " \n")
+	cfg := DefaultConfig()
+	cfg.NodeIDFile = idFile
+	cfg.Endpoints = []string{"127.0.0.1:1"}
+	cfg.IntranetAddr = "10.0.8.26:8080"
+	cfg.ProxyPort = 8080
+	cfg.ProbeAddr = "127.0.0.1:8080"
+	cfg.StateFile = filepath.Join(dir, "state.json")
+	cfg.LocalIP = func() string { return "100.64.0.1" }
+	if _, err := New(cfg); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("err=%v", err)
+	}
+	cfg.NodeID = "   "
+	t.Setenv(NodeIDEnv, "626220")
+	if _, err := New(cfg); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("blank config node id err=%v", err)
+	}
+}
+
+func TestZeroReportStaysRegistered(t *testing.T) {
+	g := newRig(t, 1, "626220", nil)
+	g.ready("100.64.0.1")
+	g.waitKey(true, 2*time.Second)
+	if err := g.reg.Report(context.Background(), Report{}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if _, _, _, ok := g.kv(g.reg.key); !ok {
+		t.Fatal("zero Report removed the key")
+	}
+	if !g.reg.Status().NetOK || !g.reg.Status().ResourcesOK {
+		t.Fatalf("status %+v", g.reg.Status())
+	}
+}
+
+func TestDrainBeforeRegisterNeedsPrevEgress(t *testing.T) {
+	g := newRig(t, 1, "626220", nil)
+	if err := g.reg.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.reg.Ready(context.Background(), "100.64.0.1", ""); !errors.Is(err, ErrEgressUnconfirmed) {
+		t.Fatalf("err=%v", err)
+	}
+	if _, _, _, ok := g.kv(g.reg.key); ok {
+		t.Fatal("unconfirmed Ready wrote a key")
+	}
+	if err := g.reg.Ready(context.Background(), "100.64.0.1", "100.64.0.1"); !errors.Is(err, ErrEgressUnchanged) {
+		t.Fatalf("err=%v", err)
+	}
+	if err := g.reg.Ready(context.Background(), "100.64.0.1", "100.64.0.9"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, val, ok := g.kv(g.reg.key); !ok || val.EgressIP != "100.64.0.1" {
+		t.Fatalf("ok=%v val=%+v", ok, val)
+	}
+}
+
+func TestCorruptStateRefusesUntilPrevConfirmed(t *testing.T) {
+	g := newRig(t, 1, "626220", nil)
+	if err := g.reg.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(g.reg.cfg.StateFile, []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	again, err := New(g.reg.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = again.Stop(context.Background()) })
+	if err := again.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, 3*time.Second, func() bool { return again.Status().ProbeOK })
+	if err := again.Ready(context.Background(), "100.64.0.1", ""); !errors.Is(err, ErrEgressUnconfirmed) {
+		t.Fatalf("corrupt state err=%v", err)
+	}
+	if _, _, _, ok := g.kv(again.key); ok {
+		t.Fatal("corrupt state registered without a previous egress")
+	}
+	if err := again.Ready(context.Background(), "100.64.0.1", "100.64.0.1"); !errors.Is(err, ErrEgressUnchanged) {
+		t.Fatalf("same prev err=%v", err)
+	}
+	g.ip.set("100.64.0.2")
+	if err := again.Ready(context.Background(), "100.64.0.2", "100.64.0.1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, val, ok := g.kv(again.key); !ok || val.EgressIP != "100.64.0.2" {
+		t.Fatalf("ok=%v val=%+v", ok, val)
+	}
+}
+
+func TestMissingStateFileLooksLikeFirstBoot(t *testing.T) {
+	g := newRig(t, 1, "626220", nil)
+	if err := g.reg.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(g.reg.cfg.StateFile); err != nil {
+		t.Fatal(err)
+	}
+	again, err := New(g.reg.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = again.Stop(context.Background()) })
+	if err := again.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, 3*time.Second, func() bool { return again.Status().ProbeOK })
+	if err := again.Ready(context.Background(), "100.64.0.1", "100.64.0.1"); !errors.Is(err, ErrEgressUnchanged) {
+		t.Fatalf("caller prev err=%v", err)
+	}
+	if _, _, _, ok := g.kv(again.key); ok {
+		t.Fatal("unchanged caller prev registered")
+	}
+	if err := again.Ready(context.Background(), "100.64.0.1", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, ok := g.kv(again.key); !ok {
+		t.Fatal("first boot with a missing state file did not register")
+	}
+}
+
+func TestClientDeadlineReclaimsOwnLease(t *testing.T) {
+	g := newRig(t, 1, "626220", nil)
+	g.ready("100.64.0.1")
+	lease, create, _ := g.waitKey(true, 2*time.Second)
+	t0 := time.Now()
+	g.reg.mu.Lock()
+	g.reg.loseLeaseLocked(errors.New("client deadline"))
+	g.reg.mu.Unlock()
+	if _, _, _, ok := g.kv(g.reg.key); !ok {
+		t.Fatal("key deleted when the client declared the lease lost")
+	}
+	if err := g.reg.Ready(context.Background(), "100.64.0.1", ""); err != nil {
+		t.Fatal(err)
+	}
+	got, gotCreate, val, ok := g.kv(g.reg.key)
+	if !ok || gotCreate != create || val.InstanceID == "" {
+		t.Fatalf("reclaim ok=%v lease %d->%d create %d->%d val=%+v", ok, lease, got, create, gotCreate, val)
+	}
+	if dels := g.w.since(t0, g.reg.key, "DELETE"); len(dels) != 0 {
+		t.Fatalf("reclaim deleted the key: %+v", dels)
+	}
+}
+
+func TestCloneDoesNotRevokeOriginal(t *testing.T) {
+	g := newRig(t, 1, "626220", func(cfg *Config) { cfg.MachineID = "host-a" })
+	g.ready("100.64.0.1")
+	lease, create, _ := g.waitKey(true, 2*time.Second)
+	raw, err := os.ReadFile(g.reg.cfg.StateFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	alerts := make(chan Alert, 2)
+	cfg := g.reg.cfg
+	cfg.MachineID = "host-b"
+	cfg.StateFile = filepath.Join(t.TempDir(), "clone.json")
+	cfg.OnAlert = func(a Alert) { alerts <- a }
+	if err := os.WriteFile(cfg.StateFile, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	clone, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = clone.Stop(context.Background()) })
+	if err := clone.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(400 * time.Millisecond)
+	got, gotCreate, _, ok := g.kv(g.reg.key)
+	if !ok || got != lease || gotCreate != create {
+		t.Fatalf("clone revoked the original ok=%v lease %d->%d create %d->%d", ok, lease, got, create, gotCreate)
+	}
+	waitUntil(t, 3*time.Second, func() bool { return clone.Status().ProbeOK })
+	if err := clone.Ready(context.Background(), "100.64.0.1", ""); !errors.Is(err, ErrNodeConflict) {
+		t.Fatalf("clone ready err=%v", err)
+	}
+	got, gotCreate, _, ok = g.kv(g.reg.key)
+	if !ok || got != lease || gotCreate != create {
+		t.Fatalf("original changed after clone Ready ok=%v lease %d create %d", ok, got, gotCreate)
+	}
+}
+
+func TestDrainEpochBlocksOtherInstance(t *testing.T) {
+	g := newRig(t, 1, "626220", func(cfg *Config) { cfg.MachineID = "host-a" })
+	g.ready("100.64.0.1")
+	g.waitKey(true, 2*time.Second)
+	if err := g.reg.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	resp, err := g.cli.Get(ctx, EpochKey("626220"))
+	cancel()
+	if err != nil || len(resp.Kvs) != 1 {
+		t.Fatalf("epoch missing err=%v n=%d", err, len(resp.Kvs))
+	}
+	alerts := make(chan Alert, 2)
+	cfg := g.reg.cfg
+	cfg.MachineID = "host-b"
+	cfg.StateFile = filepath.Join(t.TempDir(), "other.json")
+	cfg.OnAlert = func(a Alert) { alerts <- a }
+	other, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = other.Stop(context.Background()) })
+	if err := other.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, 3*time.Second, func() bool { return other.Status().ProbeOK })
+	if err := other.Ready(context.Background(), "100.64.0.1", ""); !errors.Is(err, ErrNodeConflict) {
+		t.Fatalf("takeover during drain err=%v", err)
+	}
+	select {
+	case a := <-alerts:
+		if a.Kind != AlertForeignInstance {
+			t.Fatalf("alert %+v", a)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no foreign-instance alert")
+	}
+	if _, _, _, ok := g.kv(g.reg.key); ok {
+		t.Fatal("other instance registered during drain")
+	}
+	g.ip.set("100.64.0.2")
+	if err := g.reg.Ready(context.Background(), "100.64.0.2", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, val, ok := g.kv(g.reg.key); !ok || val.EgressIP != "100.64.0.2" || val.InstanceID == "" {
+		t.Fatalf("owner return ok=%v val=%+v", ok, val)
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), 2*time.Second)
+	resp, err = g.cli.Get(ctx, EpochKey("626220"))
+	cancel()
+	if err != nil || len(resp.Kvs) != 0 {
+		t.Fatalf("epoch left behind err=%v n=%d", err, len(resp.Kvs))
+	}
 }
 
 func newRigOn(t *testing.T, base *rig, nodeID string) *rig {

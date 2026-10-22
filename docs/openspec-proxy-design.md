@@ -4,9 +4,9 @@
 - **日期**：2026-10-22
 - **状态**：Draft / 可进入 PoC
 - **目标**：参考商业隧道代理 Pro 模式，设计“一级代理 + 二级代理”多级转发系统，支持通过 `username` 指定二级节点、TLS 指纹透传、应用层与 eBPF 监控、etcd 自动服务发现。
-- **v0.4 变更**：落地 L2 向 etcd 的注册（issue #5），并吸收 v0.3.1 的文档勘误，不另立版本号。节点是虚拟机，admin 是 Go，进程内调用 `registrar`；`nodeId` 来自环境变量 `RELAY_NODE_ID`。key 为 `/relay/l2/{nodeId}`，`value.addr` 是内网地址。每台虚拟机一个 lease（TTL 10s，每 3s 续租）。一次拨号加出口校验约 5s、失败率低于 1%；计划内重拨后出口 IP 必须变化，否则不注册。巡检每 1 分钟，外网或 CPU/内存异常都 Delete key。同一宿主机异常时一批 key 一起过期。详见 §8。勘误落在 v0.2.1 的变更说明，以及 §4.1、§4.2、§7.3、§10、§12、附录 A.5。
+- **v0.4 变更**：落地 L2 向 etcd 的注册（issue #5），并吸收 v0.3.1 的文档勘误，不另立版本号。节点是虚拟机，admin 是 Go，进程内调用 `registrar`；`nodeId` 来自环境变量 `RELAY_NODE_ID`。key 为 `/relay/l2/{nodeId}`，`value.addr` 是内网地址。每台虚拟机一个 lease（TTL 10s，每 3s 续租）。一次拨号加出口校验约 5s、失败率低于 1%；计划内重拨后出口 IP 必须变化，否则不注册。巡检每 1 分钟，外网或 CPU/内存异常都 Delete key。同一宿主机异常时一批 key 一起过期。详见 §8。勘误（原 v0.3.1）：§10 示例对空口令显式回 `407`；§10 与 §12 写明整条隧道空闲兜底（默认 5 分钟）会关掉长时间静默的 WebSocket、长轮询等长连接，应用需自带心跳，TCP keepalive 不算数据；§4.2 TunnelForwarder 补上 L2 `407` 透传和两级空闲计时；附录 A.5 写明缺端口回 `400`；§4.1 架构图删去 L2 到 Prometheus 的指标连线，gost 自带指标不在 M1；§7.3 注明等待 L2 应答时客户端先断开也计入 `l2_response`。v0.2.1 变更说明补全了当时引入的 400/407 规则。
 - **v0.3 变更**：M1 PoC 的可观测改为 L1 应用层 Prometheus 指标。L1 用 `prometheus/client_golang` 暴露 `proxy_conn_active`、`proxy_connect_latency_ms`、`proxy_upstream_fail_total`，以及本地拒绝计数 `proxy_client_reject_total`。eBPF 只采集内核指标，移到 M2。两类来源和告警在 §7 分开。与 v0.2.1 的半关闭和 10s 应答等待合在同一份数据面上打点。`node_id` 失败关闭：只有 `Resolve` 返回 `ErrNoHealthyAddr` 时保留原来的 ID，其余解析错误记 `unknown`。
-- **v0.2.1 变更**：修正 §10 的隧道拆除和 L2 应答等待。某一方向 `io.Copy` 返回错误（对端 RST 或写失败）时立刻完全关闭两端。干净 EOF 只 `CloseWrite`。反方向是空闲读超时而不是一次性截止：默认 30s（`halfCloseIdleTimeout`，可改），每次成功读到字节都重新计时，客户端先 FIN 和上游先 FIN 用同一套。整条隧道另有空闲兜底，默认 5 分钟（`tunnelIdleTimeout`，可改），任一方向有数据就重新计时；gost 的 `idleTimeout` 默认是 0，不靠它收尸。等待 L2 `200` 的默认上限是 10s，因为 gost 先拨通源站再应答。可观测性改版另记为 v0.3，本版不改 §7。L1 在本地校验共享口令（SHA-256 后常量时间比较），为空或不匹配直接回 407、不拨 L2；目标缺端口或用户名切不出 node_id 回 400，node_id 取最后一个 @ 之后；L2 返回的 407 连同 Proxy-Authenticate 交给客户端，其余失败仍为 502（§5.1、§5.2）。
+- **v0.2.1 变更**：修正 §10 的隧道拆除和 L2 应答等待。某一方向 `io.Copy` 返回错误（对端 RST 或写失败）时立刻完全关闭两端。干净 EOF 只 `CloseWrite`。反方向是空闲读超时而不是一次性截止：默认 30s（`halfCloseIdleTimeout`，可改），每次成功读到字节都重新计时，客户端先 FIN 和上游先 FIN 用同一套。整条隧道另有空闲兜底，默认 5 分钟（`tunnelIdleTimeout`，可改），任一方向有数据就重新计时；gost 的 `idleTimeout` 默认是 0，不靠它收尸。等待 L2 `200` 的默认上限是 10s，因为 gost 先拨通源站再应答。可观测性改版另记为 v0.3，本版不改 §7。L1 在本地校验共享口令（SHA-256 后常量时间比较），为空或不匹配直接回 `407`、不拨 L2；目标缺端口或用户名切不出 `node_id` 回 `400`，`node_id` 取最后一个 @ 之后；L2 返回的 `407` 连同 `Proxy-Authenticate` 交给客户端，其余失败仍为 `502`（§5.1、§5.2）。
 - **v0.2 变更**：补上 v0.1 的链路缺口。L1 用第二次 HTTP `CONNECT` 把目标 `host:port` 交给 L2；L2 定为 gost v3 的 HTTP 正向代理，不再使用 HAProxy / Envoy 的纯 TCP 模式。对比与理由见附录 A。
 - **已确认**：v1 的 L2 就是 gost v3，3proxy 与锁死配置的 Envoy 只作为同接口替换项。出口拒绝范围只有环回和链路本地，不含 RFC1918。L1→L2 使用客户端登录 L1 的那一份共享口令，不轮换。
 
@@ -151,7 +151,7 @@ flowchart LR
 - **AuthParser**：解析客户端 `Proxy-Authorization`，用全系统共享口令完成认证，并保留用户名与密码供转发。
 - **RouteResolver**：解析 `username` 中 node_id 并在本地路由表匹配。
 - **EtcdWatcher**：Watch `/relay/l2/`，维护 `node_id -> addr`。`addr` 是 value 里的内网 `host:port`。key 存在即可路由，不读状态字段。见 §8.2。
-- **TunnelForwarder**：向选定 L2 写 `CONNECT host:port`，`Proxy-Authorization` 使用客户端刚刚提交的同一组用户名和密码。确认 `200` 后与客户端双向原样转发。不在这条路径上 `tls.Dial`。L2 返回 407 时连同 `Proxy-Authenticate` 交给客户端。隧道阶段有半关闭空闲超时和整条隧道的空闲兜底，见 §10。
+- **TunnelForwarder**：向选定 L2 写 `CONNECT host:port`，`Proxy-Authorization` 使用客户端刚刚提交的同一组用户名和密码。确认 `200` 后与客户端双向原样转发。不在这条路径上 `tls.Dial`。L2 返回 `407` 时连同 `Proxy-Authenticate` 交给客户端。隧道阶段有半关闭空闲超时和整条隧道的空闲兜底，见 §10。
 - **Metrics/Trace**：M1 在 L1 进程内暴露应用层 Prometheus 指标。M2 的 eBPF 内核指标另行采集，不在转发路径上计算。见 §7。
 
 ---
@@ -415,7 +415,7 @@ M2 在一级与二级节点部署 eBPF Agent（如 Cilium，或自研 exporter�
 
 应用层（M1，只用 §7.1 的三项）：
 
-- 5 分钟上游失败率 > 2%。分子是 `sum(increase(proxy_upstream_fail_total[5m]))`，包含 `l2_write`、`l2_deadline` 和 `l2_auth`。分母是该分子加上 `sum(increase(proxy_connect_latency_ms_count[5m]))`。`_count` 只包含 L2 已返回 `200` 的尝试，所以和失败计数相加就是全部已结束的上游尝试。`proxy_client_reject_total` 不进入这个比率。等待 L2 状态行时客户端先断开也记作 `l2_response`，虽然不是上游故障，却会进入分子；比率升高时，先单独看 `reason="l2_response"` 的速率。
+- 5 分钟上游失败率 > 2%。分子是 `sum(increase(proxy_upstream_fail_total[5m]))`，包含 `l2_write`、`l2_deadline` 和 `l2_auth`。分母是该分子加上 `sum(increase(proxy_connect_latency_ms_count[5m]))`。`_count` 只包含 L2 已返回 `200` 的尝试，所以和失败计数相加就是全部已结束的上游尝试。`proxy_client_reject_total` 不进入这个比率。等待 L2 状态行时客户端先断开也记作 `l2_response`（§7.1），虽然不是上游故障，却会进入分子；比率升高时，先单独看 `reason="l2_response"` 的速率。
 - 成功建连的 P95 > 200ms：`histogram_quantile(0.95, sum by (le) (rate(proxy_connect_latency_ms_bucket[5m])))`。直方图里只有 L2 返回 `200` 的样本。按节点告警时改为 `sum by (le, node_id)`。
 
 内核（M2，eBPF）：
@@ -450,6 +450,7 @@ Value：
   "proxy_port": 8080,
   "control_port": 17001,
   "node_id": "626220",
+  "instance_id": "9f1c0e2a4b6d8f01a3c5e7b9d1f30426",
   "az": "az01",
   "weight": 100,
   "capability": "http-connect",
@@ -460,21 +461,25 @@ Value：
 
 `addr` 是 L1 拨的内网地址，重拨前后不变。`egress_ip` 只作信息。`weight` 会写进 value；v1 每个 nodeId 只有一个 key，L1 按 node_id 精确选路，不看 weight，所以资源异常不靠把 weight 写小来躲流量。
 
-写入用事务：key 不存在、lease 属于本进程、lease 是本机状态文件里的上一任，或该 lease 已经失效，才允许 Put / Delete。否则视为 nodeId 冲突，不覆盖，并调用 `OnAlert`（`kind = node_id_conflict`）。
+写入用事务：key 不存在、lease 属于本进程、lease 是本机状态文件里的上一任且 value 的 `instance_id` 也是本实例，或该 lease 已经失效，才允许 Put / Delete。否则视为 nodeId 冲突，不覆盖，并调用 `OnAlert`。活着的别人的 lease 用 `kind = node_id_conflict`。`instance_id` 对不上时用 `kind = foreign_instance`，并且不 Revoke 那条 lease。
 
-状态文件（例如 `/var/lib/relay-registrar/{nodeId}.json`）记录 lease、`drained`、当前出口，以及计划内重拨前的出口（`prev_egress`）。`Drain` 先把 `drained` 和“必须换出口”落盘，再删 key。拨号过程中崩溃重启，在校验通过前不会 Put；重启后如果外部出口仍是重拨前那个，同样拒绝注册。上次在线且本机 ppp 地址未变时，新进程 Grant 新 lease，用事务盖住原 key，再撤销旧 lease，Watch 不会看到 DELETE。这是进程重启，不是重拨，不要求出口变化。
+`instance_id` 是第一次启动时生成的随机数，和当时的 `/etc/machine-id` 一起写进状态文件，也写进 value。状态文件被拷到另一台机器（`machine-id` 不同）时，新进程不认里面的 lease，也不会把原机的 key 撤掉。两边的 `/etc/machine-id` 如果也被一起拷走，registrar 无法分辨，这是残留风险：克隆虚拟机时要重新生成 machine-id，不要把状态文件当成镜像的一部分。
+
+状态文件（例如 `/var/lib/relay-registrar/{nodeId}.json`）记录 instance、lease、`drained`、当前出口，以及计划内重拨前的出口（`prev_egress`）。`Drain` 先把 `drained` 和“必须换出口”落盘，再删 key，并在 `/relay/l2-epoch/{nodeId}` 留下本实例的标记（挂在同一条 lease 上，不在 `/relay/l2/` 前缀下，L1 的 Watch 看不到）。另一个实例在这期间来创建同一个 key，会告警并拒绝。标记随 lease 消失；标记没写上、或写它的进程已经退出且 lease 到期之后，空 key 可以被别的实例创建，这时没有上一任实例可以告警。这是残留风险。
+
+上次在线且本机 ppp 地址未变、状态文件也属于本机时，新进程 Grant 新 lease，用事务盖住原 key，再撤销旧 lease，Watch 不会看到 DELETE。这是进程重启，不是重拨，不要求出口变化。客户端如果误以为自己的 lease 已经丢失（例如切主后本地截止时间到了，服务端租约其实还在），旧 lease 会留在本实例的上一任列表里，重新 Put 时认领，而不是报成和自己冲突。
 
 ### 8.2 生命周期
 
 | 调用 | 行为 |
 | --- | --- |
 | `Start` | 连接配置里的全部成员并 Grant。之后每 3s 续租、每 1s 探测 gost、每 500ms 检查 ppp 地址。探测未通过不 Put |
-| `Drain` | 同步 Delete 本 key。单次超时 700ms，最多重试 6s，etcd 确认后才返回。lease 继续续租。记下重拨前的出口，之后的 `Ready` 必须带来一个不同的出口 |
-| `Ready(egressIP)` | 本机 ppp 地址必须等于 `egressIP`，且 gost 探测已通过，才用当前 lease Put。计划内重拨后，外部看到的出口若与重拨前相同，返回错误，保持未注册 |
-| `Report` | 每分钟一次。`NetOK` 表示访问外部是否正常，`ResourcesOK` 表示 CPU 和内存是否正常。任一失败则 Delete，恢复后 Put。`drained` 期间忽略。上报正文不写 etcd |
+| `Drain` | 同步 Delete 本 key。单次超时 700ms，最多重试 6s，etcd 确认后才返回。lease 继续续租。记下重拨前的出口。还没注册过就 `Drain` 时没有出口可记，之后的 `Ready` 必须由调用方传入一个不同的 `prevEgress` |
+| `Ready(egressIP, prevEgress)` | 本机 ppp 地址必须等于 `egressIP`，且 gost 探测已通过，才 Put。重拨中：状态文件里的上一任出口和调用方传入的 `prevEgress` 都用来比对，相同则 `ErrEgressUnchanged`。状态文件损坏或 `node_id` 对不上时，不传 `prevEgress` 得到 `ErrEgressUnconfirmed`，不注册。状态文件整个缺失和第一次启动无法区分：不传 `prevEgress` 会注册；调用方如果还知道旧出口，必须传进来，传了相同的值就会拒绝 |
+| `Report` | 每分钟一次。零值表示健康。`NetFault` 表示访问外部失败，`CPUFault` / `MemFault` 表示 CPU 或内存异常。任一故障则 Delete，恢复后（再传零值或没有故障位）Put。`drained` 期间忽略。上报正文不写 etcd |
 | `Stop` | `Revoke` lease。进程被杀或宿主机异常时没有这一步，key 等 TTL |
 
-后台探测向本机 gost 发带口令的 `CONNECT 127.0.0.1:1`，期望 `403`（撞上附录 A.5 的出口拒绝）。连续 3 次失败就 Delete，连续 2 次成功再 Put，单次超时 800ms。ppp 守卫发现已注册出口和本机地址不一致，或链路断开（`LocalIP` 返回空），立刻 Delete 并进入 `drained`，直到下一次 `Ready`。这条路径不是计划内重拨，不额外要求出口必须变化。
+后台探测向本机 gost 发带口令的 `CONNECT 127.0.0.1:1`，期望 `403`。这和 gost v3 的 HTTP 行为一致：认证通过之后，bypass 命中的 `CONNECT` 回 `403`，不是 `407`（go-gost 的 `TestHTTPConnect/bypass-403`）。连续 3 次失败就 Delete，连续 2 次成功再 Put，单次超时 800ms。ppp 守卫发现已注册出口和本机地址不一致，或链路断开（`LocalIP` 返回空），立刻 Delete 并进入 `drained`，直到下一次 `Ready`。这条路径不是计划内重拨，不额外要求出口必须变化。
 
 一次拨号加一次出口校验合计约 5s（规划上按 4s 拨号、1s 校验，失败率低于 1%）。这段时间里 lease 继续每 3s 续租，所以 TTL 仍是 10s，`Drain` 的 6s 预算也不用拉长：`Drain` 在挂断之前就返回。registrar 不替 admin 睡眠，这两个时长只放在 `AssumedDial` 和 `AssumedEgressCheck` 里。
 
@@ -484,7 +489,7 @@ Value：
 
 - 启动时按前缀 `/relay/l2/` 全量拉取，之后 Watch 同一前缀。断线后从最后看到的 revision 续上。
 - key 存在即可路由，拨 `value.addr`。不要拨 `egress_ip`。
-- 拨号超时取 1–2s。进程消失后 key 还会留到 TTL：本仓库内嵌 etcd 上，约 10.3s 后 key 消失；消失 3s 后再切主，约 14.5s（验收上限 16s，etcd 会在选主时把 lease 续满）。超时太长会把这段空窗坐满。§10 示例里的 `dialUpstream` 仍是 3s，那是数据面草图；接上 EtcdWatcher 时用 1–2s。
+- 拨号超时默认跟 §10 的 `dialUpstream` 一样，是 3s。§7.1 直方图里 `3000` 这个桶按的就是这 3s。进程消失后 key 还会留到 TTL：本仓库内嵌 etcd 上，约 10.3s 后 key 消失；消失 3s 后再切主，约 14.5s（验收上限 16s，etcd 会在选主时把 lease 续满）。如果部署要把拨号超时收到 1–2s，少坐这段空窗，要同时改 §7.1 里对齐 3s 的桶，不能只改拨号。
 - 节点都是虚拟机。计划外掉线只在宿主机异常时发生，而且很少。同一宿主机上的一批节点会同时停止续租，key 在同一个 TTL 窗口里成批 DELETE。L1 的 Watch 和路由更新要扛住这一批事件：不能因为事件数量把发现循环卡住，也不能把同批里尚未过期的其他节点误删。
 - 路由就是精确的 `node_id`。没有健康地址则快速失败。v1 不做多实例权重选择。
 
@@ -494,11 +499,11 @@ Value：
 
 | 事项 | 决定 | 哪里改 |
 | --- | --- | --- |
-| 一次拨号加一次出口校验 | 合计约 5s，失败率低于 1%。规划上按拨号 4s、校验 1s。计划内重拨后外部出口必须变化，否则不注册 | `AssumedDial`、`AssumedEgressCheck`、`AssumedRedialFailureRate`。比较出口的逻辑不能关掉 |
-| 巡检 | 每 1 分钟。检查访问外部是否正常，以及 CPU、内存是否正常。默认两类失败都摘掉 key，恢复后再写回 | `InspectionInterval`。外网巡检不可靠时设 `IgnoreAdminNetCheck`。资源异常不想摘除时把 `ResourceFaultAction` 设为 `ignore`。探测间隔、失败/恢复阈值、地址守卫间隔另有字段 |
+| 一次拨号加一次出口校验 | 合计约 5s，失败率低于 1%。规划上按拨号 4s、校验 1s。计划内重拨后外部出口必须变化，否则不注册。状态文件缺失时，只有调用方传入的 `prevEgress` 能挡住旧出口 | `AssumedDial`、`AssumedEgressCheck`、`AssumedRedialFailureRate`。`Ready` 的第二个参数 |
+| 巡检 | 每 1 分钟。检查访问外部是否正常，以及 CPU、内存是否正常。默认两类失败都摘掉 key，恢复后再写回。`Report` 的零值是健康 | `InspectionInterval`。故障用 `NetFault`、`CPUFault`、`MemFault`。外网巡检不可靠时设 `IgnoreAdminNetCheck`。资源异常不想摘除时把 `ResourceFaultAction` 设为 `ignore` |
 | 定期上报发往哪里 | 不外发，上报正文不写 etcd。L1 只读注册 value | `OnReport` 交给 admin 原有上报通道 |
 | 计划外掉线 | 节点是虚拟机，只有宿主机异常时才发生，而且很少。同一宿主机上的一批节点会一起过期。不因此改 TTL | `TTL` 10s，`RenewInterval` 3s。L1 要承受批量 DELETE，见 §8.3 |
-| nodeId | 环境变量 `RELAY_NODE_ID`，运维保证唯一。事务冲突检测保留作兜底 | `NodeID` 可直接传入；为空时读该环境变量，再不行才读 `NodeIDFile`。告警走 `OnAlert` |
+| nodeId | 环境变量 `RELAY_NODE_ID`，运维保证唯一。变量存在但只有空白是配置错误，不会改去读文件。事务冲突检测保留作兜底 | `NodeID` 可直接传入；为空且环境变量未设置时才读 `NodeIDFile`。告警走 `OnAlert` |
 | admin 语言 | Go。主路径是进程内调用 `registrar`。`cmd/registrard` 只是备选 | 无单独开关 |
 
 ### 8.5 本仓库里怎么验证
@@ -535,7 +540,7 @@ Value：
 
 ## 10. Go 使用示例（一级代理核心逻辑）
 
-下面是 L1 处理 CONNECT 的数据面，共享口令校验就在这个函数里完成。口令先做 SHA-256，再用 `subtle.ConstantTimeCompare` 与全系统共享口令比较；为空或不匹配时直接回 `407`，不拨 L2。用户名以最后一个 `@` 切分，`node_id` 是它后面的那一段，因此用户名本身可以含 `@`。目标不是 `host:port`，或切不出 `node_id`，回 `400`。通过后再向 L2 发第二次 `CONNECT`，`Proxy-Authorization` 使用客户端提交的同一组用户名和密码。读取 L2 应答的默认上限是 10 秒（`l2ResponseTimeout`，部署时可改）。gost 要先拨通源站才回 `200`，2 秒会把 2.5 秒才拨通的源站误判成 `502`。读完无论成败都清掉这个截止时间，隧道阶段不再受它限制。客户端若在等待期间先断开，L1 关掉这条上游连接，读立刻返回，不必坐满 10 秒。L2 返回 `407` 时，连同 `Proxy-Authenticate` 交给客户端；解析节点、拨号、向 L2 写出 `CONNECT`、设置或清除读截止时间、读应答失败，以及除 `200`/`407` 以外的状态，先写 `502` 再返回错误（见 §5.1）。确认 `200` 后才应答客户端。之后两个方向各自拷贝：`io.Copy` 返回非 nil 错误时立刻完全关闭两端，另一方向不会继续堵着；干净 EOF 只对对端 `CloseWrite`。反方向接着用空闲读超时（`halfCloseIdleTimeout`，默认 30s，可改）：每次成功读到字节都把截止时间重新拨到「现在 + 30s」，不是从 `CloseWrite` 那一刻起只拨一次。间隔只要短于这个值，响应可以很慢，也可以一直分片；连续这段时间没有字节才放弃。客户端先 FIN 和上游先 FIN 走同一套。整条隧道另有兜底（`tunnelIdleTimeout`，默认 5 分钟，可改）：任一方向读到字节都重新计时，两边都安静这么久才关闭。gost 的 `idleTimeout` 默认是 0，这条兜底不能省。两个方向连续 5 分钟都没有字节的连接会被关掉，例如长时间静默的 WebSocket，或挂起超过 5 分钟才返回的长轮询；这类应用要自己发心跳，间隔短于 tunnelIdleTimeout，TCP keepalive 不带载荷，不会重置这个计时。两个方向都结束后再由 defer 完全关闭。出口网段拒绝在 L2 解析之后做，不在本函数里。示例不包含 etcd。打点使用 §7.1 导出的函数，按包名 `l1metrics` 调用：本地 `400` / `407` 走 `RejectClient`；对客户端的 `502`，以及原样交还的 L2 `407`，走 `Fail502`；L2 返回 `200` 后先 `ObserveConnect`，向客户端写出 `200` 成功后再 `EnterTunnel`。`upstreamConn.Write` 失败和 `SetReadDeadline` 失败都回 `502`，`reason` 分别是 `l2_write`、`l2_deadline`。涉及 `bufio`、`crypto/sha256`、`crypto/subtle`、`encoding/base64`、`errors`、`fmt`、`io`、`net`、`net/http`、`strconv`、`strings`、`sync`、`sync/atomic`、`time`。
+下面是 L1 处理 CONNECT 的数据面，共享口令校验就在这个函数里完成。口令先做 SHA-256，再用 `subtle.ConstantTimeCompare` 与全系统共享口令比较；为空或不匹配时直接回 `407`，不拨 L2。用户名以最后一个 `@` 切分，`node_id` 是它后面的那一段，因此用户名本身可以含 `@`。目标不是 `host:port`，或切不出 `node_id`，回 `400`。通过后再向 L2 发第二次 `CONNECT`，`Proxy-Authorization` 使用客户端提交的同一组用户名和密码。读取 L2 应答的默认上限是 10 秒（`l2ResponseTimeout`，部署时可改）。gost 要先拨通源站才回 `200`，2 秒会把 2.5 秒才拨通的源站误判成 `502`。读完无论成败都清掉这个截止时间，隧道阶段不再受它限制。客户端若在等待期间先断开，L1 关掉这条上游连接，读立刻返回，不必坐满 10 秒。L2 返回 `407` 时，连同 `Proxy-Authenticate` 交给客户端；解析节点、拨号、向 L2 写出 `CONNECT`、设置或清除读截止时间、读应答失败，以及除 `200`/`407` 以外的状态，先写 `502` 再返回错误（见 §5.1）。确认 `200` 后才应答客户端。之后两个方向各自拷贝：`io.Copy` 返回非 nil 错误时立刻完全关闭两端，另一方向不会继续堵着；干净 EOF 只对对端 `CloseWrite`。反方向接着用空闲读超时（`halfCloseIdleTimeout`，默认 30s，可改）：每次成功读到字节都把截止时间重新拨到「现在 + 30s」，不是从 `CloseWrite` 那一刻起只拨一次。间隔只要短于这个值，响应可以很慢，也可以一直分片；连续这段时间没有字节才放弃。客户端先 FIN 和上游先 FIN 走同一套。整条隧道另有兜底（`tunnelIdleTimeout`，默认 5 分钟，可改）：任一方向读到字节都重新计时，两边都安静这么久才关闭。gost 的 `idleTimeout` 默认是 0，这条兜底不能省。两个方向连续 5 分钟都没有字节的连接会被关掉，例如长时间静默的 WebSocket，或挂起超过 5 分钟才返回的长轮询；这类应用要自己发心跳（WebSocket ping/pong 或应用层 keepalive），间隔短于 `tunnelIdleTimeout`，TCP keepalive 不带载荷，不会重置这个计时。两个方向都结束后再由 defer 完全关闭。出口网段拒绝在 L2 解析之后做，不在本函数里。示例不包含 etcd。打点使用 §7.1 导出的函数，按包名 `l1metrics` 调用：本地 `400` / `407` 走 `RejectClient`；对客户端的 `502`，以及原样交还的 L2 `407`，走 `Fail502`；L2 返回 `200` 后先 `ObserveConnect`，向客户端写出 `200` 成功后再 `EnterTunnel`。`upstreamConn.Write` 失败和 `SetReadDeadline` 失败都回 `502`，`reason` 分别是 `l2_write`、`l2_deadline`。涉及 `bufio`、`crypto/sha256`、`crypto/subtle`、`encoding/base64`、`errors`、`fmt`、`io`、`net`、`net/http`、`strconv`、`strings`、`sync`、`sync/atomic`、`time`。
 
 ```go
 // ErrUnknownNode 表示本地路由表从未收录该 node_id。
@@ -918,7 +923,7 @@ func readConnectStatus(r *bufio.Reader) (int, string, error) {
 5. **风险：共享口令从任一 L2 泄露后，可以用来登录 L1 和全部 L2**
    - 已接受：v1 就用这一份口令，不轮换，也不另设跳级口令。更换口令会同时更换客户端、L1 和全部 L2。
 6. **风险：长时间静默的长连接会被 L1 的隧道空闲兜底关闭**
-   - 对策：`tunnelIdleTimeout` 默认 5 分钟，可按部署调大；接入方对 WebSocket、长轮询等长连接做应用层心跳；TCP keepalive 不能代替。
+   - 对策：`tunnelIdleTimeout` 默认 5 分钟，可按部署调大。接入方对 WebSocket、长轮询等长连接做应用层心跳，间隔短于该值；TCP keepalive 不算数据，不能代替。见 §10。
 
 ---
 
@@ -1039,7 +1044,7 @@ Envoy DFP（替换项）必须同时满足：
 - 判断发生在 L2 解析之后、TCP 拨号之前，对象是即将连接的 IP。IPv4-mapped IPv6（`::ffff:a.b.c.d`）先还原成 IPv4 再比。
 - gost 服务级 `bypass` 黑名单能拒绝请求行里直接写出的这些 IP。它的 CIDR 规则不解析域名：`example.com` 解析到 `169.254.169.254` 时不会命中。v1 还要在解析结果上做同一次判断（例如 `gost-geo-plugin` 黑名单，或 L2 侧等价检查）。只贴上面的 `bypass` 名单不够。
 
-客户端 `CONNECT` 缺少端口时直接拒绝（回 400，见 §5.1），L1 不替它补端口。
+客户端 `CONNECT` 缺少端口时直接拒绝（回 `400`，见 §5.1），L1 不替它补端口。
 
 ### A.6 什么时候换掉 gost
 

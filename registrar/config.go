@@ -1,6 +1,8 @@
 package registrar
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -69,6 +71,9 @@ const (
 // AlertNodeConflict 表示另一个还活着的 lease 占着同一个 nodeId，本进程拒绝覆盖。
 const AlertNodeConflict = "node_id_conflict"
 
+// AlertForeignInstance 表示 key 或重拨标记属于另一个实例（克隆或另一台同 nodeId 的虚拟机）。
+const AlertForeignInstance = "foreign_instance"
+
 // Alert 是给 admin 打日志或接告警用的。OnAlert 在独立 goroutine 里调用。
 type Alert struct {
 	Kind       string
@@ -78,21 +83,23 @@ type Alert struct {
 	Message    string
 }
 
-// Report 是 admin 每分钟巡检的结论。
-// NetOK 表示节点访问外部是否正常，ResourcesOK 表示 CPU 和内存是否正常。
+// Report 是 admin 每分钟巡检的结论。零值表示健康：没有故障标志就不会摘 key。
+// 不要用“正常=true”的布尔，否则只填了外网、忘了资源字段时会被当成资源故障。
 type Report struct {
-	NetOK       bool
-	ResourcesOK bool
-	EgressIP    string
+	NetFault bool
+	CPUFault bool
+	MemFault bool
+	EgressIP string
 }
 
 // ReportEvent 是一次 Report 的本地通知。默认不写 etcd，也不外发。
 type ReportEvent struct {
-	NetOK       bool
-	ResourcesOK bool
-	EgressIP    string
-	Drained     bool
-	At          time.Time
+	NetFault bool
+	CPUFault bool
+	MemFault bool
+	EgressIP string
+	Drained  bool
+	At       time.Time
 }
 
 // Logger 接收状态机事件。args 是成对的键和值。nil 表示不打日志。
@@ -174,8 +181,10 @@ type Config struct {
 	DialKeepAliveTime    time.Duration
 	DialKeepAliveTimeout time.Duration
 
-	// StateFile 保存 lease、drained 和已注册的出口 IP，重拨中崩溃靠它避免提前注册。
+	// StateFile 保存 lease、实例身份、drained 和已注册的出口 IP。
 	StateFile string
+	// MachineID 覆盖 /etc/machine-id。生产留空。克隆检测靠它和状态文件里记下的值是否相同。
+	MachineID string
 
 	// IgnoreAdminNetCheck 为 true 时，Report 的 NetOK 不摘除也不恢复。默认 false：信任 admin 的外网巡检。
 	IgnoreAdminNetCheck bool
@@ -360,11 +369,18 @@ func validate(c *Config) error {
 }
 
 func loadNodeID(c *Config) error {
-	if strings.TrimSpace(c.NodeID) != "" {
+	if c.NodeID != "" {
 		c.NodeID = strings.TrimSpace(c.NodeID)
+		if c.NodeID == "" {
+			return fmt.Errorf("%w: node id is blank", ErrInvalidConfig)
+		}
 		return nil
 	}
-	if v := strings.TrimSpace(os.Getenv(NodeIDEnv)); v != "" {
+	if raw, ok := os.LookupEnv(NodeIDEnv); ok {
+		v := strings.TrimSpace(raw)
+		if v == "" {
+			return fmt.Errorf("%w: %s is set but blank", ErrInvalidConfig, NodeIDEnv)
+		}
 		c.NodeID = v
 		return nil
 	}
@@ -377,4 +393,23 @@ func loadNodeID(c *Config) error {
 	}
 	c.NodeID = strings.TrimSpace(string(b))
 	return nil
+}
+
+func (c Config) currentMachineID() string {
+	if strings.TrimSpace(c.MachineID) != "" {
+		return strings.TrimSpace(c.MachineID)
+	}
+	b, err := os.ReadFile("/etc/machine-id")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+func newInstanceID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return hex.EncodeToString([]byte(time.Now().UTC().Format(time.RFC3339Nano)))
+	}
+	return hex.EncodeToString(b[:])
 }

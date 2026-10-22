@@ -141,13 +141,14 @@ func main() {
 			return
 		}
 		var body struct {
-			EgressIP string `json:"egress_ip"`
+			EgressIP   string `json:"egress_ip"`
+			PrevEgress string `json:"prev_egress"`
 		}
 		if err := json.NewDecoder(rq.Body).Decode(&body); err != nil || body.EgressIP == "" {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "err": "egress_ip required"})
 			return
 		}
-		writeResult(w, reg.Ready(context.Background(), body.EgressIP))
+		writeResult(w, reg.Ready(context.Background(), body.EgressIP, body.PrevEgress))
 	})
 	mux.HandleFunc("/v1/report", func(w http.ResponseWriter, rq *http.Request) {
 		if rq.Method != http.MethodPost {
@@ -155,15 +156,18 @@ func main() {
 			return
 		}
 		var body struct {
-			EgressIP    string `json:"egress_ip"`
-			NetOK       *bool  `json:"net_ok"`
-			ResourcesOK *bool  `json:"resources_ok"`
+			EgressIP string `json:"egress_ip"`
+			NetFault bool   `json:"net_fault"`
+			CPUFault bool   `json:"cpu_fault"`
+			MemFault bool   `json:"mem_fault"`
 		}
-		if err := json.NewDecoder(rq.Body).Decode(&body); err != nil || body.NetOK == nil || body.ResourcesOK == nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "err": "net_ok and resources_ok required"})
+		if err := json.NewDecoder(rq.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "err": "bad json"})
 			return
 		}
-		err := reg.Report(context.Background(), registrar.Report{NetOK: *body.NetOK, ResourcesOK: *body.ResourcesOK, EgressIP: body.EgressIP})
+		err := reg.Report(context.Background(), registrar.Report{
+			NetFault: body.NetFault, CPUFault: body.CPUFault, MemFault: body.MemFault, EgressIP: body.EgressIP,
+		})
 		if err != nil {
 			writeResult(w, err)
 			return
@@ -196,7 +200,7 @@ func writeResult(w http.ResponseWriter, err error) {
 	switch {
 	case err == nil:
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
-	case errors.Is(err, registrar.ErrEgressMismatch), errors.Is(err, registrar.ErrEgressUnchanged), errors.Is(err, registrar.ErrNodeConflict):
+	case errors.Is(err, registrar.ErrEgressMismatch), errors.Is(err, registrar.ErrEgressUnchanged), errors.Is(err, registrar.ErrEgressUnconfirmed), errors.Is(err, registrar.ErrNodeConflict):
 		writeJSON(w, http.StatusConflict, map[string]any{"ok": false, "err": err.Error()})
 	case errors.Is(err, registrar.ErrNotRegistered), errors.Is(err, registrar.ErrDrainTimeout):
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "err": err.Error()})

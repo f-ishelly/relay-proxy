@@ -6,9 +6,18 @@ import (
 	"path/filepath"
 )
 
+const (
+	stateMissing = iota
+	stateOK
+	stateUntrusted
+)
+
 // diskState 落在 StateFile。drained 必须在 Delete 之前写下去，崩溃后才不会把旧出口又注册上。
+// instance_id 和 machine_id 用来识别状态文件是不是从别的虚拟机拷过来的。
 type diskState struct {
 	NodeID          string  `json:"node_id"`
+	InstanceID      string  `json:"instance_id,omitempty"`
+	MachineID       string  `json:"machine_id,omitempty"`
 	Lease           int64   `json:"lease"`
 	PrevLeases      []int64 `json:"prev_leases,omitempty"`
 	Drained         bool    `json:"drained"`
@@ -30,6 +39,8 @@ func (r *Registrar) saveLocked() {
 	}
 	st := diskState{
 		NodeID:          r.cfg.NodeID,
+		InstanceID:      r.instanceID,
+		MachineID:       r.machineID,
 		Lease:           int64(r.lease),
 		PrevLeases:      append([]int64(nil), r.stale...),
 		Drained:         r.drained,
@@ -57,14 +68,19 @@ func (r *Registrar) saveLocked() {
 	}
 }
 
-func loadState(path, nodeID string) (diskState, bool) {
+// loadState 区分三种结果：文件不存在、读到本机状态、文件损坏或 node_id 对不上。
+// 后一种不能当成“第一次启动”，否则重拨中的出口校验会被跳过。
+func loadState(path, nodeID string) (diskState, int) {
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return diskState{}, false
+		if os.IsNotExist(err) {
+			return diskState{}, stateMissing
+		}
+		return diskState{}, stateUntrusted
 	}
 	var st diskState
 	if json.Unmarshal(b, &st) != nil || st.NodeID != nodeID {
-		return diskState{}, false
+		return diskState{}, stateUntrusted
 	}
-	return st, true
+	return st, stateOK
 }
