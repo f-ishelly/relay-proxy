@@ -51,6 +51,7 @@ type fileConfig struct {
 	ResourceFaultAction      string   `json:"resource_fault_action"`
 	DrainAttemptMS           int      `json:"drain_attempt_ms"`
 	DrainBudgetMS            int      `json:"drain_budget_ms"`
+	RedialJitterMS           int      `json:"redial_jitter_ms"`
 }
 
 func main() {
@@ -109,6 +110,7 @@ func main() {
 	setMS(&cfg.InspectionInterval, fc.InspectionIntervalMS)
 	setMS(&cfg.DrainAttempt, fc.DrainAttemptMS)
 	setMS(&cfg.DrainBudget, fc.DrainBudgetMS)
+	setMS(&cfg.RedialJitter, fc.RedialJitterMS)
 	if fc.FailThreshold > 0 {
 		cfg.ProbeFailThreshold = fc.FailThreshold
 	}
@@ -134,7 +136,11 @@ func main() {
 			http.Error(w, "POST", http.StatusMethodNotAllowed)
 			return
 		}
-		err := reg.Drain(context.Background())
+		if err := reg.JitterBeforeDrain(rq.Context()); err != nil {
+			writeResult(w, err)
+			return
+		}
+		err := reg.Drain(rq.Context())
 		writeResult(w, err)
 	})
 	mux.HandleFunc("/v1/ready", func(w http.ResponseWriter, rq *http.Request) {

@@ -53,16 +53,23 @@ func (r *Registrar) saveLocked() {
 		r.event("state_err", "err", err.Error())
 		return
 	}
-	dir := filepath.Dir(r.cfg.StateFile)
+	path := r.cfg.StateFile
+	r.do(func() {
+		if err := writeStateFile(path, b); err != nil {
+			r.event("state_err", "err", err.Error())
+		}
+	})
+}
+
+func writeStateFile(path string, b []byte) error {
+	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o750); err != nil {
-		r.event("state_err", "err", err.Error())
-		return
+		return err
 	}
-	tmp := r.cfg.StateFile + ".tmp"
+	tmp := path + ".tmp"
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
-		r.event("state_err", "err", err.Error())
-		return
+		return err
 	}
 	_, werr := f.Write(b)
 	if werr == nil {
@@ -70,27 +77,21 @@ func (r *Registrar) saveLocked() {
 	}
 	cerr := f.Close()
 	if werr != nil {
-		r.event("state_err", "err", werr.Error())
-		return
+		return werr
 	}
 	if cerr != nil {
-		r.event("state_err", "err", cerr.Error())
-		return
+		return cerr
 	}
-	if err := os.Rename(tmp, r.cfg.StateFile); err != nil {
-		r.event("state_err", "err", err.Error())
-		return
+	if err := os.Rename(tmp, path); err != nil {
+		return err
 	}
 	df, err := os.Open(dir)
 	if err != nil {
-		r.event("state_err", "err", err.Error())
-		return
+		return err
 	}
 	err = df.Sync()
 	_ = df.Close()
-	if err != nil {
-		r.event("state_err", "err", err.Error())
-	}
+	return err
 }
 
 // loadState 区分三种结果：文件不存在、读到本机状态、文件损坏或 node_id 对不上。

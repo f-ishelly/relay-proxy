@@ -7,7 +7,9 @@
 // Ready 只在外部看到的出口 IP 与重拨前不同时才用同一个 lease Put。状态文件损坏时必须由调用方
 // 确认上一次出口。进程消失时不 Revoke，key 等 TTL 到期后消失。同一宿主机上的一批虚拟机会一起过期。
 //
-// 对外入口是 Start、Drain、Ready、Report、Stop。后台每秒探测 gost，每 500ms 检查本机 ppp 地址。
+// 对外入口是 Start、Drain、Ready、Report、Stop，计划内批量重拨还要先调用 JitterBeforeDrain。
+// 业务 lease 和重拨标记的续租在独立的 goroutine 里，不跟 Drain、Ready、探测共用锁。
+// 后台每秒探测 gost，每 500ms 检查本机 ppp 地址。
 // Report 的零值表示健康；NetFault、CPUFault、MemFault 为真时删除 key。etcd 客户端会使用
 // Config.Endpoints 里的全部成员，生产环境必须把集群每个成员都写进去。
 package registrar

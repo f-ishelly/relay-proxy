@@ -38,6 +38,7 @@ func main() {
 	dial := flag.Duration("dial", registrar.DefaultAssumedDial, "admin 拨号耗时（registrar 不睡眠，只有演示循环使用）")
 	check := flag.Duration("egress-check", registrar.DefaultAssumedEgressCheck, "admin 出口校验耗时")
 	inspect := flag.Duration("inspection-interval", registrar.DefaultInspectionInterval, "admin 巡检间隔，默认 1 分钟；查外网、CPU 和内存")
+	jitter := flag.Duration("redial-jitter", 0, "演示把 Drain 前的随机等待设为 0。生产计划内重拨必须用 registrar.DefaultRedialJitter（0–60s），不能关掉")
 	flag.Parse()
 	if !*demo {
 		fmt.Fprintf(os.Stderr, "嵌入方式：\n\n%s\n", snippet)
@@ -76,6 +77,7 @@ func main() {
 	cfg.AssumedDial = *dial
 	cfg.AssumedEgressCheck = *check
 	cfg.InspectionInterval = *inspect
+	cfg.RedialJitter = *jitter
 	cfg.LocalIP = func() string { return readTrim(*ipFile) }
 	cfg.Logger = registrar.JSONLogger{Out: os.Stdout}
 	cfg.OnAlert = func(a registrar.Alert) {
@@ -97,7 +99,11 @@ func main() {
 	}
 	fmt.Println("在线", reg.Status().Key, "lease", reg.Status().LeaseID)
 
-	// 计划内重拨：先确认 key 删除，再拨号。外部出口必须变化，否则 Ready 拒绝注册。
+	// 计划内重拨：先把这一批 Drain 随机拉开，再确认 key 删除，然后才挂断拨号。
+	// 演示默认 -redial-jitter 0。生产必须用 DefaultRedialJitter，不能在同一时刻一起删 key。
+	if err := reg.JitterBeforeDrain(ctx); err != nil {
+		fatal(err)
+	}
 	if err := reg.Drain(ctx); err != nil {
 		fatal(err)
 	}
@@ -160,6 +166,8 @@ reg, err := registrar.New(cfg)
 err = reg.Start(ctx)
 // 启动后要调用 Ready。从没有 instance_id / machine_id 的旧状态文件升级时，Start 不会自动注册。
 // 重拨 API。一次拨号加一次出口校验大约 5 秒，失败率低于 1%。
+// 计划内批量重拨必须先随机等待 [0, RedialJitter)。默认 60s。同一时刻一起 Drain 会丢 lease。
+err = reg.JitterBeforeDrain(ctx)
 err = reg.Drain(ctx) // etcd 确认删除后才挂断
 dial()
 egressIP, prevEgress, changed := egressCheck() // 外部看到的出口必须变

@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"google.golang.org/grpc"
 )
 
 const (
@@ -32,8 +34,10 @@ const (
 	DefaultProbeRiseThreshold = 2
 	// DefaultIPGuardInterval 是 ppp 地址守卫的间隔。
 	DefaultIPGuardInterval = 500 * time.Millisecond
-	// DefaultDrainAttempt 是 Drain 单次 etcd 调用的超时。
-	DefaultDrainAttempt = 700 * time.Millisecond
+	// DefaultDrainAttempt 是 Drain 单次 etcd 调用的超时。失败后按指数退避加抖动再试，避免 700ms 超时打成重试风暴。
+	DefaultDrainAttempt = 2 * time.Second
+	// DefaultRedialJitter 是计划内批量重拨在 Drain 之前必须拉开的随机上界。
+	DefaultRedialJitter = 60 * time.Second
 	// DefaultDrainBudget 是 Drain 的总重试时间。
 	DefaultDrainBudget = 6 * time.Second
 	// DefaultOpTimeout 是 Grant、Put、Revoke、续租的单次超时。
@@ -195,6 +199,11 @@ type Config struct {
 	DialTimeout          time.Duration
 	DialKeepAliveTime    time.Duration
 	DialKeepAliveTimeout time.Duration
+	// DialOptions 附加到 etcd 客户端，测试用来注入延迟。生产留空。
+	DialOptions []grpc.DialOption
+	// RedialJitter 是计划内重拨调用 JitterBeforeDrain 时的随机上界。默认 60s。
+	// 一批节点的 Drain 必须先拉开这段随机时间，不能在同一时刻一起删 key。
+	RedialJitter time.Duration
 
 	// StateFile 保存 lease、实例身份、drained 和已注册的出口 IP。
 	StateFile string
@@ -245,6 +254,7 @@ func DefaultConfig() Config {
 		DialTimeout:              2 * time.Second,
 		DialKeepAliveTime:        2 * time.Second,
 		DialKeepAliveTimeout:     2 * time.Second,
+		RedialJitter:             DefaultRedialJitter,
 		AssumedDial:              DefaultAssumedDial,
 		AssumedEgressCheck:       DefaultAssumedEgressCheck,
 		AssumedRedialFailureRate: DefaultAssumedRedialFailureRate,

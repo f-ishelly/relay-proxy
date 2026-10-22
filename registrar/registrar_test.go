@@ -74,6 +74,9 @@ func TestNodeIDFileAndRejectBadConfig(t *testing.T) {
 	if r.cfg.AssumedDial+r.cfg.AssumedEgressCheck != 5*time.Second || r.cfg.AssumedRedialFailureRate != DefaultAssumedRedialFailureRate {
 		t.Fatalf("redial planning dial=%s check=%s rate=%v", r.cfg.AssumedDial, r.cfg.AssumedEgressCheck, r.cfg.AssumedRedialFailureRate)
 	}
+	if r.cfg.RedialJitter != DefaultRedialJitter || r.cfg.DrainAttempt != DefaultDrainAttempt {
+		t.Fatalf("jitter=%s attempt=%s", r.cfg.RedialJitter, r.cfg.DrainAttempt)
+	}
 	if r.cfg.InspectionInterval != time.Minute || r.cfg.ResourceFaultAction != ResourceFaultDeregister {
 		t.Fatalf("inspect=%s resource=%s", r.cfg.InspectionInterval, r.cfg.ResourceFaultAction)
 	}
@@ -1086,9 +1089,11 @@ func TestClientDeadlineReclaimsOwnLease(t *testing.T) {
 	lease, create, _ := g.waitKey(true, 2*time.Second)
 	t0 := time.Now()
 	// 服务端租约还活着、只是客户端截止时间到了。真正的 Revoke 会让 etcd 删掉 key，测不到这条「不能 DELETE」。
+	g.reg.opMu.Lock()
 	g.reg.mu.Lock()
 	g.reg.loseLeaseLocked(errors.New("client deadline"))
 	g.reg.mu.Unlock()
+	g.reg.opMu.Unlock()
 	if _, _, _, ok := g.kv(g.reg.key); !ok {
 		t.Fatal("key deleted when the client declared the lease lost")
 	}
@@ -1977,10 +1982,12 @@ func TestConflictRevokesUnusedEpochLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	g.reg.opMu.Lock()
 	g.reg.mu.Lock()
 	err = g.reg.deleteKeyAndEpoch(context.Background(), 1)
 	id := g.reg.epochLease
 	g.reg.mu.Unlock()
+	g.reg.opMu.Unlock()
 	if !errors.Is(err, errLostRace) {
 		t.Fatalf("stale mod err=%v", err)
 	}

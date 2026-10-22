@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
@@ -41,12 +42,37 @@ type Registrar struct {
 	key string
 
 	mu      sync.Mutex
+	opMu    sync.Mutex
+	logMu   sync.Mutex
 	cli     *clientv3.Client
+	cliPtr  atomic.Pointer[clientv3.Client]
 	root    context.Context
 	cancel  context.CancelFunc
 	wg      sync.WaitGroup
 	started bool
 	stopped bool
+
+	// pubLease / pubEpoch 给续租循环读。续租循环不拿 r.mu，Drain 也挡不住它。
+	pubLease    atomic.Int64
+	pubEpoch    atomic.Int64
+	renewMu     sync.Mutex
+	bizDue      time.Time
+	bizDead     time.Time
+	epDue       time.Time
+	epDead      time.Time
+	renewStamps []time.Time
+	lastRenew   atomic.Int64
+	bizGen      atomic.Int64
+	epGen       atomic.Int64
+
+	holdSince  atomic.Int64
+	holdActive atomic.Bool
+
+	pendingMu    sync.Mutex
+	pendingMain  *leaseFail
+	pendingEpoch *leaseFail
+	pendingHold  int64
+	lossWake     chan struct{}
 
 	lease           clientv3.LeaseID
 	epochLease      clientv3.LeaseID
@@ -69,7 +95,9 @@ type Registrar struct {
 	priorHolder bool
 	// recognizedEpoch 是本实例自己的旧标记原文（instance_id 和地址都对得上，字节和现在的正文不同）。注册成功后按这个字节删掉它。
 	// epochGrant 仅测试注入 Grant 失败。生产为 nil。
-	epochGrant      func(context.Context, int64) (*clientv3.LeaseGrantResponse, error)
+	epochGrant func(context.Context, int64) (*clientv3.LeaseGrantResponse, error)
+	// epochTxnHook 仅测试：代替 deleteKeyAndEpoch 里那次事务的 Commit。生产为 nil。
+	epochTxnHook    func(context.Context, clientv3.Txn) (*clientv3.TxnResponse, error)
 	recognizedEpoch string
 	// staleEpoch 是被换掉的上一条 epoch lease，写完新标记后撤销。
 	staleEpoch  clientv3.LeaseID
@@ -108,12 +136,18 @@ func (r *Registrar) Start(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	r.opMu.Lock()
+	defer r.opMu.Unlock()
 	r.mu.Lock()
 	if r.started {
 		r.mu.Unlock()
 		return errors.New("registrar already started")
 	}
 	r.started = true
+	if r.lossWake == nil {
+		r.lossWake = make(chan struct{}, 1)
+	}
+	r.mu.Unlock()
 	if _, ok := ctx.Deadline(); !ok {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, r.cfg.StartGrantTimeout)
@@ -126,24 +160,30 @@ func (r *Registrar) Start(ctx context.Context) error {
 		DialKeepAliveTimeout: r.cfg.DialKeepAliveTimeout,
 		AutoSyncInterval:     0,
 		Logger:               zap.NewNop(),
+		DialOptions:          r.cfg.DialOptions,
 	})
 	if err != nil {
+		r.mu.Lock()
 		r.started = false
 		r.mu.Unlock()
 		return err
 	}
+	r.mu.Lock()
 	r.cli = cli
+	r.cliPtr.Store(cli)
 	if err := r.bootstrap(ctx); err != nil {
 		r.cli = nil
+		r.cliPtr.Store(nil)
 		r.started = false
 		r.mu.Unlock()
 		_ = cli.Close()
 		return err
 	}
 	r.root, r.cancel = context.WithCancel(context.Background())
-	r.wg.Add(2)
+	r.wg.Add(3)
 	go r.controlLoop()
 	go r.probeLoop()
+	go r.renewLoop()
 	if len(r.cfg.Endpoints) < 3 {
 		r.event("endpoints_warning", "n", len(r.cfg.Endpoints), "msg", "生产环境必须配置全部 etcd 成员")
 	}
@@ -157,6 +197,8 @@ func (r *Registrar) Drain(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	r.opMu.Lock()
+	defer r.opMu.Unlock()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.stopped {
@@ -173,6 +215,8 @@ func (r *Registrar) Drain(ctx context.Context) error {
 	r.saveLocked()
 	r.event("api_drain", "prev_egress", r.prevEgress)
 	deadline := time.Now().Add(r.cfg.DrainBudget)
+	backoff := 100 * time.Millisecond
+	const backoffCap = 500 * time.Millisecond
 	var err error
 	for {
 		attempt := r.cfg.DrainAttempt
@@ -193,6 +237,24 @@ func (r *Registrar) Drain(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return fmt.Errorf("%w: %v", ErrDrainTimeout, ctx.Err())
 		}
+		remain := time.Until(deadline)
+		if remain <= 0 {
+			break
+		}
+		pause := drainBackoff(backoff)
+		if pause > remain {
+			pause = remain
+		}
+		r.do(func() { _ = sleepCtx(ctx, pause) })
+		if ctx.Err() != nil {
+			return fmt.Errorf("%w: %v", ErrDrainTimeout, ctx.Err())
+		}
+		if backoff < backoffCap {
+			backoff *= 2
+			if backoff > backoffCap {
+				backoff = backoffCap
+			}
+		}
 	}
 	if err == nil {
 		err = errors.New("budget exhausted")
@@ -206,6 +268,8 @@ func (r *Registrar) Ready(ctx context.Context, egressIP, prevEgress string) erro
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	r.opMu.Lock()
+	defer r.opMu.Unlock()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.stopped {
@@ -266,6 +330,8 @@ func (r *Registrar) Report(ctx context.Context, rep Report) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	r.opMu.Lock()
+	defer r.opMu.Unlock()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.stopped {
@@ -304,6 +370,8 @@ func (r *Registrar) Stop(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	r.opMu.Lock()
+	defer r.opMu.Unlock()
 	r.mu.Lock()
 	if !r.started {
 		r.stopped = true
@@ -317,6 +385,8 @@ func (r *Registrar) Stop(ctx context.Context) error {
 	}
 	r.stopped = true
 	cancel := r.cancel
+	r.pubLease.Store(0)
+	r.pubEpoch.Store(0)
 	r.mu.Unlock()
 	if cancel != nil {
 		cancel()
@@ -329,6 +399,7 @@ func (r *Registrar) Stop(ctx context.Context) error {
 	r.revokeStale(ctx, r.cfg.OpTimeout)
 	r.saveLocked()
 	if r.cli != nil {
+		r.cliPtr.Store(nil)
 		cerr := r.cli.Close()
 		r.cli = nil
 		if err == nil {
@@ -364,6 +435,9 @@ func (r *Registrar) abandon() {
 	cancel := r.cancel
 	cli := r.cli
 	r.cli = nil
+	r.cliPtr.Store(nil)
+	r.pubLease.Store(0)
+	r.pubEpoch.Store(0)
 	r.mu.Unlock()
 	if cancel != nil {
 		cancel()
@@ -472,23 +546,41 @@ func (r *Registrar) adoptState(ctx context.Context, st diskState) {
 
 func (r *Registrar) grant(ctx context.Context) error {
 	var last error
+	ttl := int64(r.cfg.TTL / time.Second)
+	timeout := r.cfg.OpTimeout
 	for {
-		c, cancel := context.WithTimeout(ctx, r.cfg.OpTimeout)
-		resp, err := r.cli.Grant(c, int64(r.cfg.TTL/time.Second))
-		cancel()
-		if err == nil {
-			r.lease = resp.ID
-			r.deadline = time.Now().Add(time.Duration(resp.TTL) * time.Second)
-			r.nextRenew = time.Now().Add(r.cfg.RenewInterval)
+		cli := r.cli
+		var resp *clientv3.LeaseGrantResponse
+		var err error
+		r.do(func() {
+			if cli == nil {
+				err = errors.New("etcd client closed")
+				return
+			}
+			c, cancel := context.WithTimeout(ctx, timeout)
+			resp, err = cli.Grant(c, ttl)
+			cancel()
+		})
+		if err == nil && resp != nil {
+			r.bindBusinessLocked(resp.ID, resp.TTL)
 			r.event("granted", "lease", int64(resp.ID), "ttl", resp.TTL)
 			return nil
 		}
+		if err == nil {
+			err = errors.New("empty grant")
+		}
 		last = err
 		r.event("grant_err", "err", err.Error())
-		select {
-		case <-ctx.Done():
+		var done bool
+		r.do(func() {
+			select {
+			case <-ctx.Done():
+				done = true
+			case <-time.After(200 * time.Millisecond):
+			}
+		})
+		if done || ctx.Err() != nil {
 			return fmt.Errorf("grant: %w", last)
-		case <-time.After(200 * time.Millisecond):
 		}
 	}
 }
@@ -503,11 +595,17 @@ func (r *Registrar) controlLoop() {
 		select {
 		case <-r.root.Done():
 			return
+		case <-r.lossWake:
+			r.drainSignals()
 		case <-tick.C:
-			r.renew()
+			r.drainSignals()
+			if !r.opMu.TryLock() {
+				continue
+			}
 			r.mu.Lock()
 			if r.stopped {
 				r.mu.Unlock()
+				r.opMu.Unlock()
 				return
 			}
 			if r.lease == 0 && !r.drained && r.mayRegister && r.wantIP != "" && !time.Now().Before(r.retryNotBefore) {
@@ -517,16 +615,20 @@ func (r *Registrar) controlLoop() {
 				r.revokeStale(r.root, r.cfg.BackgroundTimeout)
 			}
 			r.mu.Unlock()
+			r.opMu.Unlock()
 		case <-guard.C:
-			if !r.mu.TryLock() {
+			if !r.opMu.TryLock() {
 				continue
 			}
+			r.mu.Lock()
 			if r.stopped {
 				r.mu.Unlock()
+				r.opMu.Unlock()
 				return
 			}
 			r.reconcile(r.root, "guard", r.cfg.BackgroundTimeout)
 			r.mu.Unlock()
+			r.opMu.Unlock()
 		}
 	}
 }
@@ -548,6 +650,21 @@ func (r *Registrar) probeLoop() {
 
 func (r *Registrar) runProbe() {
 	err := probeGost(r.cfg.ProbeAddr, r.cfg.ProbeUser, r.cfg.ProbePassword, r.cfg.ProbeTarget, r.cfg.ProbeExpectStatus, r.cfg.ProbeTimeout)
+	if !r.opMu.TryLock() {
+		r.mu.Lock()
+		if !r.stopped {
+			if err != nil {
+				r.fails++
+				r.oks = 0
+			} else {
+				r.oks++
+				r.fails = 0
+			}
+		}
+		r.mu.Unlock()
+		return
+	}
+	defer r.opMu.Unlock()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.stopped {
@@ -572,98 +689,12 @@ func (r *Registrar) runProbe() {
 	}
 }
 
-func (r *Registrar) renew() {
-	r.renewLease(false)
-	r.renewLease(true)
-}
-
-func (r *Registrar) renewLease(epoch bool) {
-	r.mu.Lock()
-	if r.stopped || r.cli == nil {
-		r.mu.Unlock()
-		return
-	}
-	var id clientv3.LeaseID
-	var due, dead time.Time
-	var renewEvery time.Duration
-	if epoch {
-		if r.epochLease != 0 && r.epochHoldExceeded() {
-			r.releaseEpochHoldLocked()
-		}
-		id = r.epochLease
-		due = r.epochNextRenew
-		dead = r.epochDeadline
-		renewEvery = r.cfg.EpochRenewInterval
-	} else {
-		id = r.lease
-		due = r.nextRenew
-		dead = r.deadline
-		renewEvery = r.cfg.RenewInterval
-	}
-	if id == 0 || time.Now().Before(due) {
-		r.mu.Unlock()
-		return
-	}
-	cli := r.cli
-	timeout := r.cfg.OpTimeout
-	r.mu.Unlock()
-
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	t0 := time.Now()
-	resp, err := cli.KeepAliveOnce(ctx, id)
-	cancel()
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.cli == nil {
-		return
-	}
-	if epoch {
-		if r.epochLease != id {
-			return
-		}
-		if err == nil && resp != nil && resp.TTL > 0 {
-			r.epochDeadline = time.Now().Add(time.Duration(resp.TTL) * time.Second)
-			r.epochNextRenew = t0.Add(renewEvery)
-			return
-		}
-		if leaseMissing(err) || (err == nil && (resp == nil || resp.TTL <= 0)) || time.Now().After(dead) {
-			r.event("epoch_lease_lost", "err", fmt.Sprint(err))
-			r.staleEpoch = id
-			r.epochLease = 0
-			if werr := r.refreshEpoch(context.Background()); werr != nil {
-				r.event("epoch_refresh_err", "err", werr.Error())
-			}
-			return
-		}
-		r.event("epoch_ka_err", "err", err.Error())
-		r.epochNextRenew = time.Now().Add(500 * time.Millisecond)
-		return
-	}
-	if r.lease != id {
-		return
-	}
-	if err == nil && resp != nil && resp.TTL > 0 {
-		r.deadline = time.Now().Add(time.Duration(resp.TTL) * time.Second)
-		r.nextRenew = t0.Add(renewEvery)
-		r.event("ka_ok", "ttl", resp.TTL, "rtt_ms", time.Since(t0).Milliseconds())
-		return
-	}
-	if leaseMissing(err) || (err == nil && (resp == nil || resp.TTL <= 0)) || time.Now().After(dead) {
-		// 客户端以为租约没了，但切主后服务端可能还活着。先记进 stale，后面才能认领，而不是和自己冲突。
-		r.loseLeaseLocked(err)
-		return
-	}
-	r.event("ka_err", "err", err.Error())
-	r.nextRenew = time.Now().Add(500 * time.Millisecond)
-}
-
 func (r *Registrar) loseLeaseLocked(err error) {
 	if r.lease != 0 {
 		r.stale = uniqueLeases(append(r.stale, int64(r.lease)))
 	}
 	r.event("lease_lost", "err", fmt.Sprint(err), "kept_stale", r.stale)
-	r.lease = 0
+	r.clearBusinessLocked()
 	r.regIP = ""
 	r.saveLocked()
 	// 只有登记过的持有者才补标记。没拿过 key 的实例在这里写，会把别人的空窗占住。
@@ -767,11 +798,11 @@ func (r *Registrar) put(ctx context.Context, ip, how string, timeout time.Durati
 	var last error
 	for attempt := 0; attempt < 3; attempt++ {
 		c, cancel := context.WithTimeout(ctx, timeout)
-		tr, err := r.cli.Txn(c).
+		guard := r.opCreateGuarded(string(body))
+		tr, err := r.commitTxn(r.txn(c).
 			If(clientv3.Compare(clientv3.CreateRevision(r.key), "=", 0)).
-			Then(r.opCreateGuarded(string(body))).
-			Else(clientv3.OpGet(r.key)).
-			Commit()
+			Then(guard).
+			Else(clientv3.OpGet(r.key)))
 		if err != nil {
 			cancel()
 			return err
@@ -825,10 +856,10 @@ func (r *Registrar) put(ctx context.Context, ip, how string, timeout time.Durati
 		}
 		if reason == "dead_lease" {
 			// 过期 lease 上的残留 key 也不能绕过重拨标记。
-			tr2, err := r.cli.Txn(c).
+			guard := r.opCreateGuarded(string(body))
+			tr2, err := r.commitTxn(r.txn(c).
 				If(clientv3.Compare(clientv3.ModRevision(r.key), "=", kv.ModRevision)).
-				Then(r.opCreateGuarded(string(body))).
-				Commit()
+				Then(guard))
 			if err != nil {
 				cancel()
 				return err
@@ -867,10 +898,9 @@ func (r *Registrar) put(ctx context.Context, ip, how string, timeout time.Durati
 			cancel()
 			return r.rejectEpoch(kind, ev, foreignLease)
 		}
-		tr2, err := r.cli.Txn(c).
+		tr2, err := r.commitTxn(r.txn(c).
 			If(clientv3.Compare(clientv3.ModRevision(r.key), "=", kv.ModRevision)).
-			Then(op).
-			Commit()
+			Then(op))
 		cancel()
 		if err != nil {
 			return err
@@ -898,6 +928,7 @@ func (r *Registrar) finishPut(ip, how, reason string) {
 	r.priorHolder = true
 	r.drainedSince = time.Time{}
 	r.epochHoldReleased = false
+	r.publishHoldLocked()
 	r.event("registered", "how", how, "reason", reason, "ip", ip, "old_ip", old, "lease", int64(r.lease), "instance", r.instanceID)
 	r.revokeStale(context.Background(), r.cfg.OpTimeout)
 	r.clearEpoch(context.Background())
@@ -920,11 +951,23 @@ func (r *Registrar) allowWrite(ctx context.Context, lease int64, raw []byte) (st
 	case lease == 0:
 		return "", false, nil
 	}
-	resp, err := r.cli.TimeToLive(ctx, clientv3.LeaseID(lease))
+	cli := r.cli
+	var resp *clientv3.LeaseTimeToLiveResponse
+	var err error
+	r.do(func() {
+		if cli == nil {
+			err = errors.New("etcd client closed")
+			return
+		}
+		resp, err = cli.TimeToLive(ctx, clientv3.LeaseID(lease))
+	})
 	if leaseMissing(err) {
 		return "dead_lease", true, nil
 	}
-	if err != nil {
+	if err != nil || resp == nil {
+		if err == nil {
+			err = errors.New("empty lease ttl")
+		}
 		return "", false, err
 	}
 	if resp.TTL <= 0 {
@@ -940,7 +983,16 @@ func (r *Registrar) deleteOwned(ctx context.Context, reason string, timeout time
 	var last error
 	for attempt := 0; attempt < 3; attempt++ {
 		c, cancel := context.WithTimeout(ctx, timeout)
-		resp, err := r.cli.Get(c, r.key)
+		cli := r.cli
+		var resp *clientv3.GetResponse
+		var err error
+		r.do(func() {
+			if cli == nil {
+				err = errors.New("etcd client closed")
+				return
+			}
+			resp, err = cli.Get(c, r.key)
+		})
 		if err != nil {
 			cancel()
 			return err
@@ -1004,10 +1056,9 @@ func (r *Registrar) deleteOwned(ctx context.Context, reason string, timeout time
 }
 
 func (r *Registrar) deleteAtRev(ctx context.Context, mod int64) error {
-	tr, err := r.cli.Txn(ctx).
+	tr, err := r.commitTxn(r.txn(ctx).
 		If(clientv3.Compare(clientv3.ModRevision(r.key), "=", mod)).
-		Then(clientv3.OpDelete(r.key)).
-		Commit()
+		Then(clientv3.OpDelete(r.key)))
 	if err != nil {
 		return err
 	}
@@ -1024,15 +1075,24 @@ func (r *Registrar) revokeCurrent(ctx context.Context, reason string, timeout ti
 	}
 	c, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	_, err := r.cli.Revoke(c, r.lease)
+	cli := r.cli
+	id := r.lease
+	var err error
+	r.do(func() {
+		if cli == nil {
+			err = errors.New("etcd client closed")
+			return
+		}
+		_, err = cli.Revoke(c, id)
+	})
 	if leaseMissing(err) {
 		err = nil
 	}
-	r.event("revoked", "reason", reason, "lease", int64(r.lease), "err", fmt.Sprint(err))
+	r.event("revoked", "reason", reason, "lease", int64(id), "err", fmt.Sprint(err))
 	if err != nil {
 		return err
 	}
-	r.lease = 0
+	r.clearBusinessLocked()
 	r.regIP = ""
 	return nil
 }
@@ -1058,7 +1118,15 @@ func (r *Registrar) revokeStale(ctx context.Context, timeout time.Duration) {
 			continue
 		}
 		c, cancel := context.WithTimeout(ctx, timeout)
-		_, err := r.cli.Revoke(c, clientv3.LeaseID(id))
+		cli := r.cli
+		var err error
+		r.do(func() {
+			if cli == nil {
+				err = errors.New("etcd client closed")
+				return
+			}
+			_, err = cli.Revoke(c, clientv3.LeaseID(id))
+		})
 		cancel()
 		if err != nil && !leaseMissing(err) && ctx.Err() == nil {
 			left = append(left, id)
@@ -1154,15 +1222,32 @@ func (r *Registrar) ensureEpochLease(ctx context.Context) error {
 	if r.epochLease != 0 {
 		return nil
 	}
-	c, cancel := context.WithTimeout(ctx, r.cfg.OpTimeout)
-	defer cancel()
-	resp, err := r.grantEpoch(c, int64(r.cfg.EpochTTL/time.Second))
+	cli := r.cli
+	hook := r.epochGrant
+	ttl := int64(r.cfg.EpochTTL / time.Second)
+	timeout := r.cfg.OpTimeout
+	var resp *clientv3.LeaseGrantResponse
+	var err error
+	r.do(func() {
+		c, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		if hook != nil {
+			resp, err = hook(c, ttl)
+			return
+		}
+		if cli == nil {
+			err = errors.New("etcd client closed")
+			return
+		}
+		resp, err = cli.Grant(c, ttl)
+	})
 	if err != nil {
 		return err
 	}
-	r.epochLease = resp.ID
-	r.epochDeadline = time.Now().Add(time.Duration(resp.TTL) * time.Second)
-	r.epochNextRenew = time.Now().Add(r.cfg.EpochRenewInterval)
+	if resp == nil {
+		return errors.New("empty epoch grant")
+	}
+	r.bindEpochLocked(resp.ID, resp.TTL)
 	r.event("epoch_granted", "lease", int64(resp.ID), "ttl", resp.TTL)
 	return nil
 }
@@ -1172,6 +1257,7 @@ func (r *Registrar) noteDrained() {
 	if r.drainedSince.IsZero() {
 		r.drainedSince = time.Now()
 	}
+	r.publishHoldLocked()
 }
 
 // beginDrainedHold 从这一次 Drain 或地址守卫重新计算标记还能续多久。
@@ -1179,6 +1265,7 @@ func (r *Registrar) beginDrainedHold() {
 	r.drained = true
 	r.drainedSince = time.Now()
 	r.epochHoldReleased = false
+	r.publishHoldLocked()
 }
 
 func (r *Registrar) epochHoldExceeded() bool {
@@ -1197,7 +1284,8 @@ func (r *Registrar) releaseEpochHoldLocked() {
 	}
 	r.epochHoldReleased = true
 	// 不 Revoke：让服务端上的标记按剩余 TTL 自己过期，最多再留一个 EpochTTL。
-	r.epochLease = 0
+	r.clearEpochLeaseLocked()
+	r.publishHoldLocked()
 	r.event("epoch_hold_expired", "max", r.cfg.MaxDrained.String())
 	if r.cfg.OnAlert == nil {
 		return
@@ -1210,13 +1298,6 @@ func (r *Registrar) releaseEpochHoldLocked() {
 	}
 	cb := r.cfg.OnAlert
 	go cb(a)
-}
-
-func (r *Registrar) grantEpoch(ctx context.Context, ttl int64) (*clientv3.LeaseGrantResponse, error) {
-	if r.epochGrant != nil {
-		return r.epochGrant(ctx, ttl)
-	}
-	return r.cli.Grant(ctx, ttl)
 }
 
 func (r *Registrar) rejectEpoch(kind int, ev epochValue, foreignLease int64) error {
@@ -1284,7 +1365,7 @@ func (r *Registrar) writeHolderEpoch(ctx context.Context, requireMainAbsent bool
 
 	var tr *clientv3.TxnResponse
 	if requireMainAbsent {
-		tr, err = r.cli.Txn(c).
+		tr, err = r.commitTxn(r.txn(c).
 			If(
 				clientv3.Compare(clientv3.CreateRevision(r.key), "=", 0),
 				clientv3.Compare(clientv3.CreateRevision(epochKey), "=", 0),
@@ -1297,18 +1378,16 @@ func (r *Registrar) writeHolderEpoch(ctx context.Context, requireMainAbsent bool
 				},
 				[]clientv3.Op{clientv3.OpGet(epochKey), put},
 				[]clientv3.Op{clientv3.OpGet(r.key), clientv3.OpGet(epochKey)},
-			)).
-			Commit()
+			)))
 	} else {
-		tr, err = r.cli.Txn(c).
+		tr, err = r.commitTxn(r.txn(c).
 			If(clientv3.Compare(clientv3.CreateRevision(epochKey), "=", 0)).
 			Then(put).
 			Else(clientv3.OpTxn(
 				[]clientv3.Cmp{clientv3.Compare(clientv3.Value(epochKey), "=", body)},
 				[]clientv3.Op{clientv3.OpGet(epochKey), put},
 				[]clientv3.Op{clientv3.OpGet(epochKey)},
-			)).
-			Commit()
+			)))
 	}
 	if err != nil {
 		return err
@@ -1362,46 +1441,80 @@ func (r *Registrar) deleteKeyAndEpoch(ctx context.Context, mod int64) error {
 			return err
 		}
 		epochKey := EpochKey(r.cfg.NodeID)
-		tr, err := r.cli.Txn(ctx).
-			If(clientv3.Compare(clientv3.ModRevision(r.key), "=", mod)).
-			Then(
-				clientv3.OpGet(epochKey),
-				clientv3.OpPut(epochKey, body, clientv3.WithLease(r.epochLease)),
-				clientv3.OpDelete(r.key),
-			).
-			Commit()
+		leaseID := r.epochLease
+		hook := r.epochTxnHook
+		var tr *clientv3.TxnResponse
+		txn := r.txn(ctx)
+		if txn != nil {
+			txn = txn.
+				If(clientv3.Compare(clientv3.ModRevision(r.key), "=", mod)).
+				Then(
+					clientv3.OpGet(epochKey),
+					clientv3.OpPut(epochKey, body, clientv3.WithLease(leaseID)),
+					clientv3.OpDelete(r.key),
+				)
+		}
+		r.do(func() {
+			if hook != nil {
+				tr, err = hook(ctx, txn)
+				return
+			}
+			if txn == nil {
+				err = errors.New("etcd client closed")
+				return
+			}
+			tr, err = txn.Commit()
+		})
 		if leaseRejected(err) && attempt == 0 {
-			r.epochLease = 0
+			if r.epochLease == leaseID {
+				r.clearEpochLeaseLocked()
+			}
 			last = err
 			continue
 		}
 		if err != nil {
+			landed, checked := r.epochWriteLanded(ctx, body, leaseID)
+			if checked && landed {
+				r.event("epoch_txn_committed", "err", err.Error(), "lease", int64(leaseID))
+				if tr != nil && tr.Succeeded {
+					r.noteEpochDeletes(ctx, tr)
+				}
+				return nil
+			}
+			if !checked {
+				r.event("epoch_txn_unverified", "err", err.Error(), "lease", int64(leaseID))
+				return err
+			}
 			if fresh {
 				r.revokeEpoch(ctx)
 			}
 			return err
 		}
-		if !tr.Succeeded {
+		if tr == nil || !tr.Succeeded {
 			if fresh {
 				r.revokeEpoch(ctx)
 			}
 			return errLostRace
 		}
-		if len(tr.Responses) > 0 {
-			if rr := tr.Responses[0].GetResponseRange(); rr != nil && len(rr.Kvs) == 1 {
-				old := clientv3.LeaseID(rr.Kvs[0].Lease)
-				if old != 0 && old != r.epochLease && old != r.lease {
-					r.revokeLeaseID(ctx, old)
-				}
-			}
-		}
-		r.revokeStaleEpoch(ctx)
+		r.noteEpochDeletes(ctx, tr)
 		return nil
 	}
 	if last == nil {
 		last = errors.New("epoch lease rejected")
 	}
 	return last
+}
+
+func (r *Registrar) noteEpochDeletes(ctx context.Context, tr *clientv3.TxnResponse) {
+	if tr != nil && len(tr.Responses) > 0 {
+		if rr := tr.Responses[0].GetResponseRange(); rr != nil && len(rr.Kvs) == 1 {
+			old := clientv3.LeaseID(rr.Kvs[0].Lease)
+			if old != 0 && old != r.epochLease && old != r.lease {
+				r.revokeLeaseID(ctx, old)
+			}
+		}
+	}
+	r.revokeStaleEpoch(ctx)
 }
 
 func (r *Registrar) putIfEpochBytes(ctx context.Context, op clientv3.Op, raw string, mod int64) (bool, error) {
@@ -1411,7 +1524,7 @@ func (r *Registrar) putIfEpochBytes(ctx context.Context, op clientv3.Op, raw str
 	} else {
 		cmps = append(cmps, clientv3.Compare(clientv3.CreateRevision(r.key), "=", 0))
 	}
-	tr, err := r.cli.Txn(ctx).If(cmps...).Then(op).Commit()
+	tr, err := r.commitTxn(r.txn(ctx).If(cmps...).Then(op))
 	if err != nil {
 		return false, err
 	}
@@ -1434,10 +1547,9 @@ func (r *Registrar) clearEpoch(ctx context.Context) {
 	}
 	for _, body := range bodies {
 		c, cancel := context.WithTimeout(ctx, r.cfg.OpTimeout)
-		_, err := r.cli.Txn(c).
+		_, err := r.commitTxn(r.txn(c).
 			If(clientv3.Compare(clientv3.Value(EpochKey(r.cfg.NodeID)), "=", body)).
-			Then(clientv3.OpDelete(EpochKey(r.cfg.NodeID))).
-			Commit()
+			Then(clientv3.OpDelete(EpochKey(r.cfg.NodeID))))
 		cancel()
 		if err != nil {
 			r.event("epoch_delete_err", "err", err.Error())
@@ -1452,7 +1564,7 @@ func (r *Registrar) revokeEpoch(ctx context.Context) {
 	id := r.epochLease
 	r.revokeLeaseID(ctx, id)
 	if r.epochLease == id {
-		r.epochLease = 0
+		r.clearEpochLeaseLocked()
 	}
 }
 
@@ -1485,7 +1597,15 @@ func (r *Registrar) revokeLeaseID(ctx context.Context, id clientv3.LeaseID) {
 	}
 	c, cancel := context.WithTimeout(ctx, r.cfg.OpTimeout)
 	defer cancel()
-	_, err := r.cli.Revoke(c, id)
+	cli := r.cli
+	var err error
+	r.do(func() {
+		if cli == nil {
+			err = errors.New("etcd client closed")
+			return
+		}
+		_, err = cli.Revoke(c, id)
+	})
 	if err != nil && !leaseMissing(err) {
 		r.event("epoch_revoke_err", "lease", int64(id), "err", err.Error())
 	}
@@ -1496,10 +1616,18 @@ func (r *Registrar) keyOwnedHere(ctx context.Context, timeout time.Duration) (pr
 	if r.cli == nil {
 		return false, false, 0, errors.New("etcd client closed")
 	}
-	c, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	resp, err := r.cli.Get(c, r.key)
-	if err != nil {
+	cli := r.cli
+	key := r.key
+	var resp *clientv3.GetResponse
+	r.do(func() {
+		c, cancel := context.WithTimeout(ctx, timeout)
+		resp, err = cli.Get(c, key)
+		cancel()
+	})
+	if err != nil || resp == nil {
+		if err == nil {
+			err = errors.New("empty get")
+		}
 		return false, false, 0, err
 	}
 	if len(resp.Kvs) == 0 {
@@ -1515,6 +1643,8 @@ func (r *Registrar) event(ev string, args ...any) {
 	if r.cfg.Logger == nil {
 		return
 	}
+	r.logMu.Lock()
+	defer r.logMu.Unlock()
 	r.cfg.Logger.Event(ev, args...)
 }
 
