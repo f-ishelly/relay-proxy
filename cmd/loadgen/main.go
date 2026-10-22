@@ -8,10 +8,12 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -31,11 +33,49 @@ func main() {
 	keep := flag.Duration("keep", 20*time.Second, "全部重拨完成并切主之后，继续让 registrar 续租这么久")
 	killAfter := flag.Duration("kill-after", 0, "全部重拨完成后，再等这么久杀掉 leader；0 表示不杀")
 	registerTimeout := flag.Duration("register-timeout", 60*time.Second, "等待全部 Ready，以及之后全部 Drain+Ready 的上限")
-	redialInflight := flag.Int("redial-inflight", 64, "同时进行 Drain+Ready 的 registrar 数，避免 4000 路一起把 etcd 打满导致 TTL 内续不上租")
+	redialInflight := flag.Int("redial-inflight", 64, "同时 Drain+Ready 的上限；0 表示不限制")
 	endpoints := flag.String("endpoints", "", "逗号分隔的成员；为空且 -embed 时在本进程拉起 3 节点")
 	embedCluster := flag.Bool("embed", true, "在本进程启动 3 节点 etcd")
 	label := flag.String("label", "load", "")
+	logPath := flag.String("log", "", "把运行头、输出和结束时间写进这个文件；要求工作区干净")
+	procs := flag.Int("procs", 1, "大于 1 时拉起多个 OS 进程")
+	external := flag.Bool("external", false, "用 3 个独立 etcd 进程，而不是本进程内嵌")
+	child := flag.Bool("child", false, "由父进程拉起的 worker")
+	redialFile := flag.String("redial-file", "", "文件里的 unix 毫秒到点后，所有主机同时 Drain")
+	idBase := flag.Int("id-base", 600000, "本进程第一个 nodeId")
 	flag.Parse()
+
+	if *external && !*child {
+		lg, err := openRunLog(*logPath)
+		if err != nil {
+			fatal(err)
+		}
+		out := io.Writer(os.Stdout)
+		if lg != nil {
+			out = io.MultiWriter(os.Stdout, lg.f)
+		}
+		if *procs < 2 {
+			*procs = 8
+		}
+		code := runParent(lg, out, *hosts, *procs, *ttl, *renew, *keep, *killAfter, *registerTimeout, *label)
+		if lg != nil {
+			lg.Close()
+		}
+		os.Exit(code)
+	}
+	lg, err := openRunLog(*logPath)
+	if err != nil {
+		fatal(err)
+	}
+	out := io.Writer(os.Stdout)
+	if lg != nil {
+		out = io.MultiWriter(os.Stdout, lg.f)
+	}
+	defer func() {
+		if lg != nil {
+			lg.Close()
+		}
+	}()
 
 	var cluster *etcdcluster.Cluster
 	eps := split(*endpoints)
@@ -90,10 +130,28 @@ func main() {
 
 	var registered, readyErr, drainOK, drainErr atomic.Int64
 	redialStart := make(chan struct{})
-	if *redialInflight < 1 {
-		*redialInflight = 1
+	var drainSem chan struct{}
+	if *redialInflight > 0 {
+		drainSem = make(chan struct{}, *redialInflight)
 	}
-	drainSem := make(chan struct{}, *redialInflight)
+	if *redialFile != "" {
+		go func() {
+			for {
+				b, err := os.ReadFile(*redialFile)
+				if err == nil {
+					ms, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
+					if err == nil && ms > 0 {
+						if d := time.Until(time.UnixMilli(ms)); d > 0 {
+							time.Sleep(d)
+						}
+						close(redialStart)
+						return
+					}
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
+		}()
+	}
 	regs := make([]*registrar.Registrar, *hosts)
 	perHost := make([]*hostLog, *hosts)
 	var wg sync.WaitGroup
@@ -103,7 +161,7 @@ func main() {
 		go func(i int) {
 			defer wg.Done()
 			time.Sleep(time.Duration(i%8000) * time.Millisecond)
-			node := fmt.Sprintf("%06d", 600000+i)
+			node := fmt.Sprintf("%06d", *idBase+i)
 			ip1 := egressIP(i, 0)
 			ip2 := egressIP(i, 1)
 			var cur atomic.Value
@@ -166,16 +224,12 @@ func main() {
 				return
 			case <-redialStart:
 			}
-			select {
-			case <-ctx.Done():
-				return
-			case drainSem <- struct{}{}:
-			}
+			takeSem(drainSem)
 			dctx, dcancel := context.WithTimeout(context.Background(), 8*time.Second)
 			err = reg.Drain(dctx)
 			dcancel()
 			if err != nil {
-				<-drainSem
+				giveSem(drainSem)
 				drainErr.Add(1)
 				return
 			}
@@ -184,11 +238,11 @@ func main() {
 			err = reg.Ready(rctx, ip2, ip1)
 			rcancel()
 			if err != nil {
-				<-drainSem
+				giveSem(drainSem)
 				drainErr.Add(1)
 				return
 			}
-			<-drainSem
+			giveSem(drainSem)
 			drainOK.Add(1)
 		}(i)
 	}
@@ -198,16 +252,18 @@ func main() {
 		time.Sleep(200 * time.Millisecond)
 	}
 	up := registered.Load()
-	fmt.Printf("{\"event\":\"registered\",\"label\":%q,\"hosts\":%d,\"up\":%d,\"ready_err\":%d,\"elapsed_ms\":%d,\"endpoints\":%q}\n",
+	fmt.Fprintf(out, "{\"event\":\"registered\",\"label\":%q,\"hosts\":%d,\"up\":%d,\"ready_err\":%d,\"elapsed_ms\":%d,\"endpoints\":%q}\n",
 		*label, *hosts, up, readyErr.Load(), time.Since(start).Milliseconds(), strings.Join(eps, ","))
 	if up == int64(*hosts) && readyErr.Load() == 0 {
-		close(redialStart)
+		if *redialFile == "" {
+			close(redialStart)
+		}
 		redialDeadline := time.Now().Add(*registerTimeout)
 		for time.Now().Before(redialDeadline) && drainOK.Load()+drainErr.Load() < up {
 			time.Sleep(200 * time.Millisecond)
 		}
 	}
-	fmt.Printf("{\"event\":\"redial\",\"label\":%q,\"drain_ok\":%d,\"drain_err\":%d,\"elapsed_ms\":%d}\n",
+	fmt.Fprintf(out, "{\"event\":\"redial\",\"label\":%q,\"drain_ok\":%d,\"drain_err\":%d,\"elapsed_ms\":%d}\n",
 		*label, drainOK.Load(), drainErr.Load(), time.Since(start).Milliseconds())
 
 	killed := ""
@@ -249,6 +305,8 @@ func main() {
 		"conns_flag":           *conns,
 		"registrar_clients":    *hosts,
 		"redial_inflight":      *redialInflight,
+		"start_sleep":          "i%8000ms",
+		"start_sleep_max_ms":   (*hosts - 1) % 8000,
 		"client_mode":          "registrar",
 		"endpoints":            len(eps),
 		"ttl_s":                *ttl,
@@ -270,14 +328,29 @@ func main() {
 		"elapsed_ms":           time.Since(start).Milliseconds(),
 	}
 	b, _ := json.Marshal(summary)
-	fmt.Println(string(b))
+	fmt.Fprintln(out, string(b))
 
 	stopAll(regs)
 	// 每台主机恰好一次计划内删除。多出来的 DELETE 是 lease 过期。
 	// keepalive_err 是 registrar 单次 KeepAliveOnce 失败，切主时可能出现，随后会重试。
 	// 通过条件是租约没有丢、也没有计划外的 DELETE。
 	if up != int64(*hosts) || readyErr.Load() != 0 || drainOK.Load() != up || drainErr.Load() != 0 || counts.leaseLost.Load() != 0 || watchDel.Load() != drainOK.Load() {
+		if lg != nil {
+			lg.Close()
+		}
 		os.Exit(1)
+	}
+}
+
+func takeSem(sem chan struct{}) {
+	if sem != nil {
+		sem <- struct{}{}
+	}
+}
+
+func giveSem(sem chan struct{}) {
+	if sem != nil {
+		<-sem
 	}
 }
 
