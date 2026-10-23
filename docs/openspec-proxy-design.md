@@ -329,7 +329,7 @@ Upgrade（含 WebSocket）要同时满足：有非空的 `Upgrade`，并且 `Con
 | L2 返回 407 | 407，原样带上 `Proxy-Authenticate` | 是 | `l2_auth` |
 | L2 的其他非 200 | 502 | 是 | `l2_status` |
 
-这些 reason 的字符串与 CONNECT 相同，但明文 HTTP 调用 §7.1 的 `FailHTTP`、`RejectHTTP`、`AbortHTTP`、`ObserveHTTP` 和 `EnterHTTPTunnel`，不调用 `Fail502`、`ObserveConnect` 或 `EnterTunnel`。L2 的 CONNECT 返回 200 时请求还没结束，不在这一步记 `ok`。`ok` 记在源站最终状态行完整写给客户端的时刻。明文 HTTP 不向客户端写 L1 自己的 `200`，在途隧道看 `proxy_http_tunnel_active`。
+这些 reason 的字符串与 CONNECT 相同，但明文 HTTP 调用 §7.1 的 `FailHTTP`、`RejectHTTP`、`AbortHTTP`、`ObserveHTTP` 和 `EnterHTTPTunnel`，不调用 `Fail502`、`ObserveConnect` 或 `EnterTunnel`。L2 的 CONNECT 返回 200 时请求还没结束，不在这一步记 `ok`。`ok` 记在源站最终状态行完整写给客户端的时刻。最终状态行是 code ≥ 200，或 101；`100` 和其他 1xx 不是。明文 HTTP 不向客户端写 L1 自己的 `200`，在途隧道看 `proxy_http_tunnel_active`。
 
 失败响应带 `Content-Length: 0` 和 `Connection: close`，随后关掉客户端连接。CONNECT 路径的失败响应格式不变。
 
@@ -504,8 +504,8 @@ v0.7 把明文 HTTP 算进 SLI，并且单独成指标。不在 `proxy_connect_l
 | `l2_response` | 读不到 L2 的 CONNECT 状态行；或隧道起来之后、最终状态行还没完整写给客户端时，读不到合法的源站头。等 L2 的 10 秒里客户端已经离开、但没有并行读泵，读超时仍是这个结果，见 §5.6 | 同上。已经向客户端写过源站字节（含 `100`）就不再补 502 |
 | `l2_auth` | L2 的 CONNECT 响应是 407。源站自己的 HTTP 状态不算 | 同上，客户端收到 407 |
 | `l2_status` | L2 的 CONNECT 响应不是 200 也不是 407。源站的 4xx/5xx 不是这个结果 | 同上，客户端收到 502 |
-| `client_gone` | 还没有完整写出 code ≥ 200 的状态行，客户端把正文断开，或客户端收不下这块头。明文 HTTP 没有 CONNECT 那条 `clientGone` 泵 | 只进 `proxy_http_client_abort_total`，不进失败率 |
-| `ok` | 源站最终状态行（code ≥ 200，含 101）完整写给客户端。源站的 4xx/5xx 也算。`100` 不算 | 不加失败 |
+| `client_gone` | 还没有完整写出最终状态行，客户端把正文断开，或客户端收不下这块头。最终状态行是 code ≥ 200，或 101。明文 HTTP 没有 CONNECT 那条 `clientGone` 泵 | 只进 `proxy_http_client_abort_total`，不进失败率 |
+| `ok` | 源站最终状态行完整写给客户端。最终状态行是 code ≥ 200，或 101。源站的 4xx/5xx 也算。`100` 和其他 1xx 不算。101 小于 200，但切换协议之后没有另一条最终状态，所以它单独算 | 不加失败 |
 
 不进这张直方图的路径：口令错误、口令或用户名含 CR/LF、没有 `node_id`、目标不合法、`Resolve` 失败。前四项进 `proxy_http_client_reject_total`，`no_upstream` 只进失败计数。第一条请求的头部没读完就失败时，方法还不一定分得出来，仍记 CONNECT 的 `proxy_client_reject_total`。方法已经不是 `CONNECT` 之后的坏头记 `proxy_http_client_reject_total`。
 
@@ -2261,7 +2261,8 @@ func openUpstream(session *httpSession, username, password, nodeID, target strin
 // relay 把改写后的请求写入隧道，再把源站响应原样写回客户端。
 // Expect: 100-continue 时先只写头，等源站的 100 之后才写正文；源站直接给最终响应则不写正文。
 // 已经向客户端写出过源站字节之后，后续失败只关连接，不再补 502。
-// ok 记在最终状态行（code >= 200，含 101）完整写给客户端的时刻。1xx 不是 ok。
+// ok 记在最终状态行完整写给客户端的时刻。最终状态行是 code >= 200，或 101。
+// 100 和其他 1xx 不是 ok。101 小于 200，但它是这条请求的最终状态。
 // 源站自己的 4xx/5xx 只要完整写出，对这条代理来说仍是 ok。
 func (u *upstream) relay(client net.Conn, clientMode *modeConn, clientBR *bufio.Reader, req *absReq, try *httpTry) (relayOutcome, error) {
 	if try.started.IsZero() {
@@ -2318,7 +2319,7 @@ func (u *upstream) relay(client net.Conn, clientMode *modeConn, clientBR *bufio.
 			return relayOutcome{endClient: true}, werr
 		}
 		sent = true
-		if meta.code >= 200 {
+		if meta.code >= 200 || meta.code == http.StatusSwitchingProtocols {
 			try.observe(l1metrics.ResultOK)
 		}
 		if meta.code == http.StatusSwitchingProtocols {
