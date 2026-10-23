@@ -1,9 +1,10 @@
 # OpenSpec 设计文档：多级高性能隧道代理（Pro 模式）
 
-- **文档版本**：v0.6（HTTP 流程与链路安全）
-- **日期**：2026-10-22
+- **文档版本**：v0.7（明文 HTTP 计入 SLI）
+- **日期**：2026-10-23
 - **状态**：Draft / 可进入 PoC
 - **目标**：参考商业隧道代理 Pro 模式，设计“一级代理 + 二级代理”多级转发系统，支持通过 `username` 指定二级节点、TLS 指纹透传、应用层与 eBPF 监控、etcd 自动服务发现。
+- **v0.7 变更**：明文 HTTP 的计数纳入 SLI，单独成一套指标，不改 CONNECT 指标的名字和标签。每条 absolute-form 请求观察 `proxy_http_request_latency_ms{node_id,result}`，`result` 与建连直方图同一组八个值。另有失败、本地拒绝、`client_gone`、在途隧道、隧道时长和两个方向的字节。`proxy_conn_active` 只统计已经向客户端写出 CONNECT `200` 的隧道；明文 HTTP 用 `proxy_http_tunnel_active`，在 L2 返回 `200` 时加一，不向客户端写 L1 自己的 `200`。计量事件 `v` 改为 2，增加 `protocol`（`connect` 或 `http`）。§7.3 按协议分开告警，并给出两侧加总的失败率。§8 未改。
 - **v0.6 变更**：补上明文 HTTP（非 CONNECT）和 L1→L2 链路。明文 HTTP 由 L1 鉴权、按最后一个 `@` 切出 `node_id`，再向 gost 发一次 `CONNECT`，把 absolute-form 改成 origin-form 并删掉逐跳头，其余头行按原字节转发。不把 absolute-form 交给 gost 的 HTTP 转发：gost v3.3.1 会重排头、改大小写并注入 `User-Agent`。L1→L2 走内网，不加密、不做 mTLS；两端都不终结客户端 TLS。共享口令在内网明文传输写进 §12，作为已接受项，前提是内网隔离且 L2 只监听内网地址。§1.2、§2.1 与 §3 的 gost 示例与此对齐。§7、§8 未改。
 - **v0.5 变更**：建连时延增加闭合的 `result` 标签，拨号之后的成功和失败都观察，§7.3 的 P95 与成功样本只取 `result="ok"`。补回隧道时长 `proxy_tunnel_duration_seconds`，并增加两个方向的字节计数 `proxy_tunnel_bytes_total`。等待 L2 状态行时客户端读泵先结束记 `proxy_client_abort_total{reason="client_gone"}`，不记 `l2_response`，不进上游失败率。用户名和目标域名走计量事件，不进 Prometheus 标签。商业统计对照见附录 B，开源管理面结论见附录 C。
 - **v0.4 变更**：落地 L2 向 etcd 的注册（issue #5），并吸收 v0.3.1 的文档勘误，不另立版本号。节点是虚拟机，admin 是 Go，进程内调用 `registrar`；`nodeId` 来自环境变量 `RELAY_NODE_ID`。key 为 `/relay/l2/{nodeId}`，`value.addr` 是内网地址。每台虚拟机一个 lease（TTL 10s，每 3s 续租）。一次拨号加出口校验约 5s、失败率低于 1%；计划内重拨后出口 IP 必须变化，否则不注册。巡检每 1 分钟，外网或 CPU/内存异常都 Delete key。同一宿主机异常时一批 key 一起过期。详见 §8。勘误（原 v0.3.1）：§10 示例对空口令显式回 `407`；§10 与 §12 写明整条隧道空闲兜底（默认 5 分钟）会关掉长时间静默的 WebSocket、长轮询等长连接，应用需自带心跳，TCP keepalive 不算数据；§4.2 TunnelForwarder 补上 L2 `407` 透传和两级空闲计时；附录 A.5 写明缺端口回 `400`；§4.1 架构图删去 L2 到 Prometheus 的指标连线，gost 自带指标不在 M1；§7.3 注明等待 L2 应答时客户端先断开也计入 `l2_response`。v0.2.1 变更说明补全了当时引入的 400/407 规则。
@@ -328,7 +329,7 @@ Upgrade（含 WebSocket）要同时满足：有非空的 `Upgrade`，并且 `Con
 | L2 返回 407 | 407，原样带上 `Proxy-Authenticate` | 是 | `l2_auth` |
 | L2 的其他非 200 | 502 | 是 | `l2_status` |
 
-这些 reason 复用 §7.1 已有的标签，参考代码调用同一组 `l1metrics` 函数。L2 的 CONNECT 返回 200 时 `ObserveConnect`，`result` 取 `ok`，隧道还活着就保持 `EnterTunnel`。明文 HTTP 没有「向客户端写 200」这一步，和 §7.1 里 gauge 帮助文本并不完全一致。§7 仍写着明文 HTTP 的计数不在本文件决定，本节不改 §7。
+这些 reason 的字符串与 CONNECT 相同，但明文 HTTP 调用 §7.1 的 `FailHTTP`、`RejectHTTP`、`AbortHTTP`、`ObserveHTTP` 和 `EnterHTTPTunnel`，不调用 `Fail502`、`ObserveConnect` 或 `EnterTunnel`。L2 的 CONNECT 返回 200 时请求还没结束，不在这一步记 `ok`。`ok` 记在源站最终状态行完整写给客户端的时刻。明文 HTTP 不向客户端写 L1 自己的 `200`，在途隧道看 `proxy_http_tunnel_active`。
 
 失败响应带 `Content-Length: 0` 和 `Connection: close`，随后关掉客户端连接。CONNECT 路径的失败响应格式不变。
 
@@ -400,16 +401,16 @@ CONNECT 的 `200` 里 gost 会带 `Proxy-Agent`。这行写给 L1，不写进源
 
 指标有两个来源，都进 Prometheus，采集位置不同。用户名、目标域名、客户端地址不进 Prometheus，走 §7.1 的计量事件。
 
-- **应用层（M1）**：L1 进程用 `prometheus/client_golang` 暴露下面这些指标。建连时延、活跃隧道、上游失败在请求路径上更新。路由表规模在刷新本地缓存时更新。前三项仍是 §7.3 的 SLI；建连时延只把 `result="ok"` 当作成功样本。
+- **应用层（M1）**：L1 进程用 `prometheus/client_golang` 暴露下面这些指标。CONNECT 与明文 HTTP 各有一组时延、在途隧道和上游失败，在各自的路径上更新。路由表规模在刷新本地缓存时更新。两组都进入 §7.3 的 SLI；时延只把 `result="ok"` 当作成功样本。
 - **内核（M2）**：eBPF Agent 采集 `kernel_tcp_retrans_total`、RTT、run queue latency 等内核网络与系统指标。
 
 ### 7.1 应用层指标（M1）
 
 L1 在独立的管理监听地址上提供 `/metrics`。管理端口与代理端口分开，不接受 `CONNECT`，也不检查 `Proxy-Authorization`。每个 L1 副本暴露自己的值，集群总量由 Prometheus 聚合。默认 registry 同时导出 client_golang 自带的 Go 运行时和进程指标。
 
-本节的 SLI 仍是 `proxy_conn_active`、`proxy_connect_latency_ms`、`proxy_upstream_fail_total`。`proxy_client_reject_total` 只计拨号 L2 之前的本地拒绝。`proxy_client_abort_total` 只计 `client_gone`。这两项都不进 §7.3 的失败率。时长、字节、节点池和计量丢弃用于容量和排障，不单独设 2% / 200ms 那两条告警。
+CONNECT 的 SLI 是 `proxy_conn_active`、`proxy_connect_latency_ms`、`proxy_upstream_fail_total`。明文 HTTP 的 SLI 是 `proxy_http_tunnel_active`、`proxy_http_request_latency_ms`、`proxy_http_upstream_fail_total`。两边的本地拒绝和 `client_gone` 都不进 §7.3 的失败率。时长、字节、节点池和计量丢弃用于容量和排障，不单独设 2% / 200ms 告警。
 
-L2 不负责这些指标。gost 自带的 metrics/observer 不在 M1 范围内，见附录 C。本版只覆盖 CONNECT 隧道；明文 HTTP 的计数不在本文件决定。
+L2 不负责这些指标。gost 自带的 metrics/observer 不在 M1 范围内，见附录 C。CONNECT 与明文 HTTP 分属两套指标名，不在 CONNECT 指标上加 `protocol` 标签。
 
 标签取值有上界：
 
@@ -423,7 +424,7 @@ L2 不负责这些指标。gost 自带的 metrics/observer 不在 M1 范围内�
 
 不使用目标主机、URL、用户名、源地址或错误原文做 Prometheus 标签。
 
-`result` 把建连直方图的序列数乘了 8。上限是「路由表 node_id 数 × 8 ×（10 个桶 + `_sum` + `_count`）」。4000 个节点时约 38.4 万条，并且只在该 `(node_id, result)` 真实出现后才创建。时长直方图是「节点数 ×（8 个桶 + `_sum` + `_count`）」。字节计数是「节点数 × 2」。这是 v0.5 接受的预算，不再加第三枚业务标签。
+`result` 把建连直方图的序列数乘了 8。上限是「路由表 node_id 数 × 8 ×（10 个桶 + `_sum` + `_count`）」。4000 个节点时 `proxy_connect_latency_ms` 约 38.4 万条，并且只在该 `(node_id, result)` 真实出现后才创建。时长直方图是「节点数 ×（8 个桶 + `_sum` + `_count`）」。字节计数是「节点数 × 2」。这是 v0.5 接受的 CONNECT 预算。v0.7 不在这组指标上再加标签。明文 HTTP 是平行的另一套名字，预算见下文，同样只在标签组合真实出现后才创建。
 
 #### 建连时延的 result
 
@@ -489,35 +490,85 @@ v0.2 的采集范围写过连接时长分布，v0.3 的指标表里没有这项�
 - `proxy_l2_nodes{state="not_ready"}`：在表里但当前没有健康地址的 node_id 个数。
 - `proxy_l2_healthy_addrs`：健康地址条数，无标签。地址字符串不进标签。一个 node_id 可以对应多个地址，所以它不等于 ready 节点数。v1 若一节点一个出口地址，两者相等，这个数就是在用的出口地址数。它不是去重后的公网 IP，也不是供应商那种按国家拆开的池大小。出口国家或 AZ 用 node_id 去对注册信息，不在 L1 上猜。
 
+#### 明文 HTTP
+
+v0.7 把明文 HTTP 算进 SLI，并且单独成指标。不在 `proxy_connect_latency_ms` 上加 `protocol` 标签：那会改掉已经在用的 CONNECT 序列，也会把两种时钟混进同一个分位。CONNECT 的样本在 L2 返回 `200` 时结束，不含源站的 HTTP。明文 HTTP 的样本是一条请求，常常含源站状态行的等待，keep-alive 复用时还不含拨号。
+
+一条 absolute-form 请求一个样本，不是一条 L2 隧道一个。同一条客户端连接上的下一条请求再记一次。
+
+| `result` | 什么时候 | 失败计数 |
+| --- | --- | --- |
+| `dial` | 这条请求新开隧道，`dialUpstream` 失败 | `proxy_http_upstream_fail_total` |
+| `l2_write` | 向 L2 写出 `CONNECT` 失败，或把请求头、正文写进隧道失败。客户端已经看到源站字节时不再补 502，计数仍然加 | 同上 |
+| `l2_deadline` | 等 L2 的 CONNECT 状态行时 `SetReadDeadline` 失败 | 同上 |
+| `l2_response` | 读不到 L2 的 CONNECT 状态行；或隧道起来之后、最终状态行还没完整写给客户端时，读不到合法的源站头。等 L2 的 10 秒里客户端已经离开、但没有并行读泵，读超时仍是这个结果，见 §5.6 | 同上。已经向客户端写过源站字节（含 `100`）就不再补 502 |
+| `l2_auth` | L2 的 CONNECT 响应是 407。源站自己的 HTTP 状态不算 | 同上，客户端收到 407 |
+| `l2_status` | L2 的 CONNECT 响应不是 200 也不是 407。源站的 4xx/5xx 不是这个结果 | 同上，客户端收到 502 |
+| `client_gone` | 还没有完整写出 code ≥ 200 的状态行，客户端把正文断开，或客户端收不下这块头。明文 HTTP 没有 CONNECT 那条 `clientGone` 泵 | 只进 `proxy_http_client_abort_total`，不进失败率 |
+| `ok` | 源站最终状态行（code ≥ 200，含 101）完整写给客户端。源站的 4xx/5xx 也算。`100` 不算 | 不加失败 |
+
+不进这张直方图的路径：口令错误、口令或用户名含 CR/LF、没有 `node_id`、目标不合法、`Resolve` 失败。前四项进 `proxy_http_client_reject_total`，`no_upstream` 只进失败计数。第一条请求的头部没读完就失败时，方法还不一定分得出来，仍记 CONNECT 的 `proxy_client_reject_total`。方法已经不是 `CONNECT` 之后的坏头记 `proxy_http_client_reject_total`。
+
+计时：新开隧道时从 `dialUpstream` 之前起算，含拨号、L2 的 CONNECT，直到上表的结果。复用已有隧道时从把这条请求写进隧道起算，不含拨号。`ok` 停在最终状态行写完，不含后面的正文，也不含 101 之后的字节隧道。
+
+只写出了 `100`、最终状态行还没写成：
+
+- 接着读源站失败：`l2_response`。客户端已经看到 `100`，不再补 502，失败计数仍然加。
+- 客户端不再给正文，或不再收：`client_gone`。不补 502，不进失败率。
+
+最终状态行已经完整写出之后，正文或 101 隧道里的错误不改 `ok`，也不加失败计数。`Expect: 100-continue` 的 `417` 只要把 `417` 写给了客户端，就是 `ok`：代理把源站的决定交出去了。101 的请求延迟停在状态行写完；之后的双向拷贝只进字节和隧道时长。
+
+`proxy_http_tunnel_active` 在 L2 的 CONNECT 返回 200 时加一，这条隧道关闭时减一。明文 HTTP 不向客户端写 `200 Connection Established`，所以不用 `proxy_conn_active`。一条客户端连接至多握住一条 L2 隧道；keep-alive 复用期间 gauge 保持 1，不按请求加减。`proxy_http_tunnel_duration_seconds` 从这次 L2 `200` 到隧道关闭，中间空等下一条请求的时间算在里面。没拿到 L2 `200` 的请求不进时长。
+
+`proxy_http_bytes_total` 的 `up` 是 L2 `200` 之后写进隧道的请求字节，不含发往 L2 的那条 CONNECT。`down` 是写给客户端的源站字节，含 1xx、最终响应和 101 之后的原始字节。
+
+`result` 与 CONNECT 是同一组八个字符串。`ObserveHTTP` 收到集合外的值直接返回。`FailHTTP` 只接受七个失败 reason，`AbortHTTP` 只接受 `client_gone`，`RejectHTTP` 只接受四个本地拒绝。写错的字符串不创建序列。
+
+4000 个节点、每个闭合组合都出现过时的上限：
+
+| 指标 | 怎么乘 | 序列上限 |
+| --- | --- | --- |
+| `proxy_http_request_latency_ms` | 4000 × 8 个 result ×（10 个桶 + `_sum` + `_count`） | 384000 |
+| `proxy_http_tunnel_duration_seconds` | 4000 ×（8 个桶 + `_sum` + `_count`） | 40000 |
+| `proxy_http_bytes_total` | 4000 × 2 个 direction | 8000 |
+| `proxy_http_upstream_fail_total` | 4000 × 7 个 reason | 28000 |
+| `proxy_http_client_abort_total` | 4000 × 1 个 reason | 4000 |
+| `proxy_http_tunnel_active` | 4000 个 node_id | 4000 |
+| `proxy_http_client_reject_total` | 4 个 reason，没有 node_id | 4 |
+| 合计 | | 468004 |
+
+用户名、目标域名、客户端地址不在这些标签里。CONNECT 那套的序列数不因 v0.7 增加。
+
 #### 计量事件
 
 Prometheus 回答「这个节点现在健不健康」。按用户、按目标域名的流量和请求数会把标签做成无界集合，不放进 Prometheus。认证通过之后，每次尝试结束发一条 `MeterEvent`。口令错误、口令为空、用户名或口令含 CR/LF，都不发事件，也不记录对方提交的用户名。
 
 | 字段 | 含义 |
 | --- | --- |
-| `v` | 固定为 1 |
-| `result` | 认证通过之后的结果：`no_node`、`bad_target`、`no_upstream`，或建连直方图那八个值（含 `ok` 和 `client_gone`） |
+| `v` | 固定为 2。v0.5 写出的是 1，没有 `protocol`；读到 1 时把协议当成 `connect` |
+| `protocol` | `connect` 或 `http`。只出现在事件里，不是 Prometheus 标签 |
+| `result` | 认证通过之后的结果：`no_node`、`bad_target`、`no_upstream`，或时延直方图那八个值（含 `ok` 和 `client_gone`） |
 | `user` | 最后一个 `@` 之前的那一段。v1 没有独立子账号对象，以后按子账号汇总就用这个字段 |
 | `node_id` | 用户名里请求的那一段，路由表没有也原样保留。Prometheus 的 `node_id` 标签仍然失败关闭 |
 | `target_host` / `target_port` | `CONNECT` 的 authority。没有路径，没有 URL |
 | `client_ip` | `clientConn.RemoteAddr()`。没有地址就省略 |
-| `handshake_ms` | 与 `ObserveConnect` 同一次尝试的毫秒数。拨号之前的结果没有这个字段 |
-| `tunnel_sec` | 建成隧道时才有，与时长直方图是同一次测量 |
-| `bytes_up` / `bytes_down` | 与字节计数同一批 `io.Copy` 写入量 |
+| `handshake_ms` | CONNECT 是 `ObserveConnect` 的毫秒数。明文 HTTP 是 `ObserveHTTP` 的毫秒数。拨号之前、以及还没开始写复用隧道的结果没有这个字段 |
+| `tunnel_sec` | 只在 CONNECT 建成隧道时有，与 `proxy_tunnel_duration_seconds` 是同一次测量。明文 HTTP 的隧道可能比这一条请求活得长，事件里留空，时长只看 `proxy_http_tunnel_duration_seconds` |
+| `bytes_up` / `bytes_down` | CONNECT 是整条隧道的 `io.Copy` 写入量。明文 HTTP 只含这一条请求写进隧道和写给客户端的字节 |
 
-`TryEmit` 写入容量 1024 的通道。满了就丢，并增加无标签的 `proxy_meter_drop_total`。转发路径不因计量阻塞。一个进程只有一个消费者，不要 close 这条通道。`ServeMeter` 把事件写成 JSON 行，接到独立日志，不和调试日志混在一起。
+`TryEmit` 把 `v` 写成 2，写入容量 1024 的通道。满了就丢，并增加无标签的 `proxy_meter_drop_total`。转发路径不因计量阻塞。一个进程只有一个消费者，不要 close 这条通道。`ServeMeter` 把事件写成 JSON 行，接到独立日志，不和调试日志混在一起。明文 HTTP 在认证通过后按请求发事件，`protocol` 为 `http`。CONNECT 的 `protocol` 为 `connect`。
 
 | 路径 | 适合放什么 | 代价 |
 | --- | --- | --- |
 | Prometheus | 闭合标签上的 SLI、告警、节点并发、节点字节、节点池 | 每加一枚无界标签，序列数随用户或域名涨。4000 节点再乘域名会到百万级，抓取和查询都会坏 |
 | JSON 行，由采集端送进 Loki | 排障、按请求追查。§9.1 已把 Loki 列为可选项，M1 不必先部署新数据库 | 按用户做跨月加总又贵又慢，不拿它当账本 |
-| 同一份 JSON 再进 ClickHouse | 按用户、域名、节点算流量、请求数、成功率、分位建连时延 | 多一个存储。M1 不部署，只把 schema 定成 `v=1` |
+| 同一份 JSON 再进 ClickHouse | 按用户、域名、节点算流量、请求数、成功率、分位时延 | 多一个存储。M1 不部署，只把 schema 定成 `v=2`。读到没有 `protocol` 的 `v=1` 时，协议按 `connect` 计 |
 
 M1 先打 JSON 行。仓库查询要按用户或域名出报表时再把同一份事件导入 ClickHouse。事件里可以做的报表：某用户的上下行字节和尝试数、某域名的 `ok` 占比、某节点被哪些域名使用。出口国家或 AZ 用 `node_id` 连接注册信息，不在事件里写一个 L1 推断出来的国家。
 
 | 指标 | 类型 | 标签 | 含义 |
 | --- | --- | --- | --- |
-| `proxy_conn_active` | Gauge | `node_id` | 已经向客户端写出 `200`、`handleConnect` 尚未返回的隧道数。客户端断开后 gauge 仍可能多计这条隧道：半关闭后反方向空闲最长再等 `halfCloseIdleTimeout`（默认 30s）；两边都没有字节时由 `tunnelIdleTimeout`（默认 5 分钟）收尸 |
+| `proxy_conn_active` | Gauge | `node_id` | 只统计 CONNECT。已经向客户端写出 `200 Connection Established`、`handleConnect` 尚未返回的隧道数。明文 HTTP 不加这个 gauge。客户端断开后 gauge 仍可能多计这条隧道：半关闭后反方向空闲最长再等 `halfCloseIdleTimeout`（默认 30s）；两边都没有字节时由 `tunnelIdleTimeout`（默认 5 分钟）收尸 |
 | `proxy_connect_latency_ms` | Histogram | `node_id`, `result` | 从开始拨号 L2 到该次尝试结束的毫秒数。抓取文本里的桶列为 `proxy_connect_latency_ms_bucket`，同族还有 `_sum` 与 `_count`。未过滤的 `_count` 含全部 8 个 result |
 | `proxy_tunnel_duration_seconds` | Histogram | `node_id` | 已建成隧道的存活秒数。桶列为 `proxy_tunnel_duration_seconds_bucket` |
 | `proxy_tunnel_bytes_total` | Counter | `node_id`, `direction` | 隧道载荷字节，`up` 或 `down` |
@@ -527,10 +578,17 @@ M1 先打 JSON 行。仓库查询要按用户或域名出报表时再把同一�
 | `proxy_l2_nodes` | Gauge | `state` | 路由表里的 node_id 数，`ready` 或 `not_ready` |
 | `proxy_l2_healthy_addrs` | Gauge | 无 | 健康 L2 地址条数 |
 | `proxy_meter_drop_total` | Counter | 无 | 计量队列满而丢弃的事件数 |
+| `proxy_http_request_latency_ms` | Histogram | `node_id`, `result` | 一条明文请求从拨号前（复用隧道则从写出请求起）到结果确定的毫秒数。桶与 CONNECT 相同。`result="ok"` 停在源站最终状态行写完 |
+| `proxy_http_tunnel_active` | Gauge | `node_id` | 明文 HTTP 握住的 L2 隧道数。L2 的 CONNECT 返回 200 时加一，隧道关闭时减一。不看有没有向客户端写过 `200` |
+| `proxy_http_tunnel_duration_seconds` | Histogram | `node_id` | 上一条 gauge 对应的存活秒数，含两条请求之间的空等。桶与 CONNECT 的隧道时长相同 |
+| `proxy_http_bytes_total` | Counter | `node_id`, `direction` | 明文请求的载荷。`up` 不含发往 L2 的 CONNECT。`down` 含 1xx 和 101 之后的字节 |
+| `proxy_http_upstream_fail_total` | Counter | `node_id`, `reason` | 明文请求没完成。reason 与 `proxy_upstream_fail_total` 相同，不含 `client_gone`。已经写出源站字节时客户端不再收到补上的 502，计数仍然加 |
+| `proxy_http_client_reject_total` | Counter | `reason` | 明文请求在拨 L2 之前的本地 400 / 407。没有 `node_id` |
+| `proxy_http_client_abort_total` | Counter | `node_id`, `reason` | 明文请求的 `client_gone`。不进失败率 |
 
-`502` 与 L2 的 `407`（`l2_auth`）进入 `proxy_upstream_fail_total`。本地 `400` / `407` 只进入 `proxy_client_reject_total`。`client_gone` 只进入 `proxy_client_abort_total` 和建连直方图的 `result="client_gone"`。
+CONNECT 的 `502` 与 L2 的 `407`（`l2_auth`）进入 `proxy_upstream_fail_total`。明文 HTTP 的对应结果进入 `proxy_http_upstream_fail_total`，不进 CONNECT 那条计数。两边的本地 `400` / `407` 只进入各自的 `proxy_client_reject_total` 或 `proxy_http_client_reject_total`。`client_gone` 只进入对应的 abort 计数和该协议直方图的 `result="client_gone"`。
 
-下面是注册与打点函数。打点落在 §10 `handleConnect` 的这些位置，常量都是导出的，另一个包可以引用：
+下面是注册与打点函数。CONNECT 的打点落在 §10 `handleConnect` 的这些位置，明文 HTTP 落在 §10.1，调用另一组函数。常量都是导出的，另一个包可以引用：
 
 1. 用户名或口令含 CR/LF，以及口令为空或不匹配：`RejectClient`，再 `reply`。不 `TryEmit`。
 2. 认证通过后打开发事件。没有 `node_id`：`finish(ReasonRejectNoNode)` 和 `RejectClient`。`target` 不合法：`finish(ReasonRejectBadTarget)` 和 `RejectClient`。这两处还没拨号，`finish` 不调用 `ObserveConnect`。
@@ -602,6 +660,10 @@ const (
 	DirUp   = "up"
 	DirDown = "down"
 
+	// ProtocolConnect 与 ProtocolHTTP 只写进计量事件，不是 Prometheus 标签。
+	ProtocolConnect = "connect"
+	ProtocolHTTP    = "http"
+
 	StateReady    = "ready"
 	StateNotReady = "not_ready"
 
@@ -612,7 +674,7 @@ const (
 var (
 	proxyConnActive = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "proxy_conn_active",
-		Help: "已经向客户端返回 200、handleConnect 尚未返回的 L1 隧道数。客户端断开后最多滞后 30s（半关闭空闲）或 5 分钟（隧道空闲）。",
+		Help: "只统计 CONNECT。已经向客户端写出 200 Connection Established、handleConnect 尚未返回的隧道数。明文 HTTP 不写 L1 自己的 200，不进这个 gauge。客户端断开后最多滞后 30s（半关闭空闲）或 5 分钟（隧道空闲）。",
 	}, []string{"node_id"})
 
 	proxyConnectLatency = prometheus.NewHistogramVec(prometheus.HistogramOpts{
@@ -662,6 +724,43 @@ var (
 		Help: "计量事件队列已满而丢弃的条数。",
 	})
 
+	proxyHTTPRequestLatency = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "proxy_http_request_latency_ms",
+		Help:    "一条明文 HTTP 请求从拨号前（复用隧道则从写出请求起）到结果确定的毫秒数。result 与 proxy_connect_latency_ms 同一组八个值。ok 停在源站最终状态行写完。",
+		Buckets: []float64{5, 10, 25, 50, 100, 200, 500, 1000, 3000, 10000},
+	}, []string{"node_id", "result"})
+
+	proxyHTTPTunnelActive = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "proxy_http_tunnel_active",
+		Help: "明文 HTTP 握住的 L2 隧道数。L2 的 CONNECT 返回 200 时加一，隧道关闭时减一。明文 HTTP 不向客户端写 L1 自己的 200，所以不用 proxy_conn_active。",
+	}, []string{"node_id"})
+
+	proxyHTTPTunnelDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "proxy_http_tunnel_duration_seconds",
+		Help:    "明文 HTTP 的 L2 隧道从 L2 返回 200 到关闭的秒数，含两条请求之间的空等。",
+		Buckets: []float64{1, 5, 15, 30, 60, 300, 900, 3600},
+	}, []string{"node_id"})
+
+	proxyHTTPBytes = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "proxy_http_bytes_total",
+		Help: "明文 HTTP 载荷。up 是 L2 返回 200 之后写进隧道的请求字节，不含发往 L2 的 CONNECT。down 是写给客户端的源站字节，含 1xx 和 101 之后的原始字节。",
+	}, []string{"node_id", "direction"})
+
+	proxyHTTPUpstreamFail = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "proxy_http_upstream_fail_total",
+		Help: "明文请求没有完成。reason 与 proxy_upstream_fail_total 相同，不含 client_gone。已经写出源站字节时不再补 502，计数仍然加。",
+	}, []string{"node_id", "reason"})
+
+	proxyHTTPClientReject = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "proxy_http_client_reject_total",
+		Help: "明文请求在拨 L2 之前，L1 本地返回 400 或 407 的次数。没有 node_id。",
+	}, []string{"reason"})
+
+	proxyHTTPClientAbort = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "proxy_http_client_abort_total",
+		Help: "明文请求在最终状态行完整写出之前客户端离开。reason 只有 client_gone。不进失败率。",
+	}, []string{"node_id", "reason"})
+
 	meterEvents = make(chan MeterEvent, MeterQueue)
 )
 
@@ -677,6 +776,13 @@ func init() {
 		proxyL2Nodes,
 		proxyL2HealthyAddrs,
 		proxyMeterDrop,
+		proxyHTTPRequestLatency,
+		proxyHTTPTunnelActive,
+		proxyHTTPTunnelDuration,
+		proxyHTTPBytes,
+		proxyHTTPUpstreamFail,
+		proxyHTTPClientReject,
+		proxyHTTPClientAbort,
 	)
 }
 
@@ -752,8 +858,90 @@ func AddTunnelBytes(nodeID, direction string, n int64) {
 
 // EnterTunnel 在向客户端写出 200 成功之后调用。返回值在 handleConnect 返回时把 gauge 减一。
 // 客户端断开后，减一仍可能再等半关闭空闲（默认 30s）或隧道空闲（默认 5 分钟）。
+// 明文 HTTP 不调用它：那条路径不写 L1 自己的 200。
 func EnterTunnel(nodeID string) (leave func()) {
 	gauge := proxyConnActive.WithLabelValues(nodeID)
+	gauge.Inc()
+	return gauge.Dec
+}
+
+func knownHTTPFail(reason string) bool {
+	switch reason {
+	case ReasonNoUpstream, ReasonDial, ReasonL2Write, ReasonL2Deadline, ReasonL2Response, ReasonL2Status, ReasonL2Auth:
+		return true
+	default:
+		return false
+	}
+}
+
+func knownHTTPReject(reason string) bool {
+	switch reason {
+	case ReasonRejectAuth, ReasonRejectNoNode, ReasonRejectBadTarget, ReasonRejectBadCredential:
+		return true
+	default:
+		return false
+	}
+}
+
+// FailHTTP 增加 proxy_http_upstream_fail_total。
+// reason 只取七个上游失败值，不含 client_gone。其它字符串直接丢掉，避免新标签。
+// 已经向客户端写出过源站字节时，调用方不再补 502，这个计数仍然加。
+func FailHTTP(nodeID, reason string) {
+	if !knownHTTPFail(reason) {
+		return
+	}
+	proxyHTTPUpstreamFail.WithLabelValues(nodeID, reason).Inc()
+}
+
+// RejectHTTP 记录明文请求在拨 L2 之前的本地 400 或 407。
+// reason 只取四个本地拒绝。没有 node_id 标签。
+func RejectHTTP(reason string) {
+	if !knownHTTPReject(reason) {
+		return
+	}
+	proxyHTTPClientReject.WithLabelValues(reason).Inc()
+}
+
+// AbortHTTP 记录明文请求的 client_gone。其它 reason 直接丢掉。
+func AbortHTTP(nodeID, reason string) {
+	if reason != ReasonClientGone {
+		return
+	}
+	proxyHTTPClientAbort.WithLabelValues(nodeID, reason).Inc()
+}
+
+// ObserveHTTP 记录一条明文请求从 started 到结果确定的毫秒数。
+// result 与 ObserveConnect 是同一组八个字符串，但是另一条直方图。写错或 started 为零都不观察。
+func ObserveHTTP(nodeID, result string, started time.Time) {
+	if started.IsZero() || !knownConnectResult(result) {
+		return
+	}
+	elapsed := float64(time.Since(started)) / float64(time.Millisecond)
+	proxyHTTPRequestLatency.WithLabelValues(nodeID, result).Observe(elapsed)
+}
+
+// ObserveHTTPTunnel 记录一条明文 HTTP 的 L2 隧道从 L2 返回 200 到关闭的秒数。
+// 中间空等下一条请求的时间算在里面。started 为零不观察。
+func ObserveHTTPTunnel(nodeID string, started time.Time) {
+	if started.IsZero() {
+		return
+	}
+	proxyHTTPTunnelDuration.WithLabelValues(nodeID).Observe(time.Since(started).Seconds())
+}
+
+// AddHTTPBytes 累加明文请求的载荷。up 不含发往 L2 的 CONNECT。
+// n <= 0 或 direction 不是 up/down 时不记。
+func AddHTTPBytes(nodeID, direction string, n int64) {
+	if n <= 0 || (direction != DirUp && direction != DirDown) {
+		return
+	}
+	proxyHTTPBytes.WithLabelValues(nodeID, direction).Add(float64(n))
+}
+
+// EnterHTTPTunnel 在 L2 的 CONNECT 返回 200 时调用。明文 HTTP 不向客户端写 L1 自己的 200。
+// 返回值在这条 L2 隧道关闭时把 gauge 减一。keep-alive 复用期间不反复加减。
+func EnterHTTPTunnel(nodeID string) (leave func()) {
+	gauge := proxyHTTPTunnelActive.WithLabelValues(nodeID)
 	gauge.Inc()
 	return gauge.Dec
 }
@@ -768,10 +956,11 @@ func SetL2Inventory(readyNodes, notReadyNodes, healthyAddrs int) {
 }
 
 // MeterEvent 是一条尝试的计量事件。认证失败不产生事件。
-// 用户名、目标主机、客户端地址只出现在这里，不出现在 Prometheus 标签里。
+// Protocol 是 connect 或 http，只出现在事件里。用户名、目标主机、客户端地址同样不进 Prometheus 标签。
 // NodeID 是用户名里请求的那一段，可以是路由表没有的值；Prometheus 的 node_id 仍然失败关闭。
 type MeterEvent struct {
 	V           int     `json:"v"`
+	Protocol    string  `json:"protocol,omitempty"`
 	Result      string  `json:"result"`
 	User        string  `json:"user,omitempty"`
 	NodeID      string  `json:"node_id,omitempty"`
@@ -785,8 +974,9 @@ type MeterEvent struct {
 }
 
 // TryEmit 非阻塞写入。队列满则丢弃并增加 proxy_meter_drop_total。
+// v 固定写成 2。没有 protocol 的 v=1 事件按 connect 读。
 func TryEmit(ev MeterEvent) {
-	ev.V = 1
+	ev.V = 2
 	select {
 	case meterEvents <- ev:
 	default:
@@ -811,7 +1001,7 @@ func ServeMeter(w io.Writer) {
 
 ### 7.2 内核指标（M2，eBPF）
 
-M2 在一级与二级节点部署 eBPF Agent（如 Cilium，或自研 exporter），采集内核看到的网络与系统指标。连接数、CONNECT 时延、隧道时长、上下行字节和上游失败以 §7.1 为准。
+M2 在一级与二级节点部署 eBPF Agent（如 Cilium，或自研 exporter），采集内核看到的网络与系统指标。连接数、CONNECT 时延、明文 HTTP 请求时延、隧道时长、上下行字节和上游失败以 §7.1 为准。告警表达式在 §7.3，两条协议分开。
 
 - `kernel_tcp_retrans_total`：内核统计的 TCP 重传次数（Counter）。
 - RTT：TCP RTT 分布。
@@ -822,16 +1012,25 @@ M2 在一级与二级节点部署 eBPF Agent（如 Cilium，或自研 exporter�
 
 ### 7.3 告警建议
 
-应用层（M1，只用 §7.1 的三项 SLI）：
+应用层（M1）。CONNECT 和明文 HTTP 都算进 SLI，但时钟不同，所以失败率和 P95 按协议分开，再另给一条两侧加总的失败率。不合成一个 P95。
 
-- 5 分钟上游失败率 > 2%。分子是 `sum(increase(proxy_upstream_fail_total[5m]))`，包含 `no_upstream`、`dial`、`l2_write`、`l2_deadline`、`l2_response`、`l2_status` 和 `l2_auth`，不包含 `client_gone`，也不包含 `proxy_client_reject_total`。分母是该分子加上 `sum(increase(proxy_connect_latency_ms_count{result="ok"}[5m]))`。`client_gone` 不在分子里，也不在分母里，所以客户端离开既不抬高也不稀释这条比率。不要用未过滤的 `proxy_connect_latency_ms_count` 做分母：拨号之后的失败已经在分子里，再加进分母会算两次，`client_gone` 还会被算进分母。
-- 成功建连的 P95 > 200ms：`histogram_quantile(0.95, sum by (le) (rate(proxy_connect_latency_ms_bucket{result="ok"}[5m])))`。只统计 `result="ok"`。按节点告警时改为 `sum by (le, node_id) (rate(proxy_connect_latency_ms_bucket{result="ok"}[5m]))`。
+CONNECT 的 `ok` 停在 L2 返回 `200`，不含源站的 HTTP。明文 HTTP 的 `ok` 停在源站最终状态行写完，keep-alive 复用时还不含拨号。两套桶加在一起做分位，得到的不是任何一种请求的时延，所以没有「总体 P95」。
+
+失败率只报协议、不报加总时，两边各 1.5% 都不会越过 2% 的页，合在一起已经越线。只报加总、不报协议时，故障集中在一边会被另一边的成功样本稀释。两条协议的失败率都要告警，加总也要告警。
+
+`client_gone` 和本地拒绝都不进分子，也不进分母，所以客户端离开既不抬高也不稀释失败率。不要用未过滤的直方图 `_count` 做分母：拨号之后的失败已经在分子里，再加进分母会算两次，`client_gone` 还会被算进分母。
+
+- CONNECT，5 分钟上游失败率 > 2%。分子是 `sum(increase(proxy_upstream_fail_total[5m]))`，包含 `no_upstream`、`dial`、`l2_write`、`l2_deadline`、`l2_response`、`l2_status` 和 `l2_auth`。分母是该分子加上 `sum(increase(proxy_connect_latency_ms_count{result="ok"}[5m]))`。
+- 明文 HTTP，同一条公式，计数换成 `proxy_http_upstream_fail_total` 和 `proxy_http_request_latency_ms_count{result="ok"}`。阈值同样是 2%。
+- 两侧加总，5 分钟失败率 > 2%。分子是 `sum(increase(proxy_upstream_fail_total[5m])) + sum(increase(proxy_http_upstream_fail_total[5m]))`。分母是该分子加上 `sum(increase(proxy_connect_latency_ms_count{result="ok"}[5m])) + sum(increase(proxy_http_request_latency_ms_count{result="ok"}[5m]))`。
+- CONNECT 成功建连的 P95 > 200ms：`histogram_quantile(0.95, sum by (le) (rate(proxy_connect_latency_ms_bucket{result="ok"}[5m])))`。只统计 `result="ok"`。按节点告警时改为 `sum by (le, node_id) (rate(proxy_connect_latency_ms_bucket{result="ok"}[5m]))`。
+- 明文 HTTP 成功请求的 P95 > 200ms：`histogram_quantile(0.95, sum by (le) (rate(proxy_http_request_latency_ms_bucket{result="ok"}[5m])))`。同样只统计 `result="ok"`。按节点告警时改为 `sum by (le, node_id) (rate(proxy_http_request_latency_ms_bucket{result="ok"}[5m]))`。200ms 用的是已经存在的桶。这条时钟含源站等到最终状态行的时间，复用隧道时不含拨号，源站慢会把它抬高。本版先与 CONNECT 用同一个 200ms；要不要单独放宽由 h 定。
 
 内核（M2，eBPF）：
 
 - `kernel_tcp_retrans_total` 的 5 分钟增量相对该节点基线明显升高。
 - RTT 分布相对该节点基线明显升高。
-- run queue latency 持续高于该节点基线。这是调度延迟，与上面的 CONNECT P95 分开看。
+- run queue latency 持续高于该节点基线。这是调度延迟，与上面两条协议的 P95 分开看。
 
 发现与摘除走 etcd lease（§8），单独执行，不读 §7.1 或 §7.2 的时间序列：
 
@@ -975,7 +1174,7 @@ Watch DELETE 次数等于这次 `Drain` 的次数；多出来的 DELETE 才是 l
 
 ## 10. Go 使用示例（一级代理核心逻辑）
 
-下面是 L1 处理 CONNECT 的数据面，共享口令校验就在这个函数里完成。口令先做 SHA-256，再用 `subtle.ConstantTimeCompare` 与全系统共享口令比较；为空或不匹配时直接回 `407`，不拨 L2。用户名以最后一个 `@` 切分，`node_id` 是它后面的那一段，因此用户名本身可以含 `@`。目标不是 `host:port`，或切不出 `node_id`，回 `400`。通过后再向 L2 发第二次 `CONNECT`，`Proxy-Authorization` 使用客户端提交的同一组用户名和密码。读取 L2 应答的默认上限是 10 秒（`l2ResponseTimeout`，部署时可改）。gost 要先拨通源站才回 `200`，2 秒会把 2.5 秒才拨通的源站误判成 `502`。读完无论成败都清掉这个截止时间，隧道阶段不再受它限制。客户端若在等待期间读泵先结束，L1 关掉这条上游连接，读立刻返回，不必坐满 10 秒。读泵结束包括对端 FIN 和读错误；`io.Copy` 把干净 EOF 当成 nil，通道仍会关闭。TCP 上完全关闭和只关写端，读这一侧都是 EOF。状态行尚未解析时记 `client_gone`，不记 `l2_response`，判定见 §7.1。L2 返回 `407` 时，连同 `Proxy-Authenticate` 交给客户端；解析节点、拨号、向 L2 写出 `CONNECT`、设置或清除读截止时间、读应答失败，以及除 `200`/`407` 以外的状态，先写 `502` 再返回错误（见 §5.1）。确认 `200` 后才应答客户端。之后两个方向各自拷贝：`io.Copy` 返回非 nil 错误时立刻完全关闭两端，另一方向不会继续堵着；干净 EOF 只对对端 `CloseWrite`。反方向接着用空闲读超时（`halfCloseIdleTimeout`，默认 30s，可改）：每次成功读到字节都把截止时间重新拨到「现在 + 30s」，不是从 `CloseWrite` 那一刻起只拨一次。间隔只要短于这个值，响应可以很慢，也可以一直分片；连续这段时间没有字节才放弃。客户端先 FIN 和上游先 FIN 走同一套。整条隧道另有兜底（`tunnelIdleTimeout`，默认 5 分钟，可改）：任一方向读到字节都重新计时，两边都安静这么久才关闭。gost 的 `idleTimeout` 默认是 0，这条兜底不能省。两个方向连续 5 分钟都没有字节的连接会被关掉，例如长时间静默的 WebSocket，或挂起超过 5 分钟才返回的长轮询；这类应用要自己发心跳（WebSocket ping/pong 或应用层 keepalive），间隔短于 `tunnelIdleTimeout`，TCP keepalive 不带载荷，不会重置这个计时。两个方向都结束后再由 defer 完全关闭。出口网段拒绝在 L2 解析之后做，不在本函数里。示例不包含 etcd。打点使用 §7.1 导出的函数，按包名 `l1metrics` 调用。口令错误和含 CR/LF 的凭据只走 `RejectClient`，不发计量事件。认证通过之后的每条返回路径发一条 `MeterEvent`。对客户端的 `502`，以及原样交还的 L2 `407`，走 `Fail502`。拨号及之后的结束结果调用 `ObserveConnect`，`result` 用闭合集合里的值；`client_gone` 走 `ClientAbort`，不走 `Fail502`。L2 返回 `200` 后先 `ObserveConnect`（`result="ok"`），向客户端写出 `200` 成功后再 `EnterTunnel`。两个方向的 `io.Copy` 用 `AddTunnelBytes` 累加载荷字节。函数返回时如果隧道建立过，再 `ObserveTunnel`。`upstreamConn.Write` 失败和 `SetReadDeadline` 失败都回 `502`，`reason` 分别是 `l2_write`、`l2_deadline`。涉及 `bufio`、`crypto/sha256`、`crypto/subtle`、`encoding/base64`、`errors`、`fmt`、`io`、`net`、`net/http`、`strconv`、`strings`、`sync`、`sync/atomic`、`time`。
+下面是 L1 处理 CONNECT 的数据面，共享口令校验就在这个函数里完成。口令先做 SHA-256，再用 `subtle.ConstantTimeCompare` 与全系统共享口令比较；为空或不匹配时直接回 `407`，不拨 L2。用户名以最后一个 `@` 切分，`node_id` 是它后面的那一段，因此用户名本身可以含 `@`。目标不是 `host:port`，或切不出 `node_id`，回 `400`。通过后再向 L2 发第二次 `CONNECT`，`Proxy-Authorization` 使用客户端提交的同一组用户名和密码。读取 L2 应答的默认上限是 10 秒（`l2ResponseTimeout`，部署时可改）。gost 要先拨通源站才回 `200`，2 秒会把 2.5 秒才拨通的源站误判成 `502`。读完无论成败都清掉这个截止时间，隧道阶段不再受它限制。客户端若在等待期间读泵先结束，L1 关掉这条上游连接，读立刻返回，不必坐满 10 秒。读泵结束包括对端 FIN 和读错误；`io.Copy` 把干净 EOF 当成 nil，通道仍会关闭。TCP 上完全关闭和只关写端，读这一侧都是 EOF。状态行尚未解析时记 `client_gone`，不记 `l2_response`，判定见 §7.1。L2 返回 `407` 时，连同 `Proxy-Authenticate` 交给客户端；解析节点、拨号、向 L2 写出 `CONNECT`、设置或清除读截止时间、读应答失败，以及除 `200`/`407` 以外的状态，先写 `502` 再返回错误（见 §5.1）。确认 `200` 后才应答客户端。之后两个方向各自拷贝：`io.Copy` 返回非 nil 错误时立刻完全关闭两端，另一方向不会继续堵着；干净 EOF 只对对端 `CloseWrite`。反方向接着用空闲读超时（`halfCloseIdleTimeout`，默认 30s，可改）：每次成功读到字节都把截止时间重新拨到「现在 + 30s」，不是从 `CloseWrite` 那一刻起只拨一次。间隔只要短于这个值，响应可以很慢，也可以一直分片；连续这段时间没有字节才放弃。客户端先 FIN 和上游先 FIN 走同一套。整条隧道另有兜底（`tunnelIdleTimeout`，默认 5 分钟，可改）：任一方向读到字节都重新计时，两边都安静这么久才关闭。gost 的 `idleTimeout` 默认是 0，这条兜底不能省。两个方向连续 5 分钟都没有字节的连接会被关掉，例如长时间静默的 WebSocket，或挂起超过 5 分钟才返回的长轮询；这类应用要自己发心跳（WebSocket ping/pong 或应用层 keepalive），间隔短于 `tunnelIdleTimeout`，TCP keepalive 不带载荷，不会重置这个计时。两个方向都结束后再由 defer 完全关闭。出口网段拒绝在 L2 解析之后做，不在本函数里。示例不包含 etcd。打点使用 §7.1 导出的函数，按包名 `l1metrics` 调用。口令错误和含 CR/LF 的凭据只走 `RejectClient`，不发计量事件。认证通过之后的每条返回路径发一条 `MeterEvent`，`protocol` 为 `connect`。对客户端的 `502`，以及原样交还的 L2 `407`，走 `Fail502`。拨号及之后的结束结果调用 `ObserveConnect`，`result` 用闭合集合里的值；`client_gone` 走 `ClientAbort`，不走 `Fail502`。L2 返回 `200` 后先 `ObserveConnect`（`result="ok"`），向客户端写出 `200` 成功后再 `EnterTunnel`。两个方向的 `io.Copy` 用 `AddTunnelBytes` 累加载荷字节。函数返回时如果隧道建立过，再 `ObserveTunnel`。`upstreamConn.Write` 失败和 `SetReadDeadline` 失败都回 `502`，`reason` 分别是 `l2_write`、`l2_deadline`。涉及 `bufio`、`crypto/sha256`、`crypto/subtle`、`encoding/base64`、`errors`、`fmt`、`io`、`net`、`net/http`、`strconv`、`strings`、`sync`、`sync/atomic`、`time`。
 
 ```go
 // ErrUnknownNode 表示本地路由表从未收录该 node_id。
@@ -1047,7 +1246,7 @@ func handleConnect(clientConn net.Conn, username, password, target string, resol
 	defer clientConn.Close()
 
 	// 认证通过之后才发计量事件。握手耗时在结果确定时写入，不含后面的隧道时间。
-	meter := l1metrics.MeterEvent{}
+	meter := l1metrics.MeterEvent{Protocol: l1metrics.ProtocolConnect}
 	if ra := clientConn.RemoteAddr(); ra != nil {
 		meter.ClientIP = ra.String()
 	}
@@ -1401,7 +1600,7 @@ func readConnectStatus(r *bufio.Reader) (int, string, error) {
 
 ### 10.1 明文 HTTP
 
-下面是 §5.4 方案 B 的参考实现，和上面的 `handleConnect`、`parseNodeID`、`sharedPasswordOK`、`dialUpstream`、`readConnectStatus` 放在同一个包。`serveProxyConn` 是入口：第一条请求的方法是 `CONNECT` 时交给 `handleConnect`，否则按 absolute-form 处理。除了 §10 开头列出的包，还用到 `bytes`。失败打点复用 §7.1 已有的函数，不新增指标名。
+下面是 §5.4 方案 B 的参考实现，和上面的 `handleConnect`、`parseNodeID`、`sharedPasswordOK`、`dialUpstream`、`readConnectStatus` 放在同一个包。`serveProxyConn` 是入口：第一条请求的方法是 `CONNECT` 时交给 `handleConnect`，否则按 absolute-form 处理。除了 §10 开头列出的包，还用到 `bytes`。计数使用 §7.1 的明文 HTTP 函数：`RejectHTTP`、`FailHTTP`、`AbortHTTP`、`ObserveHTTP`、`EnterHTTPTunnel`、`ObserveHTTPTunnel`、`AddHTTPBytes`。不调用 `Fail502`、`ObserveConnect` 或 `EnterTunnel`。认证通过后每条请求发一条 `MeterEvent`，`protocol` 为 `http`。
 
 ```go
 // maxHTTPHead 是单条请求或响应头部的上限。超过则本地 400，reason 为 bad_target。
@@ -1458,9 +1657,87 @@ func finishConnect(mc *modeConn, br *bufio.Reader, head []byte, resolver Resolve
 	return handleConnect(pc, user, pass, parts[1], resolver)
 }
 
+// httpTry 是一条明文 HTTP 请求的计数，不是一条 L2 隧道。
+// keep-alive 上的下一条请求是新的 httpTry。认证失败不发计量事件。
+type httpTry struct {
+	meter    l1metrics.MeterEvent
+	meterOn  bool
+	nodeID   string
+	started  time.Time
+	up, down atomic.Int64
+	observed bool
+	emitted  bool
+}
+
+func newHTTPTry(client net.Conn) *httpTry {
+	t := &httpTry{}
+	t.meter.Protocol = l1metrics.ProtocolHTTP
+	if ra := client.RemoteAddr(); ra != nil {
+		t.meter.ClientIP = ra.String()
+	}
+	return t
+}
+
+func (t *httpTry) addUp(n int) {
+	if t == nil || n <= 0 {
+		return
+	}
+	t.up.Add(int64(n))
+	l1metrics.AddHTTPBytes(t.nodeID, l1metrics.DirUp, int64(n))
+}
+
+func (t *httpTry) addDown(n int) {
+	if t == nil || n <= 0 {
+		return
+	}
+	t.down.Add(int64(n))
+	l1metrics.AddHTTPBytes(t.nodeID, l1metrics.DirDown, int64(n))
+}
+
+// observe 在结果确定时调用一次。started 为零说明还没拨号、也还没开始写复用隧道，只记结果，不进直方图。
+func (t *httpTry) observe(result string) {
+	if t == nil || t.observed {
+		return
+	}
+	t.observed = true
+	t.meter.Result = result
+	if t.started.IsZero() {
+		return
+	}
+	t.meter.HandshakeMs = float64(time.Since(t.started)) / float64(time.Millisecond)
+	l1metrics.ObserveHTTP(t.nodeID, result, t.started)
+}
+
+func (t *httpTry) failUpstream(promNode, reason string) {
+	if t == nil || t.observed {
+		return
+	}
+	l1metrics.FailHTTP(promNode, reason)
+	t.observe(reason)
+}
+
+func (t *httpTry) clientGone() {
+	if t == nil || t.observed {
+		return
+	}
+	l1metrics.AbortHTTP(t.nodeID, l1metrics.ReasonClientGone)
+	t.observe(l1metrics.ReasonClientGone)
+}
+
+func (t *httpTry) emit() {
+	if t == nil || t.emitted || !t.meterOn || t.meter.Result == "" {
+		return
+	}
+	t.emitted = true
+	t.meter.BytesUp = t.up.Load()
+	t.meter.BytesDown = t.down.Load()
+	l1metrics.TryEmit(t.meter)
+}
+
 // serveAbsolute 处理 absolute-form 明文 HTTP。同一条客户端连接上：
 // 同一 node_id 且同一 host:port、双方都还想 keep-alive 时，复用已经建立的 L2 隧道；
 // 主机或 node 变了，就关掉隧道再向新的 L2 发 CONNECT。
+// 每条请求一个 httpTry。复用隧道不再拨号，延迟从写出请求起算。
 func serveAbsolute(client net.Conn, session *httpSession, mc *modeConn, br *bufio.Reader, head []byte, resolver Resolver) error {
 	var held *upstream
 	defer func() {
@@ -1468,7 +1745,11 @@ func serveAbsolute(client net.Conn, session *httpSession, mc *modeConn, br *bufi
 			held.close(session)
 		}
 	}()
+	var try *httpTry
+	defer func() { try.emit() }()
 	for {
+		try.emit()
+		try = nil
 		if head == nil {
 			var err error
 			head, err = readHTTPHead(br)
@@ -1476,57 +1757,68 @@ func serveAbsolute(client net.Conn, session *httpSession, mc *modeConn, br *bufi
 				if len(head) == 0 || isTimeout(err) {
 					return err
 				}
-				l1metrics.RejectClient(l1metrics.ReasonRejectBadTarget)
+				l1metrics.RejectHTTP(l1metrics.ReasonRejectBadTarget)
 				writeHTTPError(client, http.StatusBadRequest, "Bad Request", "")
 				return err
 			}
 		}
 		if requestMethod(head) == "CONNECT" {
-			l1metrics.RejectClient(l1metrics.ReasonRejectBadTarget)
+			l1metrics.RejectHTTP(l1metrics.ReasonRejectBadTarget)
 			writeHTTPError(client, http.StatusBadRequest, "Bad Request", "")
 			return fmt.Errorf("connect on http connection")
 		}
 		req, rej := parseAbsolute(head)
 		head = nil
 		if rej != nil {
-			l1metrics.RejectClient(rej.metric)
+			l1metrics.RejectHTTP(rej.metric)
 			writeHTTPError(client, rej.status, rej.reason, rej.header)
 			return rej.err
 		}
+		try = newHTTPTry(client)
 		if strings.ContainsAny(req.username, "\r\n") || strings.ContainsAny(req.password, "\r\n") {
-			l1metrics.RejectClient(l1metrics.ReasonRejectBadCredential)
+			l1metrics.RejectHTTP(l1metrics.ReasonRejectBadCredential)
 			writeHTTPError(client, http.StatusBadRequest, "Bad Request", "")
 			return fmt.Errorf("invalid credential")
 		}
 		if !sharedPasswordOK(req.password) {
-			l1metrics.RejectClient(l1metrics.ReasonRejectAuth)
+			l1metrics.RejectHTTP(l1metrics.ReasonRejectAuth)
 			writeHTTPError(client, http.StatusProxyAuthRequired, "Proxy Authentication Required",
 				`Proxy-Authenticate: Basic realm="relay"`)
 			return fmt.Errorf("invalid credential")
 		}
-		_, nodeID, err := parseNodeID(req.username)
+		try.meterOn = true
+		user, nodeID, err := parseNodeID(req.username)
+		try.meter.User = user
+		try.meter.NodeID = nodeID
+		try.nodeID = nodeID
 		if err != nil {
-			l1metrics.RejectClient(l1metrics.ReasonRejectNoNode)
+			l1metrics.RejectHTTP(l1metrics.ReasonRejectNoNode)
+			try.observe(l1metrics.ReasonRejectNoNode)
 			writeHTTPError(client, http.StatusBadRequest, "Bad Request", "")
 			return err
 		}
 		if req.targetErr != nil {
-			l1metrics.RejectClient(l1metrics.ReasonRejectBadTarget)
+			l1metrics.RejectHTTP(l1metrics.ReasonRejectBadTarget)
+			try.observe(l1metrics.ReasonRejectBadTarget)
 			writeHTTPError(client, http.StatusBadRequest, "Bad Request", "")
 			return req.targetErr
+		}
+		if host, port, serr := net.SplitHostPort(req.originTarget); serr == nil {
+			try.meter.TargetHost = host
+			try.meter.TargetPort = port
 		}
 		if held != nil && (held.nodeID != nodeID || held.target != req.originTarget) {
 			held.close(session)
 			held = nil
 		}
 		if held == nil {
-			held, err = openUpstream(session, req.username, req.password, nodeID, req.originTarget, resolver, client)
+			held, err = openUpstream(session, req.username, req.password, nodeID, req.originTarget, resolver, client, try)
 			if err != nil {
 				held = nil
 				return err
 			}
 		}
-		outcome, err := held.relay(client, mc, br, req)
+		outcome, err := held.relay(client, mc, br, req, try)
 		if err != nil {
 			held.close(session)
 			held = nil
@@ -1841,6 +2133,7 @@ func splitHostPortDefault(authority, defPort string) (string, error) {
 }
 
 // upstream 是一条已经拿到 L2 CONNECT 200 的隧道，后面只搬运 HTTP 字节。
+// opened 是 L2 返回 200 的时刻。明文 HTTP 不向客户端写 200，gauge 从这里加一。
 type upstream struct {
 	nodeID string
 	target string
@@ -1848,6 +2141,7 @@ type upstream struct {
 	br     *bufio.Reader
 	mode   *modeConn
 	leave  func()
+	opened time.Time
 }
 
 func (u *upstream) close(session *httpSession) {
@@ -1858,6 +2152,10 @@ func (u *upstream) close(session *httpSession) {
 		u.leave()
 		u.leave = nil
 	}
+	if !u.opened.IsZero() {
+		l1metrics.ObserveHTTPTunnel(u.nodeID, u.opened)
+		u.opened = time.Time{}
+	}
 	u.conn.Close()
 	if session != nil {
 		session.clearUpstream(u.conn)
@@ -1865,24 +2163,23 @@ func (u *upstream) close(session *httpSession) {
 }
 
 // openUpstream 向选定 L2 发与 CONNECT 数据面相同的第二次 CONNECT。
-// 失败时的状态码和 l1metrics reason 与 handleConnect 一致。
-// L2 返回 200 后按 §7.1 的签名调用 ObserveConnect，result 为 ok。
-// 隧道关闭前保持 EnterTunnel。拨号之后的失败只 Fail502，不把明文 HTTP 写进这张直方图。
-func openUpstream(session *httpSession, username, password, nodeID, target string, resolver Resolver, client net.Conn) (*upstream, error) {
+// 失败时的状态码与 §5.6 相同，计数走明文 HTTP 的指标，不调用 Fail502、ObserveConnect 或 EnterTunnel。
+// 延迟从拨号前开始。L2 返回 200 时请求还没结束，不在这里记 ok。
+func openUpstream(session *httpSession, username, password, nodeID, target string, resolver Resolver, client net.Conn, try *httpTry) (*upstream, error) {
 	addr, err := resolver.Resolve(nodeID)
 	if err != nil || addr == "" {
 		inTable := errors.Is(err, ErrNoHealthyAddr)
-		l1metrics.Fail502(l1metrics.NodeLabel(inTable, nodeID), l1metrics.ReasonNoUpstream)
+		try.failUpstream(l1metrics.NodeLabel(inTable, nodeID), l1metrics.ReasonNoUpstream)
 		if err == nil {
 			err = errors.New("empty address")
 		}
 		writeHTTPError(client, http.StatusBadGateway, "Bad Gateway", "")
 		return nil, fmt.Errorf("resolve node %s failed: %w", nodeID, err)
 	}
-	started := time.Now()
+	try.started = time.Now()
 	raw, err := dialUpstream(addr)
 	if err != nil {
-		l1metrics.Fail502(nodeID, l1metrics.ReasonDial)
+		try.failUpstream(nodeID, l1metrics.ReasonDial)
 		writeHTTPError(client, http.StatusBadGateway, "Bad Gateway", "")
 		return nil, err
 	}
@@ -1900,24 +2197,24 @@ func openUpstream(session *httpSession, username, password, nodeID, target strin
 		"Host: " + target + "\r\n" +
 		"Proxy-Authorization: Basic " + token + "\r\n\r\n"
 	if _, err := raw.Write([]byte(creq)); err != nil {
-		l1metrics.Fail502(nodeID, l1metrics.ReasonL2Write)
+		try.failUpstream(nodeID, l1metrics.ReasonL2Write)
 		writeHTTPError(client, http.StatusBadGateway, "Bad Gateway", "")
 		return nil, err
 	}
 	if err := raw.SetReadDeadline(time.Now().Add(l2ResponseTimeout)); err != nil {
-		l1metrics.Fail502(nodeID, l1metrics.ReasonL2Deadline)
+		try.failUpstream(nodeID, l1metrics.ReasonL2Deadline)
 		writeHTTPError(client, http.StatusBadGateway, "Bad Gateway", "")
 		return nil, err
 	}
 	br := bufio.NewReader(raw)
 	code, pa, err := readConnectStatus(br)
 	if clearErr := raw.SetReadDeadline(time.Time{}); clearErr != nil && err == nil {
-		l1metrics.Fail502(nodeID, l1metrics.ReasonL2Deadline)
+		try.failUpstream(nodeID, l1metrics.ReasonL2Deadline)
 		writeHTTPError(client, http.StatusBadGateway, "Bad Gateway", "")
 		return nil, clearErr
 	}
 	if err != nil {
-		l1metrics.Fail502(nodeID, l1metrics.ReasonL2Response)
+		try.failUpstream(nodeID, l1metrics.ReasonL2Response)
 		writeHTTPError(client, http.StatusBadGateway, "Bad Gateway", "")
 		return nil, err
 	}
@@ -1926,22 +2223,22 @@ func openUpstream(session *httpSession, username, password, nodeID, target strin
 		if challenge == "" || strings.ContainsAny(challenge, "\r\n") {
 			challenge = `Basic realm="relay"`
 		}
-		l1metrics.Fail502(nodeID, l1metrics.ReasonL2Auth)
+		try.failUpstream(nodeID, l1metrics.ReasonL2Auth)
 		writeHTTPError(client, http.StatusProxyAuthRequired, "Proxy Authentication Required",
 			"Proxy-Authenticate: "+challenge)
 		return nil, fmt.Errorf("l2 connect status 407")
 	}
 	if code != http.StatusOK {
-		l1metrics.Fail502(nodeID, l1metrics.ReasonL2Status)
+		try.failUpstream(nodeID, l1metrics.ReasonL2Status)
 		writeHTTPError(client, http.StatusBadGateway, "Bad Gateway", "")
 		return nil, fmt.Errorf("l2 connect status %d", code)
 	}
-	l1metrics.ObserveConnect(nodeID, l1metrics.ResultOK, started)
 
 	var prefix []byte
 	if n := br.Buffered(); n > 0 {
 		prefix = make([]byte, n)
 		if _, err := io.ReadFull(br, prefix); err != nil {
+			try.failUpstream(nodeID, l1metrics.ReasonL2Response)
 			writeHTTPError(client, http.StatusBadGateway, "Bad Gateway", "")
 			return nil, err
 		}
@@ -1949,72 +2246,98 @@ func openUpstream(session *httpSession, username, password, nodeID, target strin
 	mc := &modeConn{Conn: raw, session: session}
 	ubr := bufio.NewReaderSize(io.MultiReader(bytes.NewReader(prefix), mc), maxHTTPHead)
 	ok = true
+	opened := time.Now()
 	return &upstream{
 		nodeID: nodeID,
 		target: target,
 		conn:   raw,
 		br:     ubr,
 		mode:   mc,
-		leave:  l1metrics.EnterTunnel(nodeID),
+		leave:  l1metrics.EnterHTTPTunnel(nodeID),
+		opened: opened,
 	}, nil
 }
 
 // relay 把改写后的请求写入隧道，再把源站响应原样写回客户端。
 // Expect: 100-continue 时先只写头，等源站的 100 之后才写正文；源站直接给最终响应则不写正文。
 // 已经向客户端写出过源站字节之后，后续失败只关连接，不再补 502。
-func (u *upstream) relay(client net.Conn, clientMode *modeConn, clientBR *bufio.Reader, req *absReq) (relayOutcome, error) {
-	if _, err := u.conn.Write(req.wireHead); err != nil {
-		l1metrics.Fail502(u.nodeID, l1metrics.ReasonL2Write)
+// ok 记在最终状态行（code >= 200，含 101）完整写给客户端的时刻。1xx 不是 ok。
+// 源站自己的 4xx/5xx 只要完整写出，对这条代理来说仍是 ok。
+func (u *upstream) relay(client net.Conn, clientMode *modeConn, clientBR *bufio.Reader, req *absReq, try *httpTry) (relayOutcome, error) {
+	if try.started.IsZero() {
+		try.started = time.Now()
+	}
+	n, err := u.conn.Write(req.wireHead)
+	try.addUp(n)
+	if err != nil || n != len(req.wireHead) {
+		try.failUpstream(u.nodeID, l1metrics.ReasonL2Write)
 		writeHTTPError(client, http.StatusBadGateway, "Bad Gateway", "")
+		if err == nil {
+			err = io.ErrShortWrite
+		}
 		return relayOutcome{}, err
 	}
+	upW := countWriter{w: u.conn, try: try, up: true}
 	if !req.expectContinue {
-		if err := writeRequestBody(u.conn, clientBR, req); err != nil {
-			l1metrics.Fail502(u.nodeID, l1metrics.ReasonL2Write)
-			writeHTTPError(client, http.StatusBadGateway, "Bad Gateway", "")
+		if err := writeBody(upW, client, clientBR, req, try, false); err != nil {
 			return relayOutcome{}, err
 		}
 	}
 	sent := false
 	wroteBody := !req.expectContinue
+	downW := countWriter{w: client, try: try, up: false}
 	for {
 		head, err := readHTTPHead(u.br)
 		if err != nil {
-			if !sent {
-				l1metrics.Fail502(u.nodeID, l1metrics.ReasonL2Response)
-				writeHTTPError(client, http.StatusBadGateway, "Bad Gateway", "")
+			if !try.observed {
+				try.failUpstream(u.nodeID, l1metrics.ReasonL2Response)
+				if !sent {
+					writeHTTPError(client, http.StatusBadGateway, "Bad Gateway", "")
+				}
 			}
-			return relayOutcome{}, err
+			return relayOutcome{endClient: sent}, err
 		}
 		meta, err := inspectResponse(head, req)
 		if err != nil {
-			if !sent {
-				l1metrics.Fail502(u.nodeID, l1metrics.ReasonL2Status)
-				writeHTTPError(client, http.StatusBadGateway, "Bad Gateway", "")
+			if !try.observed {
+				try.failUpstream(u.nodeID, l1metrics.ReasonL2Response)
+				if !sent {
+					writeHTTPError(client, http.StatusBadGateway, "Bad Gateway", "")
+				}
 			}
-			return relayOutcome{}, err
+			return relayOutcome{endClient: sent}, err
 		}
-		if _, err := client.Write(head); err != nil {
-			return relayOutcome{}, err
+		nw, werr := downW.Write(head)
+		if werr != nil || nw != len(head) {
+			if !try.observed {
+				try.clientGone()
+			}
+			if werr == nil {
+				werr = io.ErrShortWrite
+			}
+			return relayOutcome{endClient: true}, werr
 		}
 		sent = true
+		if meta.code >= 200 {
+			try.observe(l1metrics.ResultOK)
+		}
 		if meta.code == http.StatusSwitchingProtocols {
 			if req.upgrade {
-				err := pipeUpgrade(client, clientBR, u.conn, u.br, clientMode, u.mode)
+				err := pipeUpgrade(client, clientBR, u.conn, u.br, clientMode, u.mode, try)
 				return relayOutcome{endClient: true}, err
 			}
 			return relayOutcome{endClient: true}, nil
 		}
 		if meta.code < 200 {
 			if meta.code == http.StatusContinue && req.expectContinue && !wroteBody {
-				if err := writeRequestBody(u.conn, clientBR, req); err != nil {
-					return relayOutcome{}, err
+				if err := writeBody(upW, client, clientBR, req, try, true); err != nil {
+					return relayOutcome{endClient: true}, err
 				}
 				wroteBody = true
 			}
 			continue
 		}
-		if err := relayResponseBody(client, u.br, meta); err != nil {
+		if err := relayResponseBody(downW, u.br, meta); err != nil {
 			return relayOutcome{endClient: true}, err
 		}
 		// 最终响应已经发出、但 Expect 的正文还没消费：不能在这条客户端连接上接着读下一个请求。
@@ -2023,6 +2346,24 @@ func (u *upstream) relay(client net.Conn, clientMode *modeConn, clientBR *bufio.
 		end := req.closeClient || meta.untilEOF || abandonedBody
 		return relayOutcome{reuse: reuse, endClient: end}, nil
 	}
+}
+
+// writeBody 把请求正文写入隧道。readFailed 为真表示客户端这一侧没有把正文给完。
+// afterOrigin 为真时已经向客户端写过源站字节（通常是 100），失败不再补 502。
+func writeBody(dst io.Writer, client net.Conn, src *bufio.Reader, req *absReq, try *httpTry, afterOrigin bool) error {
+	readFailed, err := writeRequestBody(dst, src, req)
+	if err == nil {
+		return nil
+	}
+	if readFailed {
+		try.clientGone()
+	} else {
+		try.failUpstream(try.nodeID, l1metrics.ReasonL2Write)
+	}
+	if !afterOrigin {
+		writeHTTPError(client, http.StatusBadGateway, "Bad Gateway", "")
+	}
+	return err
 }
 
 type respMeta struct {
@@ -2096,15 +2437,56 @@ func inspectResponse(head []byte, req *absReq) (respMeta, error) {
 	return meta, nil
 }
 
-func writeRequestBody(dst io.Writer, src *bufio.Reader, req *absReq) error {
+func writeRequestBody(dst io.Writer, src *bufio.Reader, req *absReq) (bool, error) {
 	if req.chunked {
 		return copyChunked(dst, src)
 	}
 	if req.contentLength > 0 {
-		_, err := io.CopyN(dst, src, req.contentLength)
-		return err
+		return copyNRead(dst, src, req.contentLength)
 	}
-	return nil
+	return false, nil
+}
+
+type countWriter struct {
+	w   io.Writer
+	try *httpTry
+	up  bool
+}
+
+func (c countWriter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	if c.up {
+		c.try.addUp(n)
+	} else {
+		c.try.addDown(n)
+	}
+	return n, err
+}
+
+type errReader struct {
+	r      io.Reader
+	failed bool
+}
+
+func (e *errReader) Read(p []byte) (int, error) {
+	n, err := e.r.Read(p)
+	if err != nil && !errors.Is(err, io.EOF) {
+		e.failed = true
+	}
+	return n, err
+}
+
+// copyNRead 报告失败发生在读侧还是写侧。提前 EOF 算读侧：请求正文没给完是客户端，响应正文没给完是源站。
+func copyNRead(dst io.Writer, src io.Reader, n int64) (bool, error) {
+	mr := &errReader{r: src}
+	_, err := io.CopyN(dst, mr, n)
+	if err == nil {
+		return false, nil
+	}
+	if mr.failed || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true, err
+	}
+	return false, err
 }
 
 func relayResponseBody(dst io.Writer, src *bufio.Reader, meta respMeta) error {
@@ -2112,10 +2494,11 @@ func relayResponseBody(dst io.Writer, src *bufio.Reader, meta respMeta) error {
 		return nil
 	}
 	if meta.chunked {
-		return copyChunked(dst, src)
+		_, err := copyChunked(dst, src)
+		return err
 	}
 	if meta.contentLength >= 0 {
-		_, err := io.CopyN(dst, src, meta.contentLength)
+		_, err := copyNRead(dst, src, meta.contentLength)
 		return err
 	}
 	_, err := io.Copy(dst, src)
@@ -2126,42 +2509,43 @@ func relayResponseBody(dst io.Writer, src *bufio.Reader, meta respMeta) error {
 }
 
 // copyChunked 按 chunk 帧拷贝，不解码、不重编码。size 行、扩展、正文和 trailer 都原样写出。
-func copyChunked(dst io.Writer, src *bufio.Reader) error {
+func copyChunked(dst io.Writer, src *bufio.Reader) (bool, error) {
 	for {
 		line, err := src.ReadBytes('\n')
 		if err != nil {
-			return err
+			return true, err
 		}
 		if _, err := dst.Write(line); err != nil {
-			return err
+			return false, err
 		}
 		size, err := parseChunkSize(line)
 		if err != nil {
-			return err
+			return true, err
 		}
 		if size == 0 {
 			for {
 				trailer, err := src.ReadBytes('\n')
 				if err != nil {
-					return err
+					return true, err
 				}
 				if _, err := dst.Write(trailer); err != nil {
-					return err
+					return false, err
 				}
 				if isBlankLine(trailer) {
-					return nil
+					return false, nil
 				}
 			}
 		}
-		if _, err := io.CopyN(dst, src, size); err != nil {
-			return err
+		readFailed, err := copyNRead(dst, src, size)
+		if err != nil {
+			return readFailed, err
 		}
 		crlf := make([]byte, 2)
 		if _, err := io.ReadFull(src, crlf); err != nil {
-			return err
+			return true, err
 		}
 		if _, err := dst.Write(crlf); err != nil {
-			return err
+			return false, err
 		}
 	}
 }
@@ -2179,10 +2563,10 @@ func parseChunkSize(line []byte) (int64, error) {
 
 // pipeUpgrade 在 101 之后进入与 CONNECT 相同的双向字节转发。
 // 半关闭后的空闲上限是 halfCloseIdleTimeout，整条隧道的空闲兜底仍是 tunnelIdleTimeout。
-func pipeUpgrade(client net.Conn, clientR io.Reader, up net.Conn, upR io.Reader, clientMode, upMode *modeConn) error {
+func pipeUpgrade(client net.Conn, clientR io.Reader, up net.Conn, upR io.Reader, clientMode, upMode *modeConn, try *httpTry) error {
 	errc := make(chan error, 2)
-	relay := func(dst net.Conn, src io.Reader, reverse *modeConn) {
-		_, copyErr := io.Copy(dst, src)
+	relay := func(dst net.Conn, src io.Reader, reverse *modeConn, upload bool) {
+		_, copyErr := io.Copy(countWriter{w: dst, try: try, up: upload}, src)
 		if copyErr != nil {
 			client.Close()
 			up.Close()
@@ -2201,8 +2585,8 @@ func pipeUpgrade(client net.Conn, clientR io.Reader, up net.Conn, upR io.Reader,
 		}
 		errc <- nil
 	}
-	go func() { relay(up, clientR, upMode) }()
-	go func() { relay(client, upR, clientMode) }()
+	go func() { relay(up, clientR, upMode, true) }()
+	go func() { relay(client, upR, clientMode, false) }()
 	err1 := <-errc
 	err2 := <-errc
 	if err1 != nil {
@@ -2489,7 +2873,7 @@ func (s *httpSession) stop() {
 
 ## 11. 里程碑建议
 
-- **M1（1~2 周）**：PoC 跑通（L1 向 gost 发 `CONNECT`、etcd、username 指定路由、ClientHello 字节比对），并用 `prometheus/client_golang` 暴露 §7.1 的应用层指标（三项 SLI，另加 `proxy_client_reject_total`）。应用层告警见 §7.3。
+- **M1（1~2 周）**：PoC 跑通（L1 向 gost 发 `CONNECT`、etcd、username 指定路由、ClientHello 字节比对），并用 `prometheus/client_golang` 暴露 §7.1 的应用层指标。CONNECT 与明文 HTTP 各有时延、在途隧道和上游失败，本地拒绝另计。应用层告警见 §7.3。
 - **M2（2~4 周）**：部署 eBPF Agent，采集 `kernel_tcp_retrans_total`、RTT、run queue latency 等内核指标，接入 Prometheus 看板与 §7.3 的内核告警。
 - **M3（4~6 周）**：压测调优、故障演练、灰度发布。
 
@@ -2528,7 +2912,7 @@ func (s *httpSession) stop() {
 建议进入 PoC 实施，优先验证三件事：
 1. username 路由稳定性，以及 L2 `200` 之后才向客户端应答；
 2. 客户端与目标侧 ClientHello / JA3 / JA4 一致；
-3. 高并发下连接成功率与时延目标，用 §7.1 的三项 SLI 核对。
+3. 高并发下连接成功率与时延目标，用 §7.1 的 SLI 核对。CONNECT 与明文 HTTP 分开看，两侧失败率再加总，见 §7.3。
 
 ---
 
