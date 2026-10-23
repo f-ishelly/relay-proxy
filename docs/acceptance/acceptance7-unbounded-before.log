@@ -1,0 +1,8 @@
+commit 7c4cd620d80bc28de32e27e66a934e50e5535e5f
+git_status clean
+go go version go1.22.2 linux/amd64
+start 2026-10-22T16:31:21.153809374Z
+{"event":"registered","label":"acceptance7-unbounded-before","hosts":4000,"up":4000,"ready_err":0,"elapsed_ms":5228,"endpoints":"http://127.0.0.1:39129,http://127.0.0.1:46705,http://127.0.0.1:37485"}
+{"event":"redial","label":"acceptance7-unbounded-before","drain_ok":0,"drain_err":4000,"elapsed_ms":18078}
+{"client_mode":"registrar","conns_flag":32,"drain_err":4000,"drain_ok":0,"elapsed_ms":30381,"endpoints":3,"event":"summary","hosts":4000,"keepalive_err":247,"keepalive_err_sample":"context deadline exceeded","keepalive_ok":1918,"keepalive_ok_max":1,"keepalive_ok_min":0,"keepalive_ok_p50":0,"label":"acceptance7-unbounded-before","leader_killed":false,"lease_lost":4000,"ready_err":0,"redial_inflight":0,"registered":4000,"registrar_clients":4000,"renew_ms":3000,"start_sleep":"i%8000ms","start_sleep_max_ms":3999,"ttl_s":10,"watch_del":4000,"watch_put":4000}
+end 2026-10-22T16:31:55.583761641Z

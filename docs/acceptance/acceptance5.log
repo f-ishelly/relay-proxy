@@ -1,0 +1,48 @@
+commit f82c306e997fe92b70b9b8f408a852e5927944a2
+git_status clean
+go go version go1.22.2 linux/amd64
+start 2026-10-22T17:00:27.099003000Z
+command go test -count=10 -timeout 15m -run ^TestAcceptance5_LeaderFailoverDrain$ -v ./registrar/
+=== RUN   TestAcceptance5_LeaderFailoverDrain
+    registrar_test.go:695: Drain during failover 734.630902ms
+--- PASS: TestAcceptance5_LeaderFailoverDrain (5.13s)
+=== RUN   TestAcceptance5_LeaderFailoverDrain
+    registrar_test.go:695: Drain during failover 844.148876ms
+--- PASS: TestAcceptance5_LeaderFailoverDrain (5.22s)
+=== RUN   TestAcceptance5_LeaderFailoverDrain
+    registrar_test.go:695: Drain during failover 546.190534ms
+--- PASS: TestAcceptance5_LeaderFailoverDrain (3.82s)
+=== RUN   TestAcceptance5_LeaderFailoverDrain
+    registrar_test.go:695: Drain during failover 643.081453ms
+--- PASS: TestAcceptance5_LeaderFailoverDrain (4.93s)
+=== RUN   TestAcceptance5_LeaderFailoverDrain
+    registrar_test.go:695: Drain during failover 448.530259ms
+--- PASS: TestAcceptance5_LeaderFailoverDrain (4.93s)
+=== RUN   TestAcceptance5_LeaderFailoverDrain
+    registrar_test.go:695: Drain during failover 547.99281ms
+--- PASS: TestAcceptance5_LeaderFailoverDrain (5.12s)
+=== RUN   TestAcceptance5_LeaderFailoverDrain
+    registrar_test.go:695: Drain during failover 445.719723ms
+--- PASS: TestAcceptance5_LeaderFailoverDrain (4.73s)
+=== RUN   TestAcceptance5_LeaderFailoverDrain
+    registrar_test.go:695: Drain during failover 541.072281ms
+--- PASS: TestAcceptance5_LeaderFailoverDrain (5.02s)
+=== RUN   TestAcceptance5_LeaderFailoverDrain
+    registrar_test.go:695: Drain during failover 447.38411ms
+--- PASS: TestAcceptance5_LeaderFailoverDrain (5.52s)
+=== RUN   TestAcceptance5_LeaderFailoverDrain
+    registrar_test.go:695: Drain during failover 538.401686ms
+--- PASS: TestAcceptance5_LeaderFailoverDrain (5.02s)
+PASS
+ok  	github.com/f-ishelly/relay-proxy/registrar	49.465s
+samples 10
+unit ms
+min 445.720
+p50 543.631
+max 844.149
+sorted_ms 445.720 447.384 448.530 538.402 541.072 546.191 547.993 643.081 734.631 844.149
+limit 3000ms
+pass 10
+fail 0
+go_test_exit 0
+end 2026-10-22T17:01:17.233344000Z
