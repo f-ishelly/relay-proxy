@@ -4,7 +4,7 @@
 - **日期**：2026-10-23
 - **状态**：Draft / 可进入 PoC
 - **目标**：参考商业隧道代理 Pro 模式，设计“一级代理 + 二级代理”多级转发系统，支持通过 `username` 指定二级节点、TLS 指纹透传、应用层与 eBPF 监控、etcd 自动服务发现。
-- **v0.10 变更**：等请求头的第一个字节用 `tunnelIdle`（默认 5 分钟），keep-alive 空等不再被 10s 的 `header_deadline` 切断。读到第一个字节之后才武装 `header_deadline`，绝对截止，后续字节不顺延。v0.9 的 `ProxyUnknownUpstream` 要求这三种失败至少 100 次并且超过全部尝试的一半。那个「一半」就是分母闸，不到一半的 `resolver_error` 和 5 分钟里不足 100 次的全灭都不会翻页；v0.9 里「不要求健康分母」的说法是错的。v0.10 撤掉这条页，改成 `ProxyResolverUpstream`：两条协议上 `empty_addr` 与 `resolver_error` 在 5 分钟里至少 10 次就翻页，没有比例，也没有健康分母。`unknown_node` 只上看板。共享口令在 `Resolve` 之前校验，所以它是已认证客户端写出了路由表没有的 node，不是未认证扫描，也不是 etcd 故障。半关闭一开始就停掉 `tunnelIdle`，这段拆除不记 `idle_timeout`。`Fail502` 和 `FailHTTP` 把集合外的 reason 记成 `other`。JSON 对象后面的多余数据拒绝。`{node_id="unknown",reason="no_upstream"}` 不再增加。§8 未改。
+- **v0.10 变更**：等请求头的第一个字节用 `tunnelIdle`（默认 5 分钟），keep-alive 空等不再被 10s 的 `header_deadline` 切断。读到第一个字节之后才武装 `header_deadline`，绝对截止，后续字节不顺延。v0.9 的 `ProxyUnknownUpstream` 要求这三种失败至少 100 次并且超过全部尝试的一半。那个「一半」就是分母闸，不到一半的 `resolver_error` 和 5 分钟里不足 100 次的全灭都不会翻页；v0.9 里「不要求健康分母」的说法是错的。v0.10 撤掉这条页，改成 `ProxyResolverUpstream`：两条协议上 `empty_addr` 与 `resolver_error` 在 5 分钟里至少 10 次就翻页，没有比例，也没有健康分母。`unknown_node` 只上看板。共享口令在 `Resolve` 之前校验，所以它是已认证客户端写出了路由表没有的 node，不是未认证扫描，也不是 etcd 故障。半关闭一开始就停掉 `tunnelIdle`，这段拆除不记 `idle_timeout`。`Fail502` 和 `FailHTTP` 把集合外的 reason 记成 `other`。JSON 对象后面的多余数据拒绝。`{node_id="unknown",reason="no_upstream"}` 不再增加。计量事件在写入通道前计入未确认数，消费者落盘后调用 `FinishMeter`，`WaitMeterIdle` 才返回；通道变空不等于这行已经记入日志。§8 未改。
 - **v0.9 变更**：`Resolve` 的三种哨兵分开计数：`ErrUnknownNode` 是 `unknown_node`，地址为空是 `empty_addr`，其它解析错误是 `resolver_error`，`node_id` 都是 `unknown`。`ErrNoHealthyAddr` 仍保留原来的 `node_id` 和 `no_upstream`。失败率继续去掉 `unknown`。当时的 `ProxyUnknownUpstream` 要求 5 分钟里这三种失败至少 100 次，并且占全部尝试的一半以上。读请求头用单独的绝对截止 `header_deadline`（默认 10s）。CONNECT 隧道空闲到点记 `proxy_tunnel_abort_total{reason="idle_timeout"}`。`closeWrite` 失败两边都不当成隧道中断。配置拒绝未知字段，并限制时长上限，`half_close_idle` 不得大于 `tunnel_idle`。§8 未改。v0.10 修正了这条告警和请求头空等。
 - **v0.8 变更**：空闲计时到点先记下原因再关连接，读到的 `net.ErrClosed` 记 `idle_timeout`，不再记成 `origin_reset` 或 `client_cancel`。双向拷贝用 `sync.Once` 保留第一个真实错误，忽略自己关掉对端造成的错误。半关闭之后的空闲超时不进 `proxy_http_body_abort_total`。请求头已经读到一部分才超时记 `header_timeout`，一个字节都没有仍不计数。失败率和按节点的页去掉 `node_id="unknown"`。Alertmanager 按 `alertname` 分组，全局页抑制对应的按节点页。`ECONNRESET` 在读和写上都是断管。`retry_put_delete` 来自 JSON 配置或 `-retry-put-delete`，按连接注入。`increase()` 不把序列第一次出现时已经有的值当成增量。gost 夹具按 `GOOS/GOARCH` 校验 v3.3.1 的 sha256，放进用户缓存目录；`GOST_REQUIRED=1` 时拿不到就失败。§8 未改。
 - **v0.7 变更**：明文 HTTP 的计数纳入 SLI，单独成一套指标，不改 CONNECT 指标的名字和标签。请求时延是 `proxy_http_request_latency_ms{node_id,result}`，只上看板。告警用的 P95 是 `proxy_http_tunnel_setup_ms`，时钟与 CONNECT 相同：从拨号到 L2 返回 `200`，只统计新开的隧道。直方图序列数计入隐含的 `le="+Inf"`。复用隧道只有在 EOF / `ECONNRESET`（写出时还有 `EPIPE`、`ECONNABORTED`、`ErrClosedPipe`）、零个源站字节、且请求头没有写到一半时，才对 `GET` / `HEAD` / `OPTIONS` / `TRACE` 重试一次，记 `proxy_http_reused_conn_retry_total`，不把第一次算失败。读超时不重试。`PUT` / `DELETE` 默认不重试。失败率用 `or vector(0)`，5 分钟窗口里分母至少 100 才告警，`for` 为 5 分钟，并另有按节点的页。`proxy_conn_active` 只统计 CONNECT。计量事件 `v` 为 2，`protocol` 必填且没有 `omitempty`。`setup_ms` 只含这次实际使用的隧道建立，`request_ms` 是整条请求并含白写的重试。§8 未改。
@@ -624,6 +624,8 @@ v=1 没有 `protocol`，时延字段是 `handshake_ms`。v=2 的 `protocol` 必�
 
 `TryEmit` 把 `v` 写成 2。`protocol` 不是 `connect` 或 `http` 就丢掉，并增加 `proxy_meter_drop_total`，不写入通道。通道容量 1024，满了同样丢并增加这个计数。转发路径不因计量阻塞。一个进程只有一个消费者，不要 close 这条通道。`ServeMeter` 把事件写成 JSON 行，接到独立日志，不和调试日志混在一起。明文 HTTP 在认证通过后按请求发事件，`protocol` 为 `http`。CONNECT 的 `protocol` 为 `connect`。
 
+`TryEmit` 在写入通道之前把这条事件计入未确认。唯一的消费者在把事件记入日志之后调用 `FinishMeter`；队列满而丢弃时由 `TryEmit` 自己确认。`WaitMeterIdle` 等到未确认数归零。通道已经空还不够：事件可能刚被取走，日志还没写上。转发路径不调用 `WaitMeterIdle`。测试直接读 `MeterEvents` 时同样在追加日志之后 `FinishMeter`，不能再开第二个消费者。
+
 | 路径 | 适合放什么 | 代价 |
 | --- | --- | --- |
 | Prometheus | 闭合标签上的 SLI、告警、节点并发、节点字节、节点池 | 每加一枚无界标签，序列数随用户或域名涨。4000 节点再乘域名会到百万级，抓取和查询都会坏 |
@@ -696,6 +698,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -1180,19 +1183,49 @@ type MeterEvent struct {
 	BytesDown  int64   `json:"bytes_down,omitempty"`
 }
 
+// 已写入通道、消费者尚未确认的事件数。
+// 确认发生在记入日志之后，所以通道变空不等于这行已经落盘。
+var (
+	meterMu       sync.Mutex
+	meterIdle     = sync.NewCond(&meterMu)
+	meterInflight int
+)
+
+func beginMeter() {
+	meterMu.Lock()
+	meterInflight++
+	meterMu.Unlock()
+}
+
+func endMeter() {
+	meterMu.Lock()
+	if meterInflight == 0 {
+		meterMu.Unlock()
+		panic("meter inflight underflow")
+	}
+	meterInflight--
+	if meterInflight == 0 {
+		meterIdle.Broadcast()
+	}
+	meterMu.Unlock()
+}
+
 // TryEmit 非阻塞写入。队列满则丢弃并增加 proxy_meter_drop_total。
 // v 固定写成 2。protocol 不是 connect 或 http 时丢掉，同样增加 proxy_meter_drop_total。
 // Protocol 的 JSON 标签没有 omitempty，空字符串也会出现在行里；那种行在写入前就被丢掉。
 // 没有 protocol 的 v=1 事件是旧日志，读的时候按 connect 处理；新事件不再写出那种行。
+// 写入通道之前先计入未确认。队列满则当场确认并丢弃。转发路径不等待消费者。
 func TryEmit(ev MeterEvent) {
 	if ev.Protocol != ProtocolConnect && ev.Protocol != ProtocolHTTP {
 		proxyMeterDrop.Inc()
 		return
 	}
 	ev.V = 2
+	beginMeter()
 	select {
 	case meterEvents <- ev:
 	default:
+		endMeter()
 		proxyMeterDrop.Inc()
 	}
 }
@@ -1202,11 +1235,29 @@ func MeterEvents() <-chan MeterEvent {
 	return meterEvents
 }
 
-// ServeMeter 把事件写成 JSON 行。生产环境把它接到独立日志；测试直接读 MeterEvents。
+// FinishMeter 由那一个消费者在把事件记入日志之后调用。
+func FinishMeter() {
+	endMeter()
+}
+
+// WaitMeterIdle 等到已接受的事件都被确认。转发路径不调用。
+// 通道已空仍可能要等：事件可能刚被取出，日志还没写上。
+func WaitMeterIdle() {
+	meterMu.Lock()
+	for meterInflight > 0 {
+		meterIdle.Wait()
+	}
+	meterMu.Unlock()
+}
+
+// ServeMeter 把事件写成 JSON 行。生产环境把它接到独立日志。
+// 写出一行之后 FinishMeter。测试若直接读 MeterEvents，也要在记入日志之后 FinishMeter。
+// 不能两个消费者同时读。
 func ServeMeter(w io.Writer) {
 	enc := json.NewEncoder(w)
 	for ev := range meterEvents {
 		_ = enc.Encode(ev)
+		FinishMeter()
 	}
 }
 ```

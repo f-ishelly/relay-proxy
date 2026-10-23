@@ -1187,6 +1187,7 @@ func TestLastAtNodeID(t *testing.T) {
 	if !bytes.HasPrefix(got, []byte("GET /z HTTP/1.1\r\n")) {
 		t.Fatalf("origin %s", strconv.Quote(string(got)))
 	}
+	handlers.Wait()
 }
 
 func TestLocalRejectsDoNotDial(t *testing.T) {
@@ -2661,5 +2662,28 @@ func TestIncompleteHeadRejectAttribution(t *testing.T) {
 				t.Fatalf("plain HTTP touched CONNECT series: %+v", snap)
 			}
 		})
+	}
+}
+
+// TestMeterIdleWaitsForLog 发出一批事件后立刻取基线之后的日志长度。
+// 通道被取空和写入 evLog 之间不能被看成空闲，否则下一则测试会看见漏过来的事件。
+func TestMeterIdleWaitsForLog(t *testing.T) {
+	resetMetrics()
+	const n = 400
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			l1metrics.TryEmit(l1metrics.MeterEvent{Protocol: l1metrics.ProtocolHTTP, Result: l1metrics.ResultOK})
+		}()
+	}
+	wg.Wait()
+	waitMeterIdle()
+	evMu.Lock()
+	got := len(evLog) - evBase
+	evMu.Unlock()
+	if got != n {
+		t.Fatalf("logged %d want %d", got, n)
 	}
 }

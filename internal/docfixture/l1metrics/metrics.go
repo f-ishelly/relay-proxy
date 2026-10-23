@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -490,19 +491,49 @@ type MeterEvent struct {
 	BytesDown  int64   `json:"bytes_down,omitempty"`
 }
 
+// 已写入通道、消费者尚未确认的事件数。
+// 确认发生在记入日志之后，所以通道变空不等于这行已经落盘。
+var (
+	meterMu       sync.Mutex
+	meterIdle     = sync.NewCond(&meterMu)
+	meterInflight int
+)
+
+func beginMeter() {
+	meterMu.Lock()
+	meterInflight++
+	meterMu.Unlock()
+}
+
+func endMeter() {
+	meterMu.Lock()
+	if meterInflight == 0 {
+		meterMu.Unlock()
+		panic("meter inflight underflow")
+	}
+	meterInflight--
+	if meterInflight == 0 {
+		meterIdle.Broadcast()
+	}
+	meterMu.Unlock()
+}
+
 // TryEmit 非阻塞写入。队列满则丢弃并增加 proxy_meter_drop_total。
 // v 固定写成 2。protocol 不是 connect 或 http 时丢掉，同样增加 proxy_meter_drop_total。
 // Protocol 的 JSON 标签没有 omitempty，空字符串也会出现在行里；那种行在写入前就被丢掉。
 // 没有 protocol 的 v=1 事件是旧日志，读的时候按 connect 处理；新事件不再写出那种行。
+// 写入通道之前先计入未确认。队列满则当场确认并丢弃。转发路径不等待消费者。
 func TryEmit(ev MeterEvent) {
 	if ev.Protocol != ProtocolConnect && ev.Protocol != ProtocolHTTP {
 		proxyMeterDrop.Inc()
 		return
 	}
 	ev.V = 2
+	beginMeter()
 	select {
 	case meterEvents <- ev:
 	default:
+		endMeter()
 		proxyMeterDrop.Inc()
 	}
 }
@@ -512,10 +543,28 @@ func MeterEvents() <-chan MeterEvent {
 	return meterEvents
 }
 
-// ServeMeter 把事件写成 JSON 行。生产环境把它接到独立日志；测试直接读 MeterEvents。
+// FinishMeter 由那一个消费者在把事件记入日志之后调用。
+func FinishMeter() {
+	endMeter()
+}
+
+// WaitMeterIdle 等到已接受的事件都被确认。转发路径不调用。
+// 通道已空仍可能要等：事件可能刚被取出，日志还没写上。
+func WaitMeterIdle() {
+	meterMu.Lock()
+	for meterInflight > 0 {
+		meterIdle.Wait()
+	}
+	meterMu.Unlock()
+}
+
+// ServeMeter 把事件写成 JSON 行。生产环境把它接到独立日志。
+// 写出一行之后 FinishMeter。测试若直接读 MeterEvents，也要在记入日志之后 FinishMeter。
+// 不能两个消费者同时读。
 func ServeMeter(w io.Writer) {
 	enc := json.NewEncoder(w)
 	for ev := range meterEvents {
 		_ = enc.Encode(ev)
+		FinishMeter()
 	}
 }

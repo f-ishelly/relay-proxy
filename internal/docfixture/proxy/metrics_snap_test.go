@@ -49,8 +49,6 @@ type labKey struct {
 
 var (
 	evMu       sync.Mutex
-	evCond     = sync.NewCond(&evMu)
-	evBusy     bool
 	evLog      []l1metrics.MeterEvent
 	evBase     int
 	baseSeries map[labKey]float64
@@ -59,34 +57,20 @@ var (
 func consumeMeters() {
 	ch := l1metrics.MeterEvents()
 	for {
-		evMu.Lock()
-		if len(ch) > 0 {
-			evBusy = true
-		}
-		evMu.Unlock()
 		ev, ok := <-ch
 		if !ok {
-			evMu.Lock()
-			evBusy = false
-			evCond.Broadcast()
-			evMu.Unlock()
 			return
 		}
 		evMu.Lock()
 		evLog = append(evLog, ev)
-		evBusy = len(ch) > 0
-		evCond.Broadcast()
+		// 确认放在追加之后。WaitMeterIdle 返回时这行已经在 evLog 里。
+		l1metrics.FinishMeter()
 		evMu.Unlock()
 	}
 }
 
 func waitMeterIdle() {
-	ch := l1metrics.MeterEvents()
-	evMu.Lock()
-	for len(ch) > 0 || evBusy {
-		evCond.Wait()
-	}
-	evMu.Unlock()
+	l1metrics.WaitMeterIdle()
 }
 
 func resetMetrics() {
