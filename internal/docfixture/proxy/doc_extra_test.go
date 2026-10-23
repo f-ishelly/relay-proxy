@@ -6,9 +6,11 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -353,7 +355,7 @@ func TestPutRetryIsOptIn(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !lim.retryPutDelete || lim.tunnelIdle != 5*time.Minute || lim.l2Response != 10*time.Second {
+		if !lim.retryPutDelete || lim.tunnelIdle != 5*time.Minute || lim.l2Response != 10*time.Second || lim.headerDeadline != 10*time.Second {
 			t.Fatalf("config: %+v", lim)
 		}
 		over, err := LimitsFromConfig(path, []string{"-retry-put-delete=false", "-l2-response-timeout=2s"})
@@ -675,7 +677,8 @@ func TestUpgradeRSTReason(t *testing.T) {
 func TestPartialHeaderTimeout(t *testing.T) {
 	resetMetrics()
 	lim := defaultLimits()
-	lim.tunnelIdle = 120 * time.Millisecond
+	lim.headerDeadline = 120 * time.Millisecond
+	lim.tunnelIdle = 5 * time.Second
 	l1 := startL1Limited(t, staticResolver{}, lim)
 	c, err := net.Dial("tcp", l1)
 	if err != nil {
@@ -725,15 +728,45 @@ func TestPartialHeaderTimeout(t *testing.T) {
 }
 
 func TestCachedGostRejectsBadHash(t *testing.T) {
+	t.Run("version", func(t *testing.T) {
+		bin := filepath.Join(t.TempDir(), "fake-gost")
+		script := "#!/bin/sh\necho 'gost v3.3.10 (go1.22)'\n"
+		if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := gostVersionOK(bin); err == nil {
+			t.Fatal("v3.3.10 was accepted as v3.3.1")
+		}
+		okBin := filepath.Join(t.TempDir(), "ok-gost")
+		if err := os.WriteFile(okBin, []byte("#!/bin/sh\necho 'gost v3.3.1 (go1.22)'\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := gostVersionOK(okBin); err != nil {
+			t.Fatal(err)
+		}
+	})
 	asset, ok := gostAssets[runtime.GOOS+"/"+runtime.GOARCH]
 	if !ok {
-		t.Fatalf("no pinned gost asset for %s/%s", runtime.GOOS, runtime.GOARCH)
+		msg := fmt.Sprintf("no pinned gost asset for %s/%s", runtime.GOOS, runtime.GOARCH)
+		if os.Getenv("GOST_REQUIRED") == "1" {
+			t.Fatal(msg)
+		}
+		t.Skip(msg)
 	}
-	dir := t.TempDir()
-	t.Setenv("XDG_CACHE_HOME", dir)
+	root := t.TempDir()
+	oldRoot := gostCacheRoot
+	oldGet := gostGet
+	gostCacheRoot = root
+	t.Cleanup(func() {
+		gostCacheRoot = oldRoot
+		gostGet = oldGet
+	})
 	path, err := gostCachePath()
 	if err != nil {
 		t.Fatal(err)
+	}
+	if gostBin != "" && path == gostBin {
+		t.Fatal("cache path is the binary TestMain is running")
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatal(err)
@@ -743,5 +776,195 @@ func TestCachedGostRejectsBadHash(t *testing.T) {
 	}
 	if reusableGost(path, asset.binarySHA) {
 		t.Fatal("truncated cache file was accepted")
+	}
+	gostGet = func(url string) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(bytes.NewReader([]byte("not-a-gost-archive"))),
+			Header:     make(http.Header),
+		}, nil
+	}
+	if err := downloadGost(asset, path); err == nil || !strings.Contains(err.Error(), "archive sha256") {
+		t.Fatalf("archive mismatch: %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "truncated" {
+		t.Fatalf("download overwrote cache: %q", got)
+	}
+}
+
+func TestResolveReasonLabelsConnect(t *testing.T) {
+	cases := []struct {
+		name   string
+		res    Resolver
+		node   string
+		reason string
+	}{
+		{"unknown", staticResolver{err: ErrUnknownNode}, l1metrics.NodeUnknown, l1metrics.ReasonUnknownNode},
+		{"empty", staticResolver{}, l1metrics.NodeUnknown, l1metrics.ReasonEmptyAddr},
+		{"resolver", staticResolver{err: errors.New("etcd unavailable")}, l1metrics.NodeUnknown, l1metrics.ReasonResolverError},
+		{"no-healthy", staticResolver{err: ErrNoHealthyAddr}, "node-a", l1metrics.ReasonNoUpstream},
+	}
+	req := fmt.Sprintf("CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nProxy-Authorization: Basic %s\r\n\r\n",
+		basicToken("app@node-a", "s3cret"))
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resetMetrics()
+			l1 := startL1(t, tc.res)
+			resp := doRequest(t, l1, req)
+			mustStatus(t, resp, 502)
+			handlers.Wait()
+			snap := snapMetrics()
+			if len(snap.Fails) != 1 || snap.Fails[0] != [2]string{tc.node, tc.reason} {
+				t.Fatalf("fails %#v", snap.Fails)
+			}
+			if len(snap.HTTPFails) != 0 || len(snap.Observes) != 0 {
+				t.Fatalf("leaked %#v %#v", snap.HTTPFails, snap.Observes)
+			}
+			if len(snap.Events) != 1 || snap.Events[0].Result != tc.reason || snap.Events[0].Protocol != l1metrics.ProtocolConnect || snap.Events[0].NodeID != "node-a" {
+				t.Fatalf("event %+v", snap.Events)
+			}
+		})
+	}
+}
+
+func TestConnectIdleTimeout(t *testing.T) {
+	resetMetrics()
+	origin := serveRaw(t, func(c net.Conn) {
+		defer c.Close()
+		br := bufio.NewReader(c)
+		_ = c.SetDeadline(time.Now().Add(3 * time.Second))
+		if _, err := readHTTPHead(br); err != nil {
+			return
+		}
+		if _, err := io.WriteString(c, "HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
+			return
+		}
+		_ = c.SetDeadline(time.Time{})
+		buf := make([]byte, 1)
+		_, _ = c.Read(buf)
+	})
+	lim := defaultLimits()
+	lim.tunnelIdle = 150 * time.Millisecond
+	l1 := startL1Limited(t, mapResolver{m: map[string]string{"node-a": origin}}, lim)
+	c, err := net.Dial("tcp", l1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	req := fmt.Sprintf("CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nProxy-Authorization: Basic %s\r\n\r\n",
+		basicToken("app@node-a", "s3cret"))
+	_ = c.SetDeadline(time.Now().Add(3 * time.Second))
+	resp := writeAndRead(t, c, req)
+	mustStatus(t, resp, 200)
+	_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 8)
+	if _, err := c.Read(buf); err == nil {
+		t.Fatal("expected idle close")
+	}
+	handlers.Wait()
+	snap := snapMetrics()
+	if snap.TunnelByReason[l1metrics.ReasonAbortIdleTimeout] != 1 {
+		t.Fatalf("connect idle %#v entered %d", snap.TunnelByReason, snap.Entered)
+	}
+	if snap.Entered < 1 || len(snap.Observes) == 0 || snap.Observes[0] != l1metrics.ResultOK {
+		t.Fatalf("tunnel was not established: %+v", snap)
+	}
+	if snap.BodyByReason[l1metrics.ReasonAbortIdleTimeout] != 0 || len(snap.HTTPFails) != 0 {
+		t.Fatalf("counted on http %#v %#v", snap.BodyByReason, snap.HTTPFails)
+	}
+}
+
+func TestSlowlorisHeaderDeadline(t *testing.T) {
+	resetMetrics()
+	lim := defaultLimits()
+	lim.headerDeadline = 200 * time.Millisecond
+	lim.tunnelIdle = 5 * time.Second
+	l1 := startL1Limited(t, staticResolver{}, lim)
+	c, err := net.Dial("tcp", l1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	start := time.Now()
+	go func() {
+		if _, err := c.Write([]byte("GET ")); err != nil {
+			return
+		}
+		tick := time.NewTicker(40 * time.Millisecond)
+		defer tick.Stop()
+		for range tick.C {
+			if _, err := c.Write([]byte("x")); err != nil {
+				return
+			}
+		}
+	}()
+	_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 256)
+	n, _ := c.Read(buf)
+	elapsed := time.Since(start)
+	if elapsed < 150*time.Millisecond || elapsed > time.Second {
+		t.Fatalf("header deadline cut at %s", elapsed)
+	}
+	handlers.Wait()
+	snap := snapMetrics()
+	if len(snap.HTTPRejects) != 1 || snap.HTTPRejects[0] != l1metrics.ReasonRejectHeaderTimeout {
+		t.Fatalf("rejects %#v status %s", snap.HTTPRejects, strconv.Quote(string(buf[:n])))
+	}
+	if len(snap.Rejects) != 0 || len(snap.HTTPFails) != 0 {
+		t.Fatalf("counted elsewhere %+v", snap)
+	}
+}
+
+func TestLimitsFromConfigBounds(t *testing.T) {
+	dir := t.TempDir()
+	write := func(body string) string {
+		t.Helper()
+		p := filepath.Join(dir, "proxy.json")
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	if _, err := LimitsFromConfig(write(`{"nope":true}`), nil); err == nil {
+		t.Fatal("unknown field accepted")
+	}
+	if _, err := LimitsFromConfig(write(`{"tunnel_idle":"0s"}`), nil); err == nil {
+		t.Fatal("zero duration accepted")
+	}
+	if _, err := LimitsFromConfig(write(`{"tunnel_idle":"-1s"}`), nil); err == nil {
+		t.Fatal("negative duration accepted")
+	}
+	if _, err := LimitsFromConfig(write(`{"tunnel_idle":"1h1s"}`), nil); err == nil {
+		t.Fatal("tunnel idle above 1h accepted")
+	}
+	if _, err := LimitsFromConfig(write(`{"header_deadline":"1m1s"}`), nil); err == nil {
+		t.Fatal("header deadline above 1m accepted")
+	}
+	if _, err := LimitsFromConfig(write(`{"l2_response_timeout":"2m1s"}`), nil); err == nil {
+		t.Fatal("l2 response above 2m accepted")
+	}
+	if _, err := LimitsFromConfig(write(`{"tunnel_idle":"20s","half_close_idle":"30s"}`), nil); err == nil {
+		t.Fatal("half-close idle above tunnel idle accepted")
+	}
+	if _, err := LimitsFromConfig("", []string{"-tunnel-idle=10s"}); err == nil {
+		t.Fatal("flag left half-close idle above tunnel idle")
+	}
+	lim, err := LimitsFromConfig(write(`{"tunnel_idle":"1h","half_close_idle":"1h","l2_response_timeout":"2m","header_deadline":"1m"}`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lim.tunnelIdle != time.Hour || lim.halfCloseIdle != time.Hour || lim.l2Response != 2*time.Minute || lim.headerDeadline != time.Minute {
+		t.Fatalf("boundary %+v", lim)
+	}
+	lim, err = LimitsFromConfig("", []string{"-header-deadline=10s", "-half-close-idle=10s", "-tunnel-idle=10s"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lim.headerDeadline != 10*time.Second || lim.halfCloseIdle != 10*time.Second || lim.tunnelIdle != 10*time.Second {
+		t.Fatalf("flags %+v", lim)
 	}
 }

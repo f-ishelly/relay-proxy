@@ -33,11 +33,13 @@ import (
 )
 
 var (
-	gostA    string
-	gostB    string
-	gostBad  string
-	gostBin  string
-	gostSkip string
+	gostA         string
+	gostB         string
+	gostBad       string
+	gostBin       string
+	gostSkip      string
+	gostCacheRoot string
+	gostGet       = http.Get
 )
 
 func TestMain(m *testing.M) {
@@ -53,6 +55,11 @@ func TestMain(m *testing.M) {
 			addr, cmd, err := startGost(user, pass)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, err)
+				for _, c := range cmds {
+					if c != nil && c.Process != nil {
+						_ = c.Process.Kill()
+					}
+				}
 				os.Exit(1)
 			}
 			cmds = append(cmds, cmd)
@@ -154,9 +161,13 @@ func prepareGost() (string, error) {
 }
 
 func gostCachePath() (string, error) {
-	base, err := os.UserCacheDir()
-	if err != nil {
-		return "", fmt.Errorf("gost cache dir: %w", err)
+	base := gostCacheRoot
+	if base == "" {
+		var err error
+		base, err = os.UserCacheDir()
+		if err != nil {
+			return "", fmt.Errorf("gost cache dir: %w", err)
+		}
 	}
 	return filepath.Join(base, "relay-proxy", "gost-v3.3.1", runtime.GOOS+"-"+runtime.GOARCH, "gost"), nil
 }
@@ -183,7 +194,7 @@ func gostVersionOK(bin string) error {
 	cmd := exec.Command(bin, "-V")
 	out, err := cmd.CombinedOutput()
 	text := strings.TrimSpace(string(out))
-	if !strings.Contains(text, "gost v3.3.1") {
+	if !gostVersionToken(text, "v3.3.1") {
 		if err != nil {
 			return fmt.Errorf("GOST_BIN %q failed -V (%v): %s", bin, err, text)
 		}
@@ -192,12 +203,22 @@ func gostVersionOK(bin string) error {
 	return nil
 }
 
+// gostVersionToken matches the version as a whole field. "v3.3.10" is not "v3.3.1".
+func gostVersionToken(text, ver string) bool {
+	for _, f := range strings.Fields(text) {
+		if f == ver {
+			return true
+		}
+	}
+	return false
+}
+
 func downloadGost(asset gostAsset, dest string) error {
 	dir := filepath.Dir(dest)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	resp, err := http.Get("https://github.com/go-gost/gost/releases/download/v3.3.1/" + asset.archive)
+	resp, err := gostGet("https://github.com/go-gost/gost/releases/download/v3.3.1/" + asset.archive)
 	if err != nil {
 		return fmt.Errorf("gost v3.3.1 download failed: %v; set GOST_BIN to a gost v3.3.1 binary", err)
 	}
@@ -478,11 +499,18 @@ func assertBalanced(t *testing.T, snap metricSnap) {
 
 func waitCalls(t *testing.T, pred func(metricSnap) bool) metricSnap {
 	t.Helper()
-	snap := snapMetrics()
-	if !pred(snap) {
-		t.Logf("snapshot did not match yet: %+v", snap)
+	deadline := time.Now().Add(3 * time.Second)
+	var snap metricSnap
+	for {
+		snap = snapMetrics()
+		if pred(snap) {
+			return snap
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("snapshot did not match: %+v", snap)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
-	return snap
 }
 
 type scriptConn struct {
@@ -872,6 +900,7 @@ func TestExpect100Continue(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("origin did not see body")
 	}
+	handlers.Wait()
 	snap := waitCalls(t, func(c metricSnap) bool {
 		return len(c.HTTPObserves) == 1 && len(c.Events) == 1 && c.HTTPEntered == 1 && c.HTTPLeft == 1 && c.HTTPTunnels == 1
 	})
@@ -930,6 +959,7 @@ func TestExpect100RejectedDoesNotForwardBody(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("origin did not finish")
 	}
+	handlers.Wait()
 	snap := waitCalls(t, func(c metricSnap) bool {
 		return len(c.HTTPObserves) == 1 && c.HTTPObserves[0] == l1metrics.ResultOK && len(c.HTTPSetup) == 1 && c.HTTPEntered == c.HTTPLeft && c.HTTPTunnels == c.HTTPEntered
 	})
@@ -1321,15 +1351,15 @@ func TestDialAndResolve502(t *testing.T) {
 		mustStatus(t, resp, 502)
 		handlers.Wait()
 		snap := snapMetrics()
-		if len(snap.HTTPFails) != 1 || snap.HTTPFails[0] != [2]string{l1metrics.NodeUnknown, l1metrics.ReasonNoUpstream} {
+		if len(snap.HTTPFails) != 1 || snap.HTTPFails[0] != [2]string{l1metrics.NodeUnknown, l1metrics.ReasonUnknownNode} {
 			t.Fatalf("fails %#v", snap.HTTPFails)
 		}
 		if len(snap.HTTPObserves) != 0 {
-			t.Fatalf("no_upstream observed %#v", snap.HTTPObserves)
+			t.Fatalf("unknown_node observed %#v", snap.HTTPObserves)
 		}
 		assertSetup(t, snap)
 		assertBalanced(t, snap)
-		if len(snap.Events) != 1 || snap.Events[0].Result != l1metrics.ReasonNoUpstream || snap.Events[0].Protocol != l1metrics.ProtocolHTTP {
+		if len(snap.Events) != 1 || snap.Events[0].Result != l1metrics.ReasonUnknownNode || snap.Events[0].Protocol != l1metrics.ProtocolHTTP {
 			t.Fatalf("event %+v", snap.Events)
 		}
 		assertNoConnectMetrics(t, snap)
@@ -1360,14 +1390,36 @@ func TestDialAndResolve502(t *testing.T) {
 		mustStatus(t, resp, 502)
 		handlers.Wait()
 		snap := snapMetrics()
-		if len(snap.HTTPFails) != 1 || snap.HTTPFails[0] != [2]string{l1metrics.NodeUnknown, l1metrics.ReasonNoUpstream} {
+		if len(snap.HTTPFails) != 1 || snap.HTTPFails[0] != [2]string{l1metrics.NodeUnknown, l1metrics.ReasonEmptyAddr} {
 			t.Fatalf("fails %#v", snap.HTTPFails)
 		}
 		if len(snap.HTTPObserves) != 0 {
-			t.Fatalf("no_upstream observed %#v", snap.HTTPObserves)
+			t.Fatalf("empty_addr observed %#v", snap.HTTPObserves)
 		}
 		assertSetup(t, snap)
 		assertBalanced(t, snap)
+		if len(snap.Events) != 1 || snap.Events[0].Result != l1metrics.ReasonEmptyAddr {
+			t.Fatalf("event %+v", snap.Events)
+		}
+		assertNoConnectMetrics(t, snap)
+	})
+	t.Run("resolver", func(t *testing.T) {
+		resetMetrics()
+		l1 := startL1(t, staticResolver{err: errors.New("etcd unavailable")})
+		resp := doRequest(t, l1, fmt.Sprintf("GET http://127.0.0.1/a HTTP/1.1\r\nHost: h\r\nProxy-Authorization: Basic %s\r\n\r\n",
+			basicToken("app@node-a", "s3cret")))
+		mustStatus(t, resp, 502)
+		handlers.Wait()
+		snap := snapMetrics()
+		if len(snap.HTTPFails) != 1 || snap.HTTPFails[0] != [2]string{l1metrics.NodeUnknown, l1metrics.ReasonResolverError} {
+			t.Fatalf("fails %#v", snap.HTTPFails)
+		}
+		if len(snap.HTTPObserves) != 0 {
+			t.Fatalf("resolver_error observed %#v", snap.HTTPObserves)
+		}
+		if len(snap.Events) != 1 || snap.Events[0].Result != l1metrics.ReasonResolverError || snap.Events[0].NodeID != "node-a" {
+			t.Fatalf("event %+v", snap.Events)
+		}
 		assertNoConnectMetrics(t, snap)
 	})
 }
@@ -1415,7 +1467,7 @@ func TestL2ResponseTimeout(t *testing.T) {
 func TestClientIdleTimeout(t *testing.T) {
 	resetMetrics()
 	lim := defaultLimits()
-	lim.tunnelIdle = 200 * time.Millisecond
+	lim.headerDeadline = 200 * time.Millisecond
 	l1 := startL1Limited(t, staticResolver{}, lim)
 	c, err := net.Dial("tcp", l1)
 	if err != nil {

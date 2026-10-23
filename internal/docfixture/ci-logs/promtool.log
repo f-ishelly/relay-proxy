@@ -1,2 +1,9 @@
+go: go version go1.22.2 linux/amd64
+head: 760fd8c823d59540b2cc7e9926b765a20b631a73
+command: promtool check rules internal/docfixture/prom/sli_rules.yml && promtool test rules internal/docfixture/prom/sli_test.yml
+
+Checking internal/docfixture/prom/sli_rules.yml
+  SUCCESS: 10 rules found
+
   SUCCESS
 

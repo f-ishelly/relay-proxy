@@ -37,6 +37,7 @@ type metricSnap struct {
 	HTTPRetries    int
 	HTTPBodyAborts int
 	BodyByReason   map[string]int
+	TunnelByReason map[string]int
 	Drops          int
 	Events         []l1metrics.MeterEvent
 }
@@ -127,6 +128,7 @@ func snapMetrics() metricSnap {
 	for _, n := range snap.BodyByReason {
 		snap.HTTPBodyAborts += n
 	}
+	snap.TunnelByReason = sumLabel(d, "proxy_tunnel_abort_total", "reason")
 	snap.Drops = asInt(sumMatch(d, "proxy_meter_drop_total", nil))
 
 	evMu.Lock()

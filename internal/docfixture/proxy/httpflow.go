@@ -41,7 +41,7 @@ func serveProxyConnLimited(conn net.Conn, resolver Resolver, lim proxyLimits) er
 	defer session.stop()
 	mc := &modeConn{Conn: conn, session: session}
 	br := bufio.NewReaderSize(mc, maxHTTPHead)
-	head, err := readHTTPHead(br)
+	head, err := readRequestHead(mc, br)
 	if err != nil {
 		// 一个字节都没有：不计数。零字节的空闲超时也在这里，不记拒绝。
 		// 已经读到一部分才超时：slowloris，记 header_timeout。
@@ -209,7 +209,7 @@ func serveAbsolute(client net.Conn, session *httpSession, mc *modeConn, br *bufi
 		try = nil
 		if head == nil {
 			var err error
-			head, err = readHTTPHead(br)
+			head, err = readRequestHead(mc, br)
 			if err != nil {
 				if len(head) == 0 {
 					return err
@@ -641,14 +641,10 @@ func (u *upstream) close(session *httpSession) {
 // 在 CONNECT 出结果时记一次：失败走 failOpen，成功在返回隧道之前记 ok。L2 返回 200 时请求还没结束，不在这里记请求的 ok。
 func openUpstream(session *httpSession, username, password, nodeID, target string, resolver Resolver, client net.Conn, try *httpTry) (*upstream, error) {
 	addr, err := resolver.Resolve(nodeID)
-	if err != nil || addr == "" {
-		inTable := errors.Is(err, ErrNoHealthyAddr)
-		try.failUpstream(l1metrics.NodeLabel(inTable, nodeID), l1metrics.ReasonNoUpstream)
-		if err == nil {
-			err = errors.New("empty address")
-		}
+	if label, reason, rerr := classifyResolve(nodeID, addr, err); reason != "" {
+		try.failUpstream(label, reason)
 		writeHTTPError(client, http.StatusBadGateway, "Bad Gateway", "")
-		return nil, fmt.Errorf("resolve node %s failed: %w", nodeID, err)
+		return nil, fmt.Errorf("resolve node %s failed: %w", nodeID, rerr)
 	}
 	if try.started.IsZero() {
 		try.started = time.Now()
@@ -1221,8 +1217,7 @@ func pipeUpgrade(client net.Conn, clientR io.Reader, up net.Conn, upR io.Reader,
 		}
 		_ = closeWrite(dst)
 		if reverse != nil {
-			reverse.half.Store(true)
-			_ = reverse.SetReadDeadline(time.Now().Add(halfIdle))
+			reverse.noteHalf(halfIdle)
 		}
 	}
 	go func() { relay(up, clientR, upMode, true) }()
@@ -1264,6 +1259,21 @@ func writeHTTPError(w io.Writer, status int, reason, header string) {
 	}
 	b.WriteString("Content-Length: 0\r\nConnection: close\r\n\r\n")
 	_, _ = io.WriteString(w, b.String())
+}
+
+// readRequestHead 用这条连接的 headerDeadline 做绝对截止。
+// 截止时间在开始读头时设一次，读到字节不顺延，slowloris 不能靠慢慢送字节把连接留住。
+// 读完或失败后清掉，后面的正文和空闲仍用 tunnelIdle。
+func readRequestHead(mc *modeConn, br *bufio.Reader) ([]byte, error) {
+	d := headerDeadline
+	if mc != nil && mc.session != nil && mc.session.lim.headerDeadline > 0 {
+		d = mc.session.lim.headerDeadline
+	}
+	if mc != nil {
+		mc.beginHeader(time.Now().Add(d))
+		defer mc.endHeader()
+	}
+	return readHTTPHead(br)
 }
 
 func readHTTPHead(r *bufio.Reader) ([]byte, error) {
@@ -1412,12 +1422,38 @@ func isTimeout(err error) bool {
 
 // modeConn 在每次 Read 前刷新空闲截止时间。半关闭后改用这条连接的 halfCloseIdle。
 // disabled 时不再改截止时间，留给 handleConnect 自己的 idleConn。
+// headerUntil 非零时是读请求头的绝对截止，不因读到字节而刷新，也不去拨会话空闲计时。
 // 会话空闲计时到点会先置位再 Close。这时的读错误记成 errIdleExpired，而不是 net.ErrClosed。
 type modeConn struct {
 	net.Conn
-	session  *httpSession
-	half     atomic.Bool
-	disabled atomic.Bool
+	session     *httpSession
+	mu          sync.Mutex
+	half        atomic.Bool
+	disabled    atomic.Bool
+	headerUntil atomic.Int64
+}
+
+func (m *modeConn) beginHeader(deadline time.Time) {
+	m.headerUntil.Store(deadline.UnixNano())
+	_ = m.SetReadDeadline(deadline)
+}
+
+func (m *modeConn) endHeader() {
+	m.headerUntil.Store(0)
+	if !m.disabled.Load() {
+		_ = m.SetReadDeadline(time.Time{})
+	}
+}
+
+// noteHalf 和 Read 共用 mu，避免 Read 在看到半关闭之前把截止时间又拨回整条隧道的空闲。
+func (m *modeConn) noteHalf(d time.Duration) {
+	m.mu.Lock()
+	m.half.Store(true)
+	if d <= 0 {
+		d = halfCloseIdleTimeout
+	}
+	_ = m.Conn.SetReadDeadline(time.Now().Add(d))
+	m.mu.Unlock()
 }
 
 func (m *modeConn) Read(p []byte) (int, error) {
@@ -1425,15 +1461,18 @@ func (m *modeConn) Read(p []byte) (int, error) {
 	if m.session != nil {
 		lim = m.session.lim
 	}
-	if !m.disabled.Load() {
+	m.mu.Lock()
+	inHeader := m.headerUntil.Load() != 0
+	if !m.disabled.Load() && !inHeader {
 		d := lim.tunnelIdle
 		if m.half.Load() {
 			d = lim.halfCloseIdle
 		}
 		_ = m.Conn.SetReadDeadline(time.Now().Add(d))
 	}
+	m.mu.Unlock()
 	n, err := m.Conn.Read(p)
-	if n > 0 && m.session != nil {
+	if n > 0 && m.session != nil && m.headerUntil.Load() == 0 {
 		m.session.touch()
 	}
 	if err == nil || m.session == nil {

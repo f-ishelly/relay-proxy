@@ -208,3 +208,41 @@ groups:
           severity: page
         annotations:
           summary: plain HTTP tunnel setup P95 above 200ms on one node
+      - alert: ProxyUnknownUpstream
+        # Unknown failures are not in the healthy failure rate. This page uses their own
+        # volume (>= 100 in 5m) and their share of every attempt (> 50%). It does not
+        # require a healthy-node denominator, so a wiped routing table still pages.
+        # A handful of stray unknown lookups stays under the volume floor.
+        expr: |
+          (
+            (sum(increase(proxy_upstream_fail_total{node_id="unknown",reason=~"unknown_node|empty_addr|resolver_error"}[5m])) or vector(0))
+            +
+            (sum(increase(proxy_http_upstream_fail_total{node_id="unknown",reason=~"unknown_node|empty_addr|resolver_error"}[5m])) or vector(0))
+          ) >= 100
+          and
+          (
+            (
+              (sum(increase(proxy_upstream_fail_total{node_id="unknown",reason=~"unknown_node|empty_addr|resolver_error"}[5m])) or vector(0))
+              +
+              (sum(increase(proxy_http_upstream_fail_total{node_id="unknown",reason=~"unknown_node|empty_addr|resolver_error"}[5m])) or vector(0))
+            )
+            /
+            (
+              (sum(increase(proxy_upstream_fail_total{node_id="unknown",reason=~"unknown_node|empty_addr|resolver_error"}[5m])) or vector(0))
+              +
+              (sum(increase(proxy_http_upstream_fail_total{node_id="unknown",reason=~"unknown_node|empty_addr|resolver_error"}[5m])) or vector(0))
+              +
+              (sum(increase(proxy_upstream_fail_total{node_id!="unknown"}[5m])) or vector(0))
+              +
+              (sum(increase(proxy_http_upstream_fail_total{node_id!="unknown"}[5m])) or vector(0))
+              +
+              (sum(increase(proxy_connect_latency_ms_count{node_id!="unknown",result="ok"}[5m])) or vector(0))
+              +
+              (sum(increase(proxy_http_request_latency_ms_count{node_id!="unknown",result="ok"}[5m])) or vector(0))
+            )
+          ) > 0.5
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: routing failures on node_id=unknown above half of all attempts

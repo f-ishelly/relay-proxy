@@ -299,19 +299,22 @@ tests:
         exp_alerts: []
 
   # increase() ignores the value a counter already has when the series first appears.
-  # 100 failures before the first scrape, and no later increments, do not page.
-  # This is the rule's actual behavior: the initial sample is not an increase.
+  # The evaluation window starts at that first sample (eval_time equals the range).
+  # 100 failures present at t=0, and no later increments, are not an increase.
   - interval: 1m
     input_series:
       - series: 'proxy_http_upstream_fail_total{node_id="n1",reason="dial"}'
         values: '100+0x40'
     promql_expr_test:
-      - eval_time: 15m
+      - eval_time: 5m
         expr: sum(increase(proxy_http_upstream_fail_total{node_id!="unknown"}[5m]))
         exp_samples:
           - labels: '{}'
             value: 0
     alert_rule_test:
+      - eval_time: 5m
+        alertname: ProxyHTTPFailureRate
+        exp_alerts: []
       - eval_time: 15m
         alertname: ProxyHTTPFailureRate
         exp_alerts: []
@@ -319,20 +322,23 @@ tests:
         alertname: ProxyHTTPFailureRateByNode
         exp_alerts: []
 
-  # The same counter starts at 100 and then climbs by 30 each minute.
-  # increase() over 5m counts the later steps (150) and drops the initial 100.
-  # The page still fires, from the movement after the first sample.
+  # The same counter starts at 100 at t=0 and then climbs by 30 each minute.
+  # At 5m the window is exactly the series lifetime. increase() is 150, not 250:
+  # the value already present on the first sample is not an increase.
   - interval: 1m
     input_series:
       - series: 'proxy_http_upstream_fail_total{node_id="n1",reason="dial"}'
         values: '100+30x40'
     promql_expr_test:
-      - eval_time: 15m
+      - eval_time: 5m
         expr: sum(increase(proxy_http_upstream_fail_total{node_id!="unknown"}[5m]))
         exp_samples:
           - labels: '{}'
             value: 150
     alert_rule_test:
+      - eval_time: 5m
+        alertname: ProxyHTTPFailureRate
+        exp_alerts: []
       - eval_time: 15m
         alertname: ProxyHTTPFailureRate
         exp_alerts:
@@ -423,12 +429,45 @@ tests:
             exp_annotations:
               summary: combined failure rate above 2%
 
-  # node_id="unknown" is out of the numerator and the denominator.
-  # A large sentinel failure count must not page, and must not push a healthy node over 2%.
+  # node_id="unknown" stays out of the healthy failure rate.
+  # A wiped table is a large unknown_node series and no healthy samples: the healthy
+  # page stays silent, and ProxyUnknownUpstream fires.
   - interval: 1m
     input_series:
-      - series: 'proxy_http_upstream_fail_total{node_id="unknown",reason="no_upstream"}'
+      - series: 'proxy_http_upstream_fail_total{node_id="unknown",reason="unknown_node"}'
         values: '0+400x40'
+    promql_expr_test:
+      - eval_time: 15m
+        expr: sum(increase(proxy_http_upstream_fail_total{node_id!="unknown"}[5m])) or vector(0)
+        exp_samples:
+          - labels: '{}'
+            value: 0
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: ProxyHTTPFailureRate
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: ProxyUnknownUpstream
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: ProxyHTTPFailureRate
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: ProxyHTTPFailureRateByNode
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: ProxyUnknownUpstream
+        exp_alerts:
+          - exp_labels:
+              severity: page
+            exp_annotations:
+              summary: routing failures on node_id=unknown above half of all attempts
+
+  # A few stray unknown lookups do not page, and do not move the healthy rate.
+  - interval: 1m
+    input_series:
+      - series: 'proxy_http_upstream_fail_total{node_id="unknown",reason="resolver_error"}'
+        values: '0+1x40'
       - series: 'proxy_http_upstream_fail_total{node_id="n1",reason="dial"}'
         values: '0+1x40'
       - series: 'proxy_http_request_latency_ms_count{node_id="n1",result="ok"}'
@@ -439,4 +478,7 @@ tests:
         exp_alerts: []
       - eval_time: 15m
         alertname: ProxyHTTPFailureRateByNode
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: ProxyUnknownUpstream
         exp_alerts: []

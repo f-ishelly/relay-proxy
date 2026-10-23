@@ -28,19 +28,37 @@ import (
 var ErrUnknownNode = errors.New("unknown node")
 
 // ErrNoHealthyAddr 表示该 node_id 已在路由表里，但当前没有健康地址。
-// 只有这个错误保留原来的 node_id 标签。
+// 只有这个错误保留原来的 node_id 标签，reason 仍是 no_upstream。
 var ErrNoHealthyAddr = errors.New("no healthy address")
 
 // Resolver 按 node_id 给出一个健康的 L2 地址。
-// 成功必须返回非空地址。返回 ("", nil) 按解析失败处理：502，node_id="unknown"，reason 为 no_upstream。
-// 从未收录返回 ErrUnknownNode；已收录但没有健康地址返回 ErrNoHealthyAddr。
-// 调用方只在 errors.Is(err, ErrNoHealthyAddr) 时把原来的 node_id 写入标签。
-// 其他错误，包括 ErrUnknownNode 和任何未预期的错误，都记 node_id="unknown"。
-// 这两种失败的 reason 都是 no_upstream。
-// 经 errors.Join 同时带上 ErrNoHealthyAddr 的错误也会留下原来的 ID，
+// 成功必须返回非空地址。返回 ("", nil) 按解析失败处理：502，node_id="unknown"，reason 为 empty_addr。
+// 从未收录返回 ErrUnknownNode，reason 为 unknown_node。
+// 已收录但没有健康地址返回 ErrNoHealthyAddr，保留原来的 node_id，reason 为 no_upstream。
+// 其它错误（etcd 超时、watch 中断）是 resolver_error，node_id 为 unknown。
+// 三种哨兵都不把用户名里的 ID 写进 Prometheus 标签。
+// 经 errors.Join 同时带上 ErrNoHealthyAddr 的错误会留下原来的 ID，
 // 例如 errors.Join(ErrUnknownNode, ErrNoHealthyAddr)。Resolver 不得把这两个哨兵 Join 在一起。
 type Resolver interface {
 	Resolve(nodeID string) (addr string, err error)
+}
+
+// classifyResolve 把 Resolve 的结果分成标签和 reason。
+// 成功且地址非空时 reason 为空。否则返回要写入失败计数的 node_id 和 reason。
+func classifyResolve(nodeID, addr string, err error) (label, reason string, ret error) {
+	if err == nil && addr != "" {
+		return nodeID, "", nil
+	}
+	if errors.Is(err, ErrNoHealthyAddr) {
+		return l1metrics.NodeLabel(true, nodeID), l1metrics.ReasonNoUpstream, err
+	}
+	if errors.Is(err, ErrUnknownNode) {
+		return l1metrics.NodeUnknown, l1metrics.ReasonUnknownNode, err
+	}
+	if err == nil {
+		return l1metrics.NodeUnknown, l1metrics.ReasonEmptyAddr, errors.New("empty address")
+	}
+	return l1metrics.NodeUnknown, l1metrics.ReasonResolverError, err
 }
 
 // sharedSecret 是全系统那一份共享口令，与客户端登录 L1 以及 L2 的 auth.password 相同。
@@ -61,6 +79,18 @@ var halfCloseIdleTimeout = 30 * time.Second
 // gost 的 idleTimeout 默认是 0（不限制），L1 不能靠它把两边都安静的隧道收掉。默认 5 分钟。
 var tunnelIdleTimeout = 5 * time.Minute
 
+// headerDeadline 是读请求头的绝对上限，从这次开始读头起算，不因读到一个字节而顺延。
+// 默认 10s。用来切断 slowloris。一个字节都没有仍不记拒绝；已经读到一部分才到点记 header_timeout。
+var headerDeadline = 10 * time.Second
+
+// 配置里的时长上限。超过就拒绝这份配置，避免把空闲或请求头等待设成几天。
+const (
+	maxTunnelIdle     = time.Hour
+	maxHalfCloseIdle  = time.Hour
+	maxL2Response     = 2 * time.Minute
+	maxHeaderDeadline = time.Minute
+)
+
 // dialUpstream 拨向选定 L2 的 HTTP 监听地址。默认 TCP，超时 3s。
 var dialUpstream = func(addr string) (net.Conn, error) {
 	return net.DialTimeout("tcp", addr, 3*time.Second)
@@ -79,12 +109,14 @@ var errHalfCloseIdle = errors.New("idle after half-close")
 // 包级变量只作为进程默认值。LimitsFromConfig 从 JSON 配置文件和命令行得到一份，
 // 调用方把它传给 serveProxyConnLimited 或 handleConnect。请求路径不改包级变量。
 // 配置文件示例：
-// {"retry_put_delete":false,"tunnel_idle":"5m","half_close_idle":"30s","l2_response_timeout":"10s"}
-// 命令行：-proxy-config、-retry-put-delete、-tunnel-idle、-half-close-idle、-l2-response-timeout。
+// {"retry_put_delete":false,"tunnel_idle":"5m","half_close_idle":"30s","l2_response_timeout":"10s","header_deadline":"10s"}
+// 命令行：-proxy-config、-retry-put-delete、-tunnel-idle、-half-close-idle、-l2-response-timeout、-header-deadline。
+// half_close_idle 不得大于 tunnel_idle。未知 JSON 字段拒绝。
 type proxyLimits struct {
 	tunnelIdle     time.Duration
 	halfCloseIdle  time.Duration
 	l2Response     time.Duration
+	headerDeadline time.Duration
 	retryPutDelete bool
 	dial           func(string) (net.Conn, error)
 }
@@ -94,6 +126,7 @@ func defaultLimits() proxyLimits {
 		tunnelIdle:     tunnelIdleTimeout,
 		halfCloseIdle:  halfCloseIdleTimeout,
 		l2Response:     l2ResponseTimeout,
+		headerDeadline: headerDeadline,
 		retryPutDelete: retryPutDelete,
 		dial:           dialUpstream,
 	}
@@ -110,6 +143,9 @@ func fillLimits(l proxyLimits) proxyLimits {
 	}
 	if l.l2Response <= 0 {
 		l.l2Response = d.l2Response
+	}
+	if l.headerDeadline <= 0 {
+		l.headerDeadline = d.headerDeadline
 	}
 	if l.dial == nil {
 		l.dial = d.dial
@@ -129,6 +165,7 @@ func LimitsFromConfig(path string, args []string) (proxyLimits, error) {
 	tunnelStr := fs.String("tunnel-idle", "", "整条隧道空闲兜底，例如 5m")
 	halfStr := fs.String("half-close-idle", "", "半关闭后的空闲上限，例如 30s")
 	l2Str := fs.String("l2-response-timeout", "", "等待 L2 CONNECT 状态行的上限，例如 10s")
+	headStr := fs.String("header-deadline", "", "读请求头的绝对上限，例如 10s")
 	if err := fs.Parse(args); err != nil {
 		return proxyLimits{}, err
 	}
@@ -141,8 +178,10 @@ func LimitsFromConfig(path string, args []string) (proxyLimits, error) {
 		if err != nil {
 			return proxyLimits{}, err
 		}
+		dec := json.NewDecoder(strings.NewReader(string(b)))
+		dec.DisallowUnknownFields()
 		var cfg proxyFile
-		if err := json.Unmarshal(b, &cfg); err != nil {
+		if err := dec.Decode(&cfg); err != nil {
 			return proxyLimits{}, err
 		}
 		if err := cfg.apply(&lim); err != nil {
@@ -156,14 +195,20 @@ func LimitsFromConfig(path string, args []string) (proxyLimits, error) {
 		}
 		lim.retryPutDelete = v
 	}
-	if err := applyDuration(&lim.tunnelIdle, *tunnelStr, "tunnel-idle"); err != nil {
+	if err := applyDuration(&lim.tunnelIdle, *tunnelStr, "tunnel-idle", maxTunnelIdle); err != nil {
 		return proxyLimits{}, err
 	}
-	if err := applyDuration(&lim.halfCloseIdle, *halfStr, "half-close-idle"); err != nil {
+	if err := applyDuration(&lim.halfCloseIdle, *halfStr, "half-close-idle", maxHalfCloseIdle); err != nil {
 		return proxyLimits{}, err
 	}
-	if err := applyDuration(&lim.l2Response, *l2Str, "l2-response-timeout"); err != nil {
+	if err := applyDuration(&lim.l2Response, *l2Str, "l2-response-timeout", maxL2Response); err != nil {
 		return proxyLimits{}, err
+	}
+	if err := applyDuration(&lim.headerDeadline, *headStr, "header-deadline", maxHeaderDeadline); err != nil {
+		return proxyLimits{}, err
+	}
+	if lim.halfCloseIdle > lim.tunnelIdle {
+		return proxyLimits{}, fmt.Errorf("half-close-idle %s must be <= tunnel-idle %s", lim.halfCloseIdle, lim.tunnelIdle)
 	}
 	return lim, nil
 }
@@ -173,22 +218,26 @@ type proxyFile struct {
 	TunnelIdle     string `json:"tunnel_idle"`
 	HalfCloseIdle  string `json:"half_close_idle"`
 	L2Response     string `json:"l2_response_timeout"`
+	HeaderDeadline string `json:"header_deadline"`
 }
 
 func (c proxyFile) apply(l *proxyLimits) error {
 	if c.RetryPutDelete != nil {
 		l.retryPutDelete = *c.RetryPutDelete
 	}
-	if err := applyDuration(&l.tunnelIdle, c.TunnelIdle, "tunnel_idle"); err != nil {
+	if err := applyDuration(&l.tunnelIdle, c.TunnelIdle, "tunnel_idle", maxTunnelIdle); err != nil {
 		return err
 	}
-	if err := applyDuration(&l.halfCloseIdle, c.HalfCloseIdle, "half_close_idle"); err != nil {
+	if err := applyDuration(&l.halfCloseIdle, c.HalfCloseIdle, "half_close_idle", maxHalfCloseIdle); err != nil {
 		return err
 	}
-	return applyDuration(&l.l2Response, c.L2Response, "l2_response_timeout")
+	if err := applyDuration(&l.l2Response, c.L2Response, "l2_response_timeout", maxL2Response); err != nil {
+		return err
+	}
+	return applyDuration(&l.headerDeadline, c.HeaderDeadline, "header_deadline", maxHeaderDeadline)
 }
 
-func applyDuration(dst *time.Duration, raw, name string) error {
+func applyDuration(dst *time.Duration, raw, name string, max time.Duration) error {
 	if raw == "" {
 		return nil
 	}
@@ -198,6 +247,9 @@ func applyDuration(dst *time.Duration, raw, name string) error {
 	}
 	if d <= 0 {
 		return fmt.Errorf("%s must be > 0", name)
+	}
+	if d > max {
+		return fmt.Errorf("%s must be <= %s", name, max)
 	}
 	*dst = d
 	return nil
@@ -298,7 +350,7 @@ func handleConnect(clientConn net.Conn, username, password, target string, resol
 		return reply(http.StatusBadRequest, "Bad Request", "", err)
 	}
 	meter.User = user
-	// 事件保留请求的 node_id。Prometheus 只在 ErrNoHealthyAddr 时保留它，其它解析失败记 unknown。
+	// 事件保留请求的 node_id。Prometheus 只在 ErrNoHealthyAddr 时保留它。
 	meter.NodeID = nodeID
 
 	host, port, err := net.SplitHostPort(target)
@@ -316,14 +368,10 @@ func handleConnect(clientConn net.Conn, username, password, target string, resol
 	meter.TargetPort = port
 
 	upstreamAddr, err := resolver.Resolve(nodeID)
-	if err != nil || upstreamAddr == "" {
-		inTable := errors.Is(err, ErrNoHealthyAddr)
-		l1metrics.Fail502(l1metrics.NodeLabel(inTable, nodeID), l1metrics.ReasonNoUpstream)
-		finish(l1metrics.ReasonNoUpstream)
-		if err == nil {
-			err = errors.New("empty address")
-		}
-		return badGateway(fmt.Errorf("resolve node %s failed: %w", nodeID, err))
+	if label, reason, rerr := classifyResolve(nodeID, upstreamAddr, err); reason != "" {
+		l1metrics.Fail502(label, reason)
+		finish(reason)
+		return badGateway(fmt.Errorf("resolve node %s failed: %w", nodeID, rerr))
 	}
 
 	handshakeStart = time.Now()
@@ -472,18 +520,20 @@ func handleConnect(clientConn net.Conn, username, password, target string, resol
 			record(copyErr)
 			return
 		}
-		if werr := closeWrite(dst); werr != nil {
-			record(werr)
-			return
-		}
-		reverse.halfClosed.Store(true)
-		_ = reverse.SetReadDeadline(time.Now().Add(lim.halfCloseIdle))
+		// closeWrite 失败不当成隧道中断，也不关另一端。对端经常已经先关了，
+		// 这时再把两端都 Close，另一方向会读到 net.ErrClosed，把正常半关闭记成中断。
+		// 明文 HTTP 的 pipeUpgrade 同样忽略这个错误。之后的空闲仍由 halfCloseIdle 收掉。
+		_ = closeWrite(dst)
+		reverse.armHalf(lim.halfCloseIdle)
 	}
 	// 客户端先 FIN：反方向是 upstreamR。上游先 FIN：反方向是 clientR。同一套空闲计时。
 	go func() { relay(upstreamConn, clientPipe, upstreamR, l1metrics.DirUp, &bytesUp) }()
 	go func() { relay(clientConn, br, clientR, l1metrics.DirDown, &bytesDown) }()
 	<-done
 	<-done
+	if errors.Is(kept, errIdleExpired) {
+		l1metrics.AddTunnelAbort(nodeID, l1metrics.ReasonAbortIdleTimeout)
+	}
 	return kept
 }
 
@@ -492,13 +542,25 @@ func handleConnect(clientConn net.Conn, username, password, target string, resol
 // expired 在 tunnelIdle.fire 关掉连接之前置位。这时的读错误是空闲到点，不是对端 RST。
 type idleConn struct {
 	net.Conn
+	mu         sync.Mutex
 	halfClosed atomic.Bool
 	onBytes    func()
 	expired    *atomic.Bool
 	halfIdle   time.Duration
 }
 
+func (c *idleConn) armHalf(d time.Duration) {
+	c.mu.Lock()
+	c.halfClosed.Store(true)
+	if d <= 0 {
+		d = halfCloseIdleTimeout
+	}
+	_ = c.Conn.SetReadDeadline(time.Now().Add(d))
+	c.mu.Unlock()
+}
+
 func (c *idleConn) Read(p []byte) (int, error) {
+	c.mu.Lock()
 	if c.halfClosed.Load() {
 		d := c.halfIdle
 		if d <= 0 {
@@ -506,6 +568,7 @@ func (c *idleConn) Read(p []byte) (int, error) {
 		}
 		_ = c.Conn.SetReadDeadline(time.Now().Add(d))
 	}
+	c.mu.Unlock()
 	n, err := c.Conn.Read(p)
 	if n > 0 && c.onBytes != nil {
 		c.onBytes()
