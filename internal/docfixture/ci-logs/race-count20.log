@@ -1,7 +1,8 @@
 go: go version go1.22.2 linux/amd64
-head: 760fd8c823d59540b2cc7e9926b765a20b631a73
-command: GOST_REQUIRED=1 go test -tags docfixture -race -count=20 -v ./internal/docfixture/...
+head: b9b1af8557b3d707c69f6af5b8c368fb29bff765
+git status --porcelain:
 
+command: GOST_REQUIRED=1 go test -tags docfixture -race -count=20 -v ./internal/docfixture/...
 ?   	github.com/f-ishelly/relay-proxy/internal/docfixture/l1metrics	[no test files]
 === RUN   TestDocFencesMatchSources
 --- PASS: TestDocFencesMatchSources (0.00s)
@@ -51,6 +52,12 @@ command: GOST_REQUIRED=1 go test -tags docfixture -race -count=20 -v ./internal/
 --- PASS: TestConnectIdleTimeout (0.15s)
 === RUN   TestSlowlorisHeaderDeadline
 --- PASS: TestSlowlorisHeaderDeadline (0.20s)
+=== RUN   TestKeepAliveIdleSurvivesHeaderDeadline
+--- PASS: TestKeepAliveIdleSurvivesHeaderDeadline (0.45s)
+=== RUN   TestKeepAliveTrickleHeader
+--- PASS: TestKeepAliveTrickleHeader (0.20s)
+=== RUN   TestConnectHalfClosePreemptsTunnelIdle
+--- PASS: TestConnectHalfClosePreemptsTunnelIdle (0.70s)
 === RUN   TestLimitsFromConfigBounds
 --- PASS: TestLimitsFromConfigBounds (0.00s)
 === RUN   TestHeaderOrderAndCaseThroughGost
@@ -58,11 +65,11 @@ command: GOST_REQUIRED=1 go test -tags docfixture -race -count=20 -v ./internal/
 === RUN   TestChunkedAndContentLength
 --- PASS: TestChunkedAndContentLength (0.00s)
 === RUN   TestExpect100Continue
---- PASS: TestExpect100Continue (10.21s)
+--- PASS: TestExpect100Continue (0.20s)
 === RUN   TestExpect100RejectedDoesNotForwardBody
---- PASS: TestExpect100RejectedDoesNotForwardBody (0.21s)
+--- PASS: TestExpect100RejectedDoesNotForwardBody (0.20s)
 === RUN   TestWebSocketUpgrade
---- PASS: TestWebSocketUpgrade (0.01s)
+--- PASS: TestWebSocketUpgrade (0.00s)
 === RUN   TestKeepAliveDifferentHostsAndSameHostReuse
 --- PASS: TestKeepAliveDifferentHostsAndSameHostReuse (0.01s)
 === RUN   TestLastAtNodeID
@@ -106,7 +113,7 @@ command: GOST_REQUIRED=1 go test -tags docfixture -race -count=20 -v ./internal/
 === RUN   TestApproachAGostRewritesHeaders
 --- PASS: TestApproachAGostRewritesHeaders (0.00s)
 === RUN   TestClientHelloBytesJA3JA4
-    httpflow_test.go:1732: ja3=8520497e701d328ca849031134f31582 ja4=t13d0206h2_84cdcbea686c_fb71836bce29
+    httpflow_test.go:1739: ja3=8520497e701d328ca849031134f31582 ja4=t13d0206h2_84cdcbea686c_fb71836bce29
 --- PASS: TestClientHelloBytesJA3JA4 (0.04s)
 === RUN   TestHTTPL2WriteAndDeadline
 === RUN   TestHTTPL2WriteAndDeadline/write-error
@@ -186,6 +193,12 @@ command: GOST_REQUIRED=1 go test -tags docfixture -race -count=20 -v ./internal/
 --- PASS: TestConnectIdleTimeout (0.15s)
 === RUN   TestSlowlorisHeaderDeadline
 --- PASS: TestSlowlorisHeaderDeadline (0.20s)
+=== RUN   TestKeepAliveIdleSurvivesHeaderDeadline
+--- PASS: TestKeepAliveIdleSurvivesHeaderDeadline (0.46s)
+=== RUN   TestKeepAliveTrickleHeader
+--- PASS: TestKeepAliveTrickleHeader (0.20s)
+=== RUN   TestConnectHalfClosePreemptsTunnelIdle
+--- PASS: TestConnectHalfClosePreemptsTunnelIdle (0.70s)
 === RUN   TestLimitsFromConfigBounds
 --- PASS: TestLimitsFromConfigBounds (0.00s)
 === RUN   TestHeaderOrderAndCaseThroughGost
@@ -193,142 +206,7 @@ command: GOST_REQUIRED=1 go test -tags docfixture -race -count=20 -v ./internal/
 === RUN   TestChunkedAndContentLength
 --- PASS: TestChunkedAndContentLength (0.00s)
 === RUN   TestExpect100Continue
---- PASS: TestExpect100Continue (10.21s)
-=== RUN   TestExpect100RejectedDoesNotForwardBody
---- PASS: TestExpect100RejectedDoesNotForwardBody (0.21s)
-=== RUN   TestWebSocketUpgrade
---- PASS: TestWebSocketUpgrade (0.01s)
-=== RUN   TestKeepAliveDifferentHostsAndSameHostReuse
---- PASS: TestKeepAliveDifferentHostsAndSameHostReuse (0.01s)
-=== RUN   TestLastAtNodeID
---- PASS: TestLastAtNodeID (0.02s)
-=== RUN   TestLocalRejectsDoNotDial
-=== RUN   TestLocalRejectsDoNotDial/auth
-=== RUN   TestLocalRejectsDoNotDial/no-node
-=== RUN   TestLocalRejectsDoNotDial/origin-form
-=== RUN   TestLocalRejectsDoNotDial/https
---- PASS: TestLocalRejectsDoNotDial (0.01s)
-    --- PASS: TestLocalRejectsDoNotDial/auth (0.00s)
-    --- PASS: TestLocalRejectsDoNotDial/no-node (0.00s)
-    --- PASS: TestLocalRejectsDoNotDial/origin-form (0.00s)
-    --- PASS: TestLocalRejectsDoNotDial/https (0.00s)
-=== RUN   TestBadCredentialDoesNotDial
---- PASS: TestBadCredentialDoesNotDial (0.00s)
-=== RUN   TestL2Auth407
---- PASS: TestL2Auth407 (0.00s)
-=== RUN   TestL2Status502
---- PASS: TestL2Status502 (0.00s)
-=== RUN   TestDialAndResolve502
-=== RUN   TestDialAndResolve502/dial
-=== RUN   TestDialAndResolve502/unknown
-=== RUN   TestDialAndResolve502/no-healthy
-=== RUN   TestDialAndResolve502/empty
-=== RUN   TestDialAndResolve502/resolver
---- PASS: TestDialAndResolve502 (0.01s)
-    --- PASS: TestDialAndResolve502/dial (0.00s)
-    --- PASS: TestDialAndResolve502/unknown (0.00s)
-    --- PASS: TestDialAndResolve502/no-healthy (0.00s)
-    --- PASS: TestDialAndResolve502/empty (0.00s)
-    --- PASS: TestDialAndResolve502/resolver (0.00s)
-=== RUN   TestL2ResponseTimeout
---- PASS: TestL2ResponseTimeout (0.30s)
-=== RUN   TestClientIdleTimeout
---- PASS: TestClientIdleTimeout (0.20s)
-=== RUN   TestAbsoluteFormMutations
---- PASS: TestAbsoluteFormMutations (0.00s)
-=== RUN   TestHopHeaderStripAndHEAD
---- PASS: TestHopHeaderStripAndHEAD (0.00s)
-=== RUN   TestApproachAGostRewritesHeaders
---- PASS: TestApproachAGostRewritesHeaders (0.00s)
-=== RUN   TestClientHelloBytesJA3JA4
-    httpflow_test.go:1732: ja3=8520497e701d328ca849031134f31582 ja4=t13d0206h2_84cdcbea686c_fb71836bce29
---- PASS: TestClientHelloBytesJA3JA4 (0.04s)
-=== RUN   TestHTTPL2WriteAndDeadline
-=== RUN   TestHTTPL2WriteAndDeadline/write-error
-=== RUN   TestHTTPL2WriteAndDeadline/short-write
-=== RUN   TestHTTPL2WriteAndDeadline/deadline
---- PASS: TestHTTPL2WriteAndDeadline (0.01s)
-    --- PASS: TestHTTPL2WriteAndDeadline/write-error (0.00s)
-    --- PASS: TestHTTPL2WriteAndDeadline/short-write (0.00s)
-    --- PASS: TestHTTPL2WriteAndDeadline/deadline (0.00s)
-=== RUN   TestHTTPClientGone
---- PASS: TestHTTPClientGone (0.00s)
-=== RUN   TestHTTPResponseAfter100IsL2Response
---- PASS: TestHTTPResponseAfter100IsL2Response (0.00s)
-=== RUN   TestClosedHTTPLabels
---- PASS: TestClosedHTTPLabels (0.00s)
-=== RUN   TestKeepAliveSameHostGauge
---- PASS: TestKeepAliveSameHostGauge (0.01s)
-=== RUN   TestStaleKeepAliveRetry
---- PASS: TestStaleKeepAliveRetry (5.01s)
-=== RUN   TestStaleNonIdempotentPOST
---- PASS: TestStaleNonIdempotentPOST (0.00s)
-=== RUN   TestBodyAbortAfterStatus
---- PASS: TestBodyAbortAfterStatus (0.00s)
-=== RUN   TestIncompleteHeadRejectAttribution
-=== RUN   TestIncompleteHeadRejectAttribution/partial-connect
-=== RUN   TestIncompleteHeadRejectAttribution/partial-get
-=== RUN   TestIncompleteHeadRejectAttribution/empty
---- PASS: TestIncompleteHeadRejectAttribution (0.01s)
-    --- PASS: TestIncompleteHeadRejectAttribution/partial-connect (0.00s)
-    --- PASS: TestIncompleteHeadRejectAttribution/partial-get (0.00s)
-    --- PASS: TestIncompleteHeadRejectAttribution/empty (0.00s)
-=== RUN   TestDocFencesMatchSources
---- PASS: TestDocFencesMatchSources (0.00s)
-=== RUN   TestHistogramInfAndClosedSetup
---- PASS: TestHistogramInfAndClosedSetup (0.01s)
-=== RUN   TestPartialHeaderWriteDoesNotRetry
---- PASS: TestPartialHeaderWriteDoesNotRetry (0.00s)
-=== RUN   TestReusedReadTimeoutDoesNotRetry
---- PASS: TestReusedReadTimeoutDoesNotRetry (0.00s)
-=== RUN   TestPutRetryIsOptIn
-=== RUN   TestPutRetryIsOptIn/default
-=== RUN   TestPutRetryIsOptIn/enabled
-=== RUN   TestPutRetryIsOptIn/config-file
---- PASS: TestPutRetryIsOptIn (0.01s)
-    --- PASS: TestPutRetryIsOptIn/default (0.00s)
-    --- PASS: TestPutRetryIsOptIn/enabled (0.00s)
-    --- PASS: TestPutRetryIsOptIn/config-file (0.00s)
-=== RUN   TestReadSideReset
-=== RUN   TestReadSideReset/get
-=== RUN   TestReadSideReset/put
---- PASS: TestReadSideReset (0.01s)
-    --- PASS: TestReadSideReset/get (0.00s)
-    --- PASS: TestReadSideReset/put (0.00s)
-=== RUN   TestBodyIdleIsIdleTimeout
---- PASS: TestBodyIdleIsIdleTimeout (0.08s)
-=== RUN   TestHalfCloseIdleIsNotAbort
---- PASS: TestHalfCloseIdleIsNotAbort (0.08s)
-=== RUN   TestUpgradeRSTReason
---- PASS: TestUpgradeRSTReason (0.00s)
-=== RUN   TestPartialHeaderTimeout
---- PASS: TestPartialHeaderTimeout (0.25s)
-=== RUN   TestCachedGostRejectsBadHash
-=== RUN   TestCachedGostRejectsBadHash/version
---- PASS: TestCachedGostRejectsBadHash (0.00s)
-    --- PASS: TestCachedGostRejectsBadHash/version (0.00s)
-=== RUN   TestResolveReasonLabelsConnect
-=== RUN   TestResolveReasonLabelsConnect/unknown
-=== RUN   TestResolveReasonLabelsConnect/empty
-=== RUN   TestResolveReasonLabelsConnect/resolver
-=== RUN   TestResolveReasonLabelsConnect/no-healthy
---- PASS: TestResolveReasonLabelsConnect (0.01s)
-    --- PASS: TestResolveReasonLabelsConnect/unknown (0.00s)
-    --- PASS: TestResolveReasonLabelsConnect/empty (0.00s)
-    --- PASS: TestResolveReasonLabelsConnect/resolver (0.00s)
-    --- PASS: TestResolveReasonLabelsConnect/no-healthy (0.00s)
-=== RUN   TestConnectIdleTimeout
---- PASS: TestConnectIdleTimeout (0.15s)
-=== RUN   TestSlowlorisHeaderDeadline
---- PASS: TestSlowlorisHeaderDeadline (0.20s)
-=== RUN   TestLimitsFromConfigBounds
---- PASS: TestLimitsFromConfigBounds (0.00s)
-=== RUN   TestHeaderOrderAndCaseThroughGost
---- PASS: TestHeaderOrderAndCaseThroughGost (0.00s)
-=== RUN   TestChunkedAndContentLength
---- PASS: TestChunkedAndContentLength (0.00s)
-=== RUN   TestExpect100Continue
---- PASS: TestExpect100Continue (10.21s)
+--- PASS: TestExpect100Continue (0.20s)
 === RUN   TestExpect100RejectedDoesNotForwardBody
 --- PASS: TestExpect100RejectedDoesNotForwardBody (0.20s)
 === RUN   TestWebSocketUpgrade
@@ -376,7 +254,7 @@ command: GOST_REQUIRED=1 go test -tags docfixture -race -count=20 -v ./internal/
 === RUN   TestApproachAGostRewritesHeaders
 --- PASS: TestApproachAGostRewritesHeaders (0.00s)
 === RUN   TestClientHelloBytesJA3JA4
-    httpflow_test.go:1732: ja3=8520497e701d328ca849031134f31582 ja4=t13d0206h2_84cdcbea686c_fb71836bce29
+    httpflow_test.go:1739: ja3=8520497e701d328ca849031134f31582 ja4=t13d0206h2_84cdcbea686c_fb71836bce29
 --- PASS: TestClientHelloBytesJA3JA4 (0.04s)
 === RUN   TestHTTPL2WriteAndDeadline
 === RUN   TestHTTPL2WriteAndDeadline/write-error
@@ -456,6 +334,12 @@ command: GOST_REQUIRED=1 go test -tags docfixture -race -count=20 -v ./internal/
 --- PASS: TestConnectIdleTimeout (0.15s)
 === RUN   TestSlowlorisHeaderDeadline
 --- PASS: TestSlowlorisHeaderDeadline (0.20s)
+=== RUN   TestKeepAliveIdleSurvivesHeaderDeadline
+--- PASS: TestKeepAliveIdleSurvivesHeaderDeadline (0.46s)
+=== RUN   TestKeepAliveTrickleHeader
+--- PASS: TestKeepAliveTrickleHeader (0.20s)
+=== RUN   TestConnectHalfClosePreemptsTunnelIdle
+--- PASS: TestConnectHalfClosePreemptsTunnelIdle (0.70s)
 === RUN   TestLimitsFromConfigBounds
 --- PASS: TestLimitsFromConfigBounds (0.00s)
 === RUN   TestHeaderOrderAndCaseThroughGost
@@ -463,7 +347,7 @@ command: GOST_REQUIRED=1 go test -tags docfixture -race -count=20 -v ./internal/
 === RUN   TestChunkedAndContentLength
 --- PASS: TestChunkedAndContentLength (0.00s)
 === RUN   TestExpect100Continue
---- PASS: TestExpect100Continue (10.21s)
+--- PASS: TestExpect100Continue (0.20s)
 === RUN   TestExpect100RejectedDoesNotForwardBody
 --- PASS: TestExpect100RejectedDoesNotForwardBody (0.21s)
 === RUN   TestWebSocketUpgrade
@@ -511,7 +395,7 @@ command: GOST_REQUIRED=1 go test -tags docfixture -race -count=20 -v ./internal/
 === RUN   TestApproachAGostRewritesHeaders
 --- PASS: TestApproachAGostRewritesHeaders (0.00s)
 === RUN   TestClientHelloBytesJA3JA4
-    httpflow_test.go:1732: ja3=8520497e701d328ca849031134f31582 ja4=t13d0206h2_84cdcbea686c_fb71836bce29
+    httpflow_test.go:1739: ja3=8520497e701d328ca849031134f31582 ja4=t13d0206h2_84cdcbea686c_fb71836bce29
 --- PASS: TestClientHelloBytesJA3JA4 (0.04s)
 === RUN   TestHTTPL2WriteAndDeadline
 === RUN   TestHTTPL2WriteAndDeadline/write-error
@@ -591,6 +475,12 @@ command: GOST_REQUIRED=1 go test -tags docfixture -race -count=20 -v ./internal/
 --- PASS: TestConnectIdleTimeout (0.15s)
 === RUN   TestSlowlorisHeaderDeadline
 --- PASS: TestSlowlorisHeaderDeadline (0.20s)
+=== RUN   TestKeepAliveIdleSurvivesHeaderDeadline
+--- PASS: TestKeepAliveIdleSurvivesHeaderDeadline (0.45s)
+=== RUN   TestKeepAliveTrickleHeader
+--- PASS: TestKeepAliveTrickleHeader (0.21s)
+=== RUN   TestConnectHalfClosePreemptsTunnelIdle
+--- PASS: TestConnectHalfClosePreemptsTunnelIdle (0.70s)
 === RUN   TestLimitsFromConfigBounds
 --- PASS: TestLimitsFromConfigBounds (0.00s)
 === RUN   TestHeaderOrderAndCaseThroughGost
@@ -598,547 +488,7 @@ command: GOST_REQUIRED=1 go test -tags docfixture -race -count=20 -v ./internal/
 === RUN   TestChunkedAndContentLength
 --- PASS: TestChunkedAndContentLength (0.00s)
 === RUN   TestExpect100Continue
---- PASS: TestExpect100Continue (10.21s)
-=== RUN   TestExpect100RejectedDoesNotForwardBody
---- PASS: TestExpect100RejectedDoesNotForwardBody (0.21s)
-=== RUN   TestWebSocketUpgrade
---- PASS: TestWebSocketUpgrade (0.01s)
-=== RUN   TestKeepAliveDifferentHostsAndSameHostReuse
---- PASS: TestKeepAliveDifferentHostsAndSameHostReuse (0.01s)
-=== RUN   TestLastAtNodeID
---- PASS: TestLastAtNodeID (0.02s)
-=== RUN   TestLocalRejectsDoNotDial
-=== RUN   TestLocalRejectsDoNotDial/auth
-=== RUN   TestLocalRejectsDoNotDial/no-node
-=== RUN   TestLocalRejectsDoNotDial/origin-form
-=== RUN   TestLocalRejectsDoNotDial/https
---- PASS: TestLocalRejectsDoNotDial (0.01s)
-    --- PASS: TestLocalRejectsDoNotDial/auth (0.00s)
-    --- PASS: TestLocalRejectsDoNotDial/no-node (0.00s)
-    --- PASS: TestLocalRejectsDoNotDial/origin-form (0.00s)
-    --- PASS: TestLocalRejectsDoNotDial/https (0.00s)
-=== RUN   TestBadCredentialDoesNotDial
---- PASS: TestBadCredentialDoesNotDial (0.00s)
-=== RUN   TestL2Auth407
---- PASS: TestL2Auth407 (0.00s)
-=== RUN   TestL2Status502
---- PASS: TestL2Status502 (0.00s)
-=== RUN   TestDialAndResolve502
-=== RUN   TestDialAndResolve502/dial
-=== RUN   TestDialAndResolve502/unknown
-=== RUN   TestDialAndResolve502/no-healthy
-=== RUN   TestDialAndResolve502/empty
-=== RUN   TestDialAndResolve502/resolver
---- PASS: TestDialAndResolve502 (0.02s)
-    --- PASS: TestDialAndResolve502/dial (0.00s)
-    --- PASS: TestDialAndResolve502/unknown (0.00s)
-    --- PASS: TestDialAndResolve502/no-healthy (0.00s)
-    --- PASS: TestDialAndResolve502/empty (0.00s)
-    --- PASS: TestDialAndResolve502/resolver (0.00s)
-=== RUN   TestL2ResponseTimeout
---- PASS: TestL2ResponseTimeout (0.30s)
-=== RUN   TestClientIdleTimeout
---- PASS: TestClientIdleTimeout (0.20s)
-=== RUN   TestAbsoluteFormMutations
---- PASS: TestAbsoluteFormMutations (0.00s)
-=== RUN   TestHopHeaderStripAndHEAD
---- PASS: TestHopHeaderStripAndHEAD (0.00s)
-=== RUN   TestApproachAGostRewritesHeaders
---- PASS: TestApproachAGostRewritesHeaders (0.00s)
-=== RUN   TestClientHelloBytesJA3JA4
-    httpflow_test.go:1732: ja3=8520497e701d328ca849031134f31582 ja4=t13d0206h2_84cdcbea686c_fb71836bce29
---- PASS: TestClientHelloBytesJA3JA4 (0.04s)
-=== RUN   TestHTTPL2WriteAndDeadline
-=== RUN   TestHTTPL2WriteAndDeadline/write-error
-=== RUN   TestHTTPL2WriteAndDeadline/short-write
-=== RUN   TestHTTPL2WriteAndDeadline/deadline
---- PASS: TestHTTPL2WriteAndDeadline (0.01s)
-    --- PASS: TestHTTPL2WriteAndDeadline/write-error (0.00s)
-    --- PASS: TestHTTPL2WriteAndDeadline/short-write (0.00s)
-    --- PASS: TestHTTPL2WriteAndDeadline/deadline (0.00s)
-=== RUN   TestHTTPClientGone
---- PASS: TestHTTPClientGone (0.00s)
-=== RUN   TestHTTPResponseAfter100IsL2Response
---- PASS: TestHTTPResponseAfter100IsL2Response (0.00s)
-=== RUN   TestClosedHTTPLabels
---- PASS: TestClosedHTTPLabels (0.00s)
-=== RUN   TestKeepAliveSameHostGauge
---- PASS: TestKeepAliveSameHostGauge (0.01s)
-=== RUN   TestStaleKeepAliveRetry
---- PASS: TestStaleKeepAliveRetry (5.01s)
-=== RUN   TestStaleNonIdempotentPOST
---- PASS: TestStaleNonIdempotentPOST (0.00s)
-=== RUN   TestBodyAbortAfterStatus
---- PASS: TestBodyAbortAfterStatus (0.00s)
-=== RUN   TestIncompleteHeadRejectAttribution
-=== RUN   TestIncompleteHeadRejectAttribution/partial-connect
-=== RUN   TestIncompleteHeadRejectAttribution/partial-get
-=== RUN   TestIncompleteHeadRejectAttribution/empty
---- PASS: TestIncompleteHeadRejectAttribution (0.01s)
-    --- PASS: TestIncompleteHeadRejectAttribution/partial-connect (0.00s)
-    --- PASS: TestIncompleteHeadRejectAttribution/partial-get (0.00s)
-    --- PASS: TestIncompleteHeadRejectAttribution/empty (0.00s)
-=== RUN   TestDocFencesMatchSources
---- PASS: TestDocFencesMatchSources (0.00s)
-=== RUN   TestHistogramInfAndClosedSetup
---- PASS: TestHistogramInfAndClosedSetup (0.01s)
-=== RUN   TestPartialHeaderWriteDoesNotRetry
---- PASS: TestPartialHeaderWriteDoesNotRetry (0.00s)
-=== RUN   TestReusedReadTimeoutDoesNotRetry
---- PASS: TestReusedReadTimeoutDoesNotRetry (0.00s)
-=== RUN   TestPutRetryIsOptIn
-=== RUN   TestPutRetryIsOptIn/default
-=== RUN   TestPutRetryIsOptIn/enabled
-=== RUN   TestPutRetryIsOptIn/config-file
---- PASS: TestPutRetryIsOptIn (0.01s)
-    --- PASS: TestPutRetryIsOptIn/default (0.00s)
-    --- PASS: TestPutRetryIsOptIn/enabled (0.00s)
-    --- PASS: TestPutRetryIsOptIn/config-file (0.00s)
-=== RUN   TestReadSideReset
-=== RUN   TestReadSideReset/get
-=== RUN   TestReadSideReset/put
---- PASS: TestReadSideReset (0.01s)
-    --- PASS: TestReadSideReset/get (0.00s)
-    --- PASS: TestReadSideReset/put (0.00s)
-=== RUN   TestBodyIdleIsIdleTimeout
---- PASS: TestBodyIdleIsIdleTimeout (0.08s)
-=== RUN   TestHalfCloseIdleIsNotAbort
---- PASS: TestHalfCloseIdleIsNotAbort (0.09s)
-=== RUN   TestUpgradeRSTReason
---- PASS: TestUpgradeRSTReason (0.00s)
-=== RUN   TestPartialHeaderTimeout
---- PASS: TestPartialHeaderTimeout (0.25s)
-=== RUN   TestCachedGostRejectsBadHash
-=== RUN   TestCachedGostRejectsBadHash/version
---- PASS: TestCachedGostRejectsBadHash (0.00s)
-    --- PASS: TestCachedGostRejectsBadHash/version (0.00s)
-=== RUN   TestResolveReasonLabelsConnect
-=== RUN   TestResolveReasonLabelsConnect/unknown
-=== RUN   TestResolveReasonLabelsConnect/empty
-=== RUN   TestResolveReasonLabelsConnect/resolver
-=== RUN   TestResolveReasonLabelsConnect/no-healthy
---- PASS: TestResolveReasonLabelsConnect (0.01s)
-    --- PASS: TestResolveReasonLabelsConnect/unknown (0.00s)
-    --- PASS: TestResolveReasonLabelsConnect/empty (0.00s)
-    --- PASS: TestResolveReasonLabelsConnect/resolver (0.00s)
-    --- PASS: TestResolveReasonLabelsConnect/no-healthy (0.00s)
-=== RUN   TestConnectIdleTimeout
---- PASS: TestConnectIdleTimeout (0.15s)
-=== RUN   TestSlowlorisHeaderDeadline
---- PASS: TestSlowlorisHeaderDeadline (0.20s)
-=== RUN   TestLimitsFromConfigBounds
---- PASS: TestLimitsFromConfigBounds (0.00s)
-=== RUN   TestHeaderOrderAndCaseThroughGost
---- PASS: TestHeaderOrderAndCaseThroughGost (0.00s)
-=== RUN   TestChunkedAndContentLength
---- PASS: TestChunkedAndContentLength (0.00s)
-=== RUN   TestExpect100Continue
---- PASS: TestExpect100Continue (10.21s)
-=== RUN   TestExpect100RejectedDoesNotForwardBody
---- PASS: TestExpect100RejectedDoesNotForwardBody (0.21s)
-=== RUN   TestWebSocketUpgrade
---- PASS: TestWebSocketUpgrade (0.01s)
-=== RUN   TestKeepAliveDifferentHostsAndSameHostReuse
---- PASS: TestKeepAliveDifferentHostsAndSameHostReuse (0.01s)
-=== RUN   TestLastAtNodeID
---- PASS: TestLastAtNodeID (0.02s)
-=== RUN   TestLocalRejectsDoNotDial
-=== RUN   TestLocalRejectsDoNotDial/auth
-=== RUN   TestLocalRejectsDoNotDial/no-node
-=== RUN   TestLocalRejectsDoNotDial/origin-form
-=== RUN   TestLocalRejectsDoNotDial/https
---- PASS: TestLocalRejectsDoNotDial (0.01s)
-    --- PASS: TestLocalRejectsDoNotDial/auth (0.00s)
-    --- PASS: TestLocalRejectsDoNotDial/no-node (0.00s)
-    --- PASS: TestLocalRejectsDoNotDial/origin-form (0.00s)
-    --- PASS: TestLocalRejectsDoNotDial/https (0.00s)
-=== RUN   TestBadCredentialDoesNotDial
---- PASS: TestBadCredentialDoesNotDial (0.00s)
-=== RUN   TestL2Auth407
---- PASS: TestL2Auth407 (0.00s)
-=== RUN   TestL2Status502
---- PASS: TestL2Status502 (0.00s)
-=== RUN   TestDialAndResolve502
-=== RUN   TestDialAndResolve502/dial
-=== RUN   TestDialAndResolve502/unknown
-=== RUN   TestDialAndResolve502/no-healthy
-=== RUN   TestDialAndResolve502/empty
-=== RUN   TestDialAndResolve502/resolver
---- PASS: TestDialAndResolve502 (0.02s)
-    --- PASS: TestDialAndResolve502/dial (0.00s)
-    --- PASS: TestDialAndResolve502/unknown (0.00s)
-    --- PASS: TestDialAndResolve502/no-healthy (0.00s)
-    --- PASS: TestDialAndResolve502/empty (0.00s)
-    --- PASS: TestDialAndResolve502/resolver (0.00s)
-=== RUN   TestL2ResponseTimeout
---- PASS: TestL2ResponseTimeout (0.30s)
-=== RUN   TestClientIdleTimeout
---- PASS: TestClientIdleTimeout (0.20s)
-=== RUN   TestAbsoluteFormMutations
---- PASS: TestAbsoluteFormMutations (0.00s)
-=== RUN   TestHopHeaderStripAndHEAD
---- PASS: TestHopHeaderStripAndHEAD (0.00s)
-=== RUN   TestApproachAGostRewritesHeaders
---- PASS: TestApproachAGostRewritesHeaders (0.00s)
-=== RUN   TestClientHelloBytesJA3JA4
-    httpflow_test.go:1732: ja3=8520497e701d328ca849031134f31582 ja4=t13d0206h2_84cdcbea686c_fb71836bce29
---- PASS: TestClientHelloBytesJA3JA4 (0.04s)
-=== RUN   TestHTTPL2WriteAndDeadline
-=== RUN   TestHTTPL2WriteAndDeadline/write-error
-=== RUN   TestHTTPL2WriteAndDeadline/short-write
-=== RUN   TestHTTPL2WriteAndDeadline/deadline
---- PASS: TestHTTPL2WriteAndDeadline (0.01s)
-    --- PASS: TestHTTPL2WriteAndDeadline/write-error (0.00s)
-    --- PASS: TestHTTPL2WriteAndDeadline/short-write (0.00s)
-    --- PASS: TestHTTPL2WriteAndDeadline/deadline (0.00s)
-=== RUN   TestHTTPClientGone
---- PASS: TestHTTPClientGone (0.00s)
-=== RUN   TestHTTPResponseAfter100IsL2Response
---- PASS: TestHTTPResponseAfter100IsL2Response (0.00s)
-=== RUN   TestClosedHTTPLabels
---- PASS: TestClosedHTTPLabels (0.00s)
-=== RUN   TestKeepAliveSameHostGauge
---- PASS: TestKeepAliveSameHostGauge (0.01s)
-=== RUN   TestStaleKeepAliveRetry
---- PASS: TestStaleKeepAliveRetry (5.01s)
-=== RUN   TestStaleNonIdempotentPOST
---- PASS: TestStaleNonIdempotentPOST (0.00s)
-=== RUN   TestBodyAbortAfterStatus
---- PASS: TestBodyAbortAfterStatus (0.00s)
-=== RUN   TestIncompleteHeadRejectAttribution
-=== RUN   TestIncompleteHeadRejectAttribution/partial-connect
-=== RUN   TestIncompleteHeadRejectAttribution/partial-get
-=== RUN   TestIncompleteHeadRejectAttribution/empty
---- PASS: TestIncompleteHeadRejectAttribution (0.01s)
-    --- PASS: TestIncompleteHeadRejectAttribution/partial-connect (0.00s)
-    --- PASS: TestIncompleteHeadRejectAttribution/partial-get (0.00s)
-    --- PASS: TestIncompleteHeadRejectAttribution/empty (0.00s)
-=== RUN   TestDocFencesMatchSources
---- PASS: TestDocFencesMatchSources (0.00s)
-=== RUN   TestHistogramInfAndClosedSetup
---- PASS: TestHistogramInfAndClosedSetup (0.01s)
-=== RUN   TestPartialHeaderWriteDoesNotRetry
---- PASS: TestPartialHeaderWriteDoesNotRetry (0.00s)
-=== RUN   TestReusedReadTimeoutDoesNotRetry
---- PASS: TestReusedReadTimeoutDoesNotRetry (0.00s)
-=== RUN   TestPutRetryIsOptIn
-=== RUN   TestPutRetryIsOptIn/default
-=== RUN   TestPutRetryIsOptIn/enabled
-=== RUN   TestPutRetryIsOptIn/config-file
---- PASS: TestPutRetryIsOptIn (0.01s)
-    --- PASS: TestPutRetryIsOptIn/default (0.00s)
-    --- PASS: TestPutRetryIsOptIn/enabled (0.00s)
-    --- PASS: TestPutRetryIsOptIn/config-file (0.00s)
-=== RUN   TestReadSideReset
-=== RUN   TestReadSideReset/get
-=== RUN   TestReadSideReset/put
---- PASS: TestReadSideReset (0.01s)
-    --- PASS: TestReadSideReset/get (0.00s)
-    --- PASS: TestReadSideReset/put (0.00s)
-=== RUN   TestBodyIdleIsIdleTimeout
---- PASS: TestBodyIdleIsIdleTimeout (0.08s)
-=== RUN   TestHalfCloseIdleIsNotAbort
---- PASS: TestHalfCloseIdleIsNotAbort (0.08s)
-=== RUN   TestUpgradeRSTReason
---- PASS: TestUpgradeRSTReason (0.00s)
-=== RUN   TestPartialHeaderTimeout
---- PASS: TestPartialHeaderTimeout (0.25s)
-=== RUN   TestCachedGostRejectsBadHash
-=== RUN   TestCachedGostRejectsBadHash/version
---- PASS: TestCachedGostRejectsBadHash (0.00s)
-    --- PASS: TestCachedGostRejectsBadHash/version (0.00s)
-=== RUN   TestResolveReasonLabelsConnect
-=== RUN   TestResolveReasonLabelsConnect/unknown
-=== RUN   TestResolveReasonLabelsConnect/empty
-=== RUN   TestResolveReasonLabelsConnect/resolver
-=== RUN   TestResolveReasonLabelsConnect/no-healthy
---- PASS: TestResolveReasonLabelsConnect (0.01s)
-    --- PASS: TestResolveReasonLabelsConnect/unknown (0.00s)
-    --- PASS: TestResolveReasonLabelsConnect/empty (0.00s)
-    --- PASS: TestResolveReasonLabelsConnect/resolver (0.00s)
-    --- PASS: TestResolveReasonLabelsConnect/no-healthy (0.00s)
-=== RUN   TestConnectIdleTimeout
---- PASS: TestConnectIdleTimeout (0.15s)
-=== RUN   TestSlowlorisHeaderDeadline
---- PASS: TestSlowlorisHeaderDeadline (0.20s)
-=== RUN   TestLimitsFromConfigBounds
---- PASS: TestLimitsFromConfigBounds (0.00s)
-=== RUN   TestHeaderOrderAndCaseThroughGost
---- PASS: TestHeaderOrderAndCaseThroughGost (0.00s)
-=== RUN   TestChunkedAndContentLength
---- PASS: TestChunkedAndContentLength (0.00s)
-=== RUN   TestExpect100Continue
---- PASS: TestExpect100Continue (10.21s)
-=== RUN   TestExpect100RejectedDoesNotForwardBody
---- PASS: TestExpect100RejectedDoesNotForwardBody (0.21s)
-=== RUN   TestWebSocketUpgrade
---- PASS: TestWebSocketUpgrade (0.01s)
-=== RUN   TestKeepAliveDifferentHostsAndSameHostReuse
---- PASS: TestKeepAliveDifferentHostsAndSameHostReuse (0.01s)
-=== RUN   TestLastAtNodeID
---- PASS: TestLastAtNodeID (0.02s)
-=== RUN   TestLocalRejectsDoNotDial
-=== RUN   TestLocalRejectsDoNotDial/auth
-=== RUN   TestLocalRejectsDoNotDial/no-node
-=== RUN   TestLocalRejectsDoNotDial/origin-form
-=== RUN   TestLocalRejectsDoNotDial/https
---- PASS: TestLocalRejectsDoNotDial (0.01s)
-    --- PASS: TestLocalRejectsDoNotDial/auth (0.00s)
-    --- PASS: TestLocalRejectsDoNotDial/no-node (0.00s)
-    --- PASS: TestLocalRejectsDoNotDial/origin-form (0.00s)
-    --- PASS: TestLocalRejectsDoNotDial/https (0.00s)
-=== RUN   TestBadCredentialDoesNotDial
---- PASS: TestBadCredentialDoesNotDial (0.00s)
-=== RUN   TestL2Auth407
---- PASS: TestL2Auth407 (0.00s)
-=== RUN   TestL2Status502
---- PASS: TestL2Status502 (0.00s)
-=== RUN   TestDialAndResolve502
-=== RUN   TestDialAndResolve502/dial
-=== RUN   TestDialAndResolve502/unknown
-=== RUN   TestDialAndResolve502/no-healthy
-=== RUN   TestDialAndResolve502/empty
-=== RUN   TestDialAndResolve502/resolver
---- PASS: TestDialAndResolve502 (0.02s)
-    --- PASS: TestDialAndResolve502/dial (0.00s)
-    --- PASS: TestDialAndResolve502/unknown (0.00s)
-    --- PASS: TestDialAndResolve502/no-healthy (0.00s)
-    --- PASS: TestDialAndResolve502/empty (0.00s)
-    --- PASS: TestDialAndResolve502/resolver (0.00s)
-=== RUN   TestL2ResponseTimeout
---- PASS: TestL2ResponseTimeout (0.30s)
-=== RUN   TestClientIdleTimeout
---- PASS: TestClientIdleTimeout (0.20s)
-=== RUN   TestAbsoluteFormMutations
---- PASS: TestAbsoluteFormMutations (0.00s)
-=== RUN   TestHopHeaderStripAndHEAD
---- PASS: TestHopHeaderStripAndHEAD (0.00s)
-=== RUN   TestApproachAGostRewritesHeaders
---- PASS: TestApproachAGostRewritesHeaders (0.00s)
-=== RUN   TestClientHelloBytesJA3JA4
-    httpflow_test.go:1732: ja3=8520497e701d328ca849031134f31582 ja4=t13d0206h2_84cdcbea686c_fb71836bce29
---- PASS: TestClientHelloBytesJA3JA4 (0.04s)
-=== RUN   TestHTTPL2WriteAndDeadline
-=== RUN   TestHTTPL2WriteAndDeadline/write-error
-=== RUN   TestHTTPL2WriteAndDeadline/short-write
-=== RUN   TestHTTPL2WriteAndDeadline/deadline
---- PASS: TestHTTPL2WriteAndDeadline (0.01s)
-    --- PASS: TestHTTPL2WriteAndDeadline/write-error (0.00s)
-    --- PASS: TestHTTPL2WriteAndDeadline/short-write (0.00s)
-    --- PASS: TestHTTPL2WriteAndDeadline/deadline (0.00s)
-=== RUN   TestHTTPClientGone
---- PASS: TestHTTPClientGone (0.00s)
-=== RUN   TestHTTPResponseAfter100IsL2Response
---- PASS: TestHTTPResponseAfter100IsL2Response (0.00s)
-=== RUN   TestClosedHTTPLabels
---- PASS: TestClosedHTTPLabels (0.00s)
-=== RUN   TestKeepAliveSameHostGauge
---- PASS: TestKeepAliveSameHostGauge (0.01s)
-=== RUN   TestStaleKeepAliveRetry
---- PASS: TestStaleKeepAliveRetry (5.01s)
-=== RUN   TestStaleNonIdempotentPOST
---- PASS: TestStaleNonIdempotentPOST (0.00s)
-=== RUN   TestBodyAbortAfterStatus
---- PASS: TestBodyAbortAfterStatus (0.00s)
-=== RUN   TestIncompleteHeadRejectAttribution
-=== RUN   TestIncompleteHeadRejectAttribution/partial-connect
-=== RUN   TestIncompleteHeadRejectAttribution/partial-get
-=== RUN   TestIncompleteHeadRejectAttribution/empty
---- PASS: TestIncompleteHeadRejectAttribution (0.01s)
-    --- PASS: TestIncompleteHeadRejectAttribution/partial-connect (0.00s)
-    --- PASS: TestIncompleteHeadRejectAttribution/partial-get (0.00s)
-    --- PASS: TestIncompleteHeadRejectAttribution/empty (0.00s)
-=== RUN   TestDocFencesMatchSources
---- PASS: TestDocFencesMatchSources (0.00s)
-=== RUN   TestHistogramInfAndClosedSetup
---- PASS: TestHistogramInfAndClosedSetup (0.01s)
-=== RUN   TestPartialHeaderWriteDoesNotRetry
---- PASS: TestPartialHeaderWriteDoesNotRetry (0.00s)
-=== RUN   TestReusedReadTimeoutDoesNotRetry
---- PASS: TestReusedReadTimeoutDoesNotRetry (0.00s)
-=== RUN   TestPutRetryIsOptIn
-=== RUN   TestPutRetryIsOptIn/default
-=== RUN   TestPutRetryIsOptIn/enabled
-=== RUN   TestPutRetryIsOptIn/config-file
---- PASS: TestPutRetryIsOptIn (0.01s)
-    --- PASS: TestPutRetryIsOptIn/default (0.00s)
-    --- PASS: TestPutRetryIsOptIn/enabled (0.00s)
-    --- PASS: TestPutRetryIsOptIn/config-file (0.00s)
-=== RUN   TestReadSideReset
-=== RUN   TestReadSideReset/get
-=== RUN   TestReadSideReset/put
---- PASS: TestReadSideReset (0.01s)
-    --- PASS: TestReadSideReset/get (0.00s)
-    --- PASS: TestReadSideReset/put (0.00s)
-=== RUN   TestBodyIdleIsIdleTimeout
---- PASS: TestBodyIdleIsIdleTimeout (0.08s)
-=== RUN   TestHalfCloseIdleIsNotAbort
---- PASS: TestHalfCloseIdleIsNotAbort (0.08s)
-=== RUN   TestUpgradeRSTReason
---- PASS: TestUpgradeRSTReason (0.00s)
-=== RUN   TestPartialHeaderTimeout
---- PASS: TestPartialHeaderTimeout (0.25s)
-=== RUN   TestCachedGostRejectsBadHash
-=== RUN   TestCachedGostRejectsBadHash/version
---- PASS: TestCachedGostRejectsBadHash (0.00s)
-    --- PASS: TestCachedGostRejectsBadHash/version (0.00s)
-=== RUN   TestResolveReasonLabelsConnect
-=== RUN   TestResolveReasonLabelsConnect/unknown
-=== RUN   TestResolveReasonLabelsConnect/empty
-=== RUN   TestResolveReasonLabelsConnect/resolver
-=== RUN   TestResolveReasonLabelsConnect/no-healthy
---- PASS: TestResolveReasonLabelsConnect (0.01s)
-    --- PASS: TestResolveReasonLabelsConnect/unknown (0.00s)
-    --- PASS: TestResolveReasonLabelsConnect/empty (0.00s)
-    --- PASS: TestResolveReasonLabelsConnect/resolver (0.00s)
-    --- PASS: TestResolveReasonLabelsConnect/no-healthy (0.00s)
-=== RUN   TestConnectIdleTimeout
---- PASS: TestConnectIdleTimeout (0.15s)
-=== RUN   TestSlowlorisHeaderDeadline
---- PASS: TestSlowlorisHeaderDeadline (0.20s)
-=== RUN   TestLimitsFromConfigBounds
---- PASS: TestLimitsFromConfigBounds (0.00s)
-=== RUN   TestHeaderOrderAndCaseThroughGost
---- PASS: TestHeaderOrderAndCaseThroughGost (0.00s)
-=== RUN   TestChunkedAndContentLength
---- PASS: TestChunkedAndContentLength (0.00s)
-=== RUN   TestExpect100Continue
---- PASS: TestExpect100Continue (10.21s)
-=== RUN   TestExpect100RejectedDoesNotForwardBody
---- PASS: TestExpect100RejectedDoesNotForwardBody (0.21s)
-=== RUN   TestWebSocketUpgrade
---- PASS: TestWebSocketUpgrade (0.01s)
-=== RUN   TestKeepAliveDifferentHostsAndSameHostReuse
---- PASS: TestKeepAliveDifferentHostsAndSameHostReuse (0.01s)
-=== RUN   TestLastAtNodeID
---- PASS: TestLastAtNodeID (0.02s)
-=== RUN   TestLocalRejectsDoNotDial
-=== RUN   TestLocalRejectsDoNotDial/auth
-=== RUN   TestLocalRejectsDoNotDial/no-node
-=== RUN   TestLocalRejectsDoNotDial/origin-form
-=== RUN   TestLocalRejectsDoNotDial/https
---- PASS: TestLocalRejectsDoNotDial (0.01s)
-    --- PASS: TestLocalRejectsDoNotDial/auth (0.00s)
-    --- PASS: TestLocalRejectsDoNotDial/no-node (0.00s)
-    --- PASS: TestLocalRejectsDoNotDial/origin-form (0.00s)
-    --- PASS: TestLocalRejectsDoNotDial/https (0.00s)
-=== RUN   TestBadCredentialDoesNotDial
---- PASS: TestBadCredentialDoesNotDial (0.00s)
-=== RUN   TestL2Auth407
---- PASS: TestL2Auth407 (0.00s)
-=== RUN   TestL2Status502
---- PASS: TestL2Status502 (0.00s)
-=== RUN   TestDialAndResolve502
-=== RUN   TestDialAndResolve502/dial
-=== RUN   TestDialAndResolve502/unknown
-=== RUN   TestDialAndResolve502/no-healthy
-=== RUN   TestDialAndResolve502/empty
-=== RUN   TestDialAndResolve502/resolver
---- PASS: TestDialAndResolve502 (0.02s)
-    --- PASS: TestDialAndResolve502/dial (0.00s)
-    --- PASS: TestDialAndResolve502/unknown (0.00s)
-    --- PASS: TestDialAndResolve502/no-healthy (0.00s)
-    --- PASS: TestDialAndResolve502/empty (0.00s)
-    --- PASS: TestDialAndResolve502/resolver (0.00s)
-=== RUN   TestL2ResponseTimeout
---- PASS: TestL2ResponseTimeout (0.30s)
-=== RUN   TestClientIdleTimeout
---- PASS: TestClientIdleTimeout (0.20s)
-=== RUN   TestAbsoluteFormMutations
---- PASS: TestAbsoluteFormMutations (0.00s)
-=== RUN   TestHopHeaderStripAndHEAD
---- PASS: TestHopHeaderStripAndHEAD (0.00s)
-=== RUN   TestApproachAGostRewritesHeaders
---- PASS: TestApproachAGostRewritesHeaders (0.00s)
-=== RUN   TestClientHelloBytesJA3JA4
-    httpflow_test.go:1732: ja3=8520497e701d328ca849031134f31582 ja4=t13d0206h2_84cdcbea686c_fb71836bce29
---- PASS: TestClientHelloBytesJA3JA4 (0.04s)
-=== RUN   TestHTTPL2WriteAndDeadline
-=== RUN   TestHTTPL2WriteAndDeadline/write-error
-=== RUN   TestHTTPL2WriteAndDeadline/short-write
-=== RUN   TestHTTPL2WriteAndDeadline/deadline
---- PASS: TestHTTPL2WriteAndDeadline (0.01s)
-    --- PASS: TestHTTPL2WriteAndDeadline/write-error (0.00s)
-    --- PASS: TestHTTPL2WriteAndDeadline/short-write (0.00s)
-    --- PASS: TestHTTPL2WriteAndDeadline/deadline (0.00s)
-=== RUN   TestHTTPClientGone
---- PASS: TestHTTPClientGone (0.00s)
-=== RUN   TestHTTPResponseAfter100IsL2Response
---- PASS: TestHTTPResponseAfter100IsL2Response (0.00s)
-=== RUN   TestClosedHTTPLabels
---- PASS: TestClosedHTTPLabels (0.00s)
-=== RUN   TestKeepAliveSameHostGauge
---- PASS: TestKeepAliveSameHostGauge (0.01s)
-=== RUN   TestStaleKeepAliveRetry
---- PASS: TestStaleKeepAliveRetry (5.01s)
-=== RUN   TestStaleNonIdempotentPOST
---- PASS: TestStaleNonIdempotentPOST (0.01s)
-=== RUN   TestBodyAbortAfterStatus
---- PASS: TestBodyAbortAfterStatus (0.00s)
-=== RUN   TestIncompleteHeadRejectAttribution
-=== RUN   TestIncompleteHeadRejectAttribution/partial-connect
-=== RUN   TestIncompleteHeadRejectAttribution/partial-get
-=== RUN   TestIncompleteHeadRejectAttribution/empty
---- PASS: TestIncompleteHeadRejectAttribution (0.01s)
-    --- PASS: TestIncompleteHeadRejectAttribution/partial-connect (0.00s)
-    --- PASS: TestIncompleteHeadRejectAttribution/partial-get (0.00s)
-    --- PASS: TestIncompleteHeadRejectAttribution/empty (0.00s)
-=== RUN   TestDocFencesMatchSources
---- PASS: TestDocFencesMatchSources (0.00s)
-=== RUN   TestHistogramInfAndClosedSetup
---- PASS: TestHistogramInfAndClosedSetup (0.01s)
-=== RUN   TestPartialHeaderWriteDoesNotRetry
---- PASS: TestPartialHeaderWriteDoesNotRetry (0.00s)
-=== RUN   TestReusedReadTimeoutDoesNotRetry
---- PASS: TestReusedReadTimeoutDoesNotRetry (0.00s)
-=== RUN   TestPutRetryIsOptIn
-=== RUN   TestPutRetryIsOptIn/default
-=== RUN   TestPutRetryIsOptIn/enabled
-=== RUN   TestPutRetryIsOptIn/config-file
---- PASS: TestPutRetryIsOptIn (0.01s)
-    --- PASS: TestPutRetryIsOptIn/default (0.00s)
-    --- PASS: TestPutRetryIsOptIn/enabled (0.00s)
-    --- PASS: TestPutRetryIsOptIn/config-file (0.00s)
-=== RUN   TestReadSideReset
-=== RUN   TestReadSideReset/get
-=== RUN   TestReadSideReset/put
---- PASS: TestReadSideReset (0.01s)
-    --- PASS: TestReadSideReset/get (0.00s)
-    --- PASS: TestReadSideReset/put (0.00s)
-=== RUN   TestBodyIdleIsIdleTimeout
---- PASS: TestBodyIdleIsIdleTimeout (0.08s)
-=== RUN   TestHalfCloseIdleIsNotAbort
---- PASS: TestHalfCloseIdleIsNotAbort (0.08s)
-=== RUN   TestUpgradeRSTReason
---- PASS: TestUpgradeRSTReason (0.00s)
-=== RUN   TestPartialHeaderTimeout
---- PASS: TestPartialHeaderTimeout (0.25s)
-=== RUN   TestCachedGostRejectsBadHash
-=== RUN   TestCachedGostRejectsBadHash/version
---- PASS: TestCachedGostRejectsBadHash (0.00s)
-    --- PASS: TestCachedGostRejectsBadHash/version (0.00s)
-=== RUN   TestResolveReasonLabelsConnect
-=== RUN   TestResolveReasonLabelsConnect/unknown
-=== RUN   TestResolveReasonLabelsConnect/empty
-=== RUN   TestResolveReasonLabelsConnect/resolver
-=== RUN   TestResolveReasonLabelsConnect/no-healthy
---- PASS: TestResolveReasonLabelsConnect (0.01s)
-    --- PASS: TestResolveReasonLabelsConnect/unknown (0.00s)
-    --- PASS: TestResolveReasonLabelsConnect/empty (0.00s)
-    --- PASS: TestResolveReasonLabelsConnect/resolver (0.00s)
-    --- PASS: TestResolveReasonLabelsConnect/no-healthy (0.00s)
-=== RUN   TestConnectIdleTimeout
---- PASS: TestConnectIdleTimeout (0.15s)
-=== RUN   TestSlowlorisHeaderDeadline
---- PASS: TestSlowlorisHeaderDeadline (0.20s)
-=== RUN   TestLimitsFromConfigBounds
---- PASS: TestLimitsFromConfigBounds (0.00s)
-=== RUN   TestHeaderOrderAndCaseThroughGost
---- PASS: TestHeaderOrderAndCaseThroughGost (0.00s)
-=== RUN   TestChunkedAndContentLength
---- PASS: TestChunkedAndContentLength (0.00s)
-=== RUN   TestExpect100Continue
---- PASS: TestExpect100Continue (10.21s)
+--- PASS: TestExpect100Continue (0.20s)
 === RUN   TestExpect100RejectedDoesNotForwardBody
 --- PASS: TestExpect100RejectedDoesNotForwardBody (0.20s)
 === RUN   TestWebSocketUpgrade
@@ -1186,7 +536,7 @@ command: GOST_REQUIRED=1 go test -tags docfixture -race -count=20 -v ./internal/
 === RUN   TestApproachAGostRewritesHeaders
 --- PASS: TestApproachAGostRewritesHeaders (0.00s)
 === RUN   TestClientHelloBytesJA3JA4
-    httpflow_test.go:1732: ja3=8520497e701d328ca849031134f31582 ja4=t13d0206h2_84cdcbea686c_fb71836bce29
+    httpflow_test.go:1739: ja3=8520497e701d328ca849031134f31582 ja4=t13d0206h2_84cdcbea686c_fb71836bce29
 --- PASS: TestClientHelloBytesJA3JA4 (0.04s)
 === RUN   TestHTTPL2WriteAndDeadline
 === RUN   TestHTTPL2WriteAndDeadline/write-error
@@ -1266,6 +616,12 @@ command: GOST_REQUIRED=1 go test -tags docfixture -race -count=20 -v ./internal/
 --- PASS: TestConnectIdleTimeout (0.15s)
 === RUN   TestSlowlorisHeaderDeadline
 --- PASS: TestSlowlorisHeaderDeadline (0.20s)
+=== RUN   TestKeepAliveIdleSurvivesHeaderDeadline
+--- PASS: TestKeepAliveIdleSurvivesHeaderDeadline (0.45s)
+=== RUN   TestKeepAliveTrickleHeader
+--- PASS: TestKeepAliveTrickleHeader (0.21s)
+=== RUN   TestConnectHalfClosePreemptsTunnelIdle
+--- PASS: TestConnectHalfClosePreemptsTunnelIdle (0.70s)
 === RUN   TestLimitsFromConfigBounds
 --- PASS: TestLimitsFromConfigBounds (0.00s)
 === RUN   TestHeaderOrderAndCaseThroughGost
@@ -1273,412 +629,7 @@ command: GOST_REQUIRED=1 go test -tags docfixture -race -count=20 -v ./internal/
 === RUN   TestChunkedAndContentLength
 --- PASS: TestChunkedAndContentLength (0.00s)
 === RUN   TestExpect100Continue
---- PASS: TestExpect100Continue (10.21s)
-=== RUN   TestExpect100RejectedDoesNotForwardBody
---- PASS: TestExpect100RejectedDoesNotForwardBody (0.21s)
-=== RUN   TestWebSocketUpgrade
---- PASS: TestWebSocketUpgrade (0.01s)
-=== RUN   TestKeepAliveDifferentHostsAndSameHostReuse
---- PASS: TestKeepAliveDifferentHostsAndSameHostReuse (0.01s)
-=== RUN   TestLastAtNodeID
---- PASS: TestLastAtNodeID (0.02s)
-=== RUN   TestLocalRejectsDoNotDial
-=== RUN   TestLocalRejectsDoNotDial/auth
-=== RUN   TestLocalRejectsDoNotDial/no-node
-=== RUN   TestLocalRejectsDoNotDial/origin-form
-=== RUN   TestLocalRejectsDoNotDial/https
---- PASS: TestLocalRejectsDoNotDial (0.01s)
-    --- PASS: TestLocalRejectsDoNotDial/auth (0.00s)
-    --- PASS: TestLocalRejectsDoNotDial/no-node (0.00s)
-    --- PASS: TestLocalRejectsDoNotDial/origin-form (0.00s)
-    --- PASS: TestLocalRejectsDoNotDial/https (0.00s)
-=== RUN   TestBadCredentialDoesNotDial
---- PASS: TestBadCredentialDoesNotDial (0.00s)
-=== RUN   TestL2Auth407
---- PASS: TestL2Auth407 (0.00s)
-=== RUN   TestL2Status502
---- PASS: TestL2Status502 (0.00s)
-=== RUN   TestDialAndResolve502
-=== RUN   TestDialAndResolve502/dial
-=== RUN   TestDialAndResolve502/unknown
-=== RUN   TestDialAndResolve502/no-healthy
-=== RUN   TestDialAndResolve502/empty
-=== RUN   TestDialAndResolve502/resolver
---- PASS: TestDialAndResolve502 (0.02s)
-    --- PASS: TestDialAndResolve502/dial (0.00s)
-    --- PASS: TestDialAndResolve502/unknown (0.00s)
-    --- PASS: TestDialAndResolve502/no-healthy (0.00s)
-    --- PASS: TestDialAndResolve502/empty (0.00s)
-    --- PASS: TestDialAndResolve502/resolver (0.00s)
-=== RUN   TestL2ResponseTimeout
---- PASS: TestL2ResponseTimeout (0.30s)
-=== RUN   TestClientIdleTimeout
---- PASS: TestClientIdleTimeout (0.20s)
-=== RUN   TestAbsoluteFormMutations
---- PASS: TestAbsoluteFormMutations (0.00s)
-=== RUN   TestHopHeaderStripAndHEAD
---- PASS: TestHopHeaderStripAndHEAD (0.00s)
-=== RUN   TestApproachAGostRewritesHeaders
---- PASS: TestApproachAGostRewritesHeaders (0.00s)
-=== RUN   TestClientHelloBytesJA3JA4
-    httpflow_test.go:1732: ja3=8520497e701d328ca849031134f31582 ja4=t13d0206h2_84cdcbea686c_fb71836bce29
---- PASS: TestClientHelloBytesJA3JA4 (0.04s)
-=== RUN   TestHTTPL2WriteAndDeadline
-=== RUN   TestHTTPL2WriteAndDeadline/write-error
-=== RUN   TestHTTPL2WriteAndDeadline/short-write
-=== RUN   TestHTTPL2WriteAndDeadline/deadline
---- PASS: TestHTTPL2WriteAndDeadline (0.01s)
-    --- PASS: TestHTTPL2WriteAndDeadline/write-error (0.00s)
-    --- PASS: TestHTTPL2WriteAndDeadline/short-write (0.00s)
-    --- PASS: TestHTTPL2WriteAndDeadline/deadline (0.00s)
-=== RUN   TestHTTPClientGone
---- PASS: TestHTTPClientGone (0.00s)
-=== RUN   TestHTTPResponseAfter100IsL2Response
---- PASS: TestHTTPResponseAfter100IsL2Response (0.00s)
-=== RUN   TestClosedHTTPLabels
---- PASS: TestClosedHTTPLabels (0.00s)
-=== RUN   TestKeepAliveSameHostGauge
---- PASS: TestKeepAliveSameHostGauge (0.01s)
-=== RUN   TestStaleKeepAliveRetry
---- PASS: TestStaleKeepAliveRetry (5.01s)
-=== RUN   TestStaleNonIdempotentPOST
---- PASS: TestStaleNonIdempotentPOST (0.00s)
-=== RUN   TestBodyAbortAfterStatus
---- PASS: TestBodyAbortAfterStatus (0.00s)
-=== RUN   TestIncompleteHeadRejectAttribution
-=== RUN   TestIncompleteHeadRejectAttribution/partial-connect
-=== RUN   TestIncompleteHeadRejectAttribution/partial-get
-=== RUN   TestIncompleteHeadRejectAttribution/empty
---- PASS: TestIncompleteHeadRejectAttribution (0.01s)
-    --- PASS: TestIncompleteHeadRejectAttribution/partial-connect (0.00s)
-    --- PASS: TestIncompleteHeadRejectAttribution/partial-get (0.00s)
-    --- PASS: TestIncompleteHeadRejectAttribution/empty (0.00s)
-=== RUN   TestDocFencesMatchSources
---- PASS: TestDocFencesMatchSources (0.00s)
-=== RUN   TestHistogramInfAndClosedSetup
---- PASS: TestHistogramInfAndClosedSetup (0.01s)
-=== RUN   TestPartialHeaderWriteDoesNotRetry
---- PASS: TestPartialHeaderWriteDoesNotRetry (0.00s)
-=== RUN   TestReusedReadTimeoutDoesNotRetry
---- PASS: TestReusedReadTimeoutDoesNotRetry (0.00s)
-=== RUN   TestPutRetryIsOptIn
-=== RUN   TestPutRetryIsOptIn/default
-=== RUN   TestPutRetryIsOptIn/enabled
-=== RUN   TestPutRetryIsOptIn/config-file
---- PASS: TestPutRetryIsOptIn (0.01s)
-    --- PASS: TestPutRetryIsOptIn/default (0.00s)
-    --- PASS: TestPutRetryIsOptIn/enabled (0.00s)
-    --- PASS: TestPutRetryIsOptIn/config-file (0.00s)
-=== RUN   TestReadSideReset
-=== RUN   TestReadSideReset/get
-=== RUN   TestReadSideReset/put
---- PASS: TestReadSideReset (0.01s)
-    --- PASS: TestReadSideReset/get (0.00s)
-    --- PASS: TestReadSideReset/put (0.00s)
-=== RUN   TestBodyIdleIsIdleTimeout
---- PASS: TestBodyIdleIsIdleTimeout (0.08s)
-=== RUN   TestHalfCloseIdleIsNotAbort
---- PASS: TestHalfCloseIdleIsNotAbort (0.08s)
-=== RUN   TestUpgradeRSTReason
---- PASS: TestUpgradeRSTReason (0.00s)
-=== RUN   TestPartialHeaderTimeout
---- PASS: TestPartialHeaderTimeout (0.25s)
-=== RUN   TestCachedGostRejectsBadHash
-=== RUN   TestCachedGostRejectsBadHash/version
---- PASS: TestCachedGostRejectsBadHash (0.00s)
-    --- PASS: TestCachedGostRejectsBadHash/version (0.00s)
-=== RUN   TestResolveReasonLabelsConnect
-=== RUN   TestResolveReasonLabelsConnect/unknown
-=== RUN   TestResolveReasonLabelsConnect/empty
-=== RUN   TestResolveReasonLabelsConnect/resolver
-=== RUN   TestResolveReasonLabelsConnect/no-healthy
---- PASS: TestResolveReasonLabelsConnect (0.01s)
-    --- PASS: TestResolveReasonLabelsConnect/unknown (0.00s)
-    --- PASS: TestResolveReasonLabelsConnect/empty (0.00s)
-    --- PASS: TestResolveReasonLabelsConnect/resolver (0.00s)
-    --- PASS: TestResolveReasonLabelsConnect/no-healthy (0.00s)
-=== RUN   TestConnectIdleTimeout
---- PASS: TestConnectIdleTimeout (0.15s)
-=== RUN   TestSlowlorisHeaderDeadline
---- PASS: TestSlowlorisHeaderDeadline (0.20s)
-=== RUN   TestLimitsFromConfigBounds
---- PASS: TestLimitsFromConfigBounds (0.00s)
-=== RUN   TestHeaderOrderAndCaseThroughGost
---- PASS: TestHeaderOrderAndCaseThroughGost (0.00s)
-=== RUN   TestChunkedAndContentLength
---- PASS: TestChunkedAndContentLength (0.00s)
-=== RUN   TestExpect100Continue
---- PASS: TestExpect100Continue (10.21s)
-=== RUN   TestExpect100RejectedDoesNotForwardBody
---- PASS: TestExpect100RejectedDoesNotForwardBody (0.21s)
-=== RUN   TestWebSocketUpgrade
---- PASS: TestWebSocketUpgrade (0.01s)
-=== RUN   TestKeepAliveDifferentHostsAndSameHostReuse
---- PASS: TestKeepAliveDifferentHostsAndSameHostReuse (0.01s)
-=== RUN   TestLastAtNodeID
---- PASS: TestLastAtNodeID (0.02s)
-=== RUN   TestLocalRejectsDoNotDial
-=== RUN   TestLocalRejectsDoNotDial/auth
-=== RUN   TestLocalRejectsDoNotDial/no-node
-=== RUN   TestLocalRejectsDoNotDial/origin-form
-=== RUN   TestLocalRejectsDoNotDial/https
---- PASS: TestLocalRejectsDoNotDial (0.01s)
-    --- PASS: TestLocalRejectsDoNotDial/auth (0.00s)
-    --- PASS: TestLocalRejectsDoNotDial/no-node (0.00s)
-    --- PASS: TestLocalRejectsDoNotDial/origin-form (0.00s)
-    --- PASS: TestLocalRejectsDoNotDial/https (0.00s)
-=== RUN   TestBadCredentialDoesNotDial
---- PASS: TestBadCredentialDoesNotDial (0.00s)
-=== RUN   TestL2Auth407
---- PASS: TestL2Auth407 (0.00s)
-=== RUN   TestL2Status502
---- PASS: TestL2Status502 (0.00s)
-=== RUN   TestDialAndResolve502
-=== RUN   TestDialAndResolve502/dial
-=== RUN   TestDialAndResolve502/unknown
-=== RUN   TestDialAndResolve502/no-healthy
-=== RUN   TestDialAndResolve502/empty
-=== RUN   TestDialAndResolve502/resolver
---- PASS: TestDialAndResolve502 (0.02s)
-    --- PASS: TestDialAndResolve502/dial (0.00s)
-    --- PASS: TestDialAndResolve502/unknown (0.00s)
-    --- PASS: TestDialAndResolve502/no-healthy (0.00s)
-    --- PASS: TestDialAndResolve502/empty (0.00s)
-    --- PASS: TestDialAndResolve502/resolver (0.00s)
-=== RUN   TestL2ResponseTimeout
---- PASS: TestL2ResponseTimeout (0.30s)
-=== RUN   TestClientIdleTimeout
---- PASS: TestClientIdleTimeout (0.20s)
-=== RUN   TestAbsoluteFormMutations
---- PASS: TestAbsoluteFormMutations (0.00s)
-=== RUN   TestHopHeaderStripAndHEAD
---- PASS: TestHopHeaderStripAndHEAD (0.00s)
-=== RUN   TestApproachAGostRewritesHeaders
---- PASS: TestApproachAGostRewritesHeaders (0.00s)
-=== RUN   TestClientHelloBytesJA3JA4
-    httpflow_test.go:1732: ja3=8520497e701d328ca849031134f31582 ja4=t13d0206h2_84cdcbea686c_fb71836bce29
---- PASS: TestClientHelloBytesJA3JA4 (0.04s)
-=== RUN   TestHTTPL2WriteAndDeadline
-=== RUN   TestHTTPL2WriteAndDeadline/write-error
-=== RUN   TestHTTPL2WriteAndDeadline/short-write
-=== RUN   TestHTTPL2WriteAndDeadline/deadline
---- PASS: TestHTTPL2WriteAndDeadline (0.01s)
-    --- PASS: TestHTTPL2WriteAndDeadline/write-error (0.00s)
-    --- PASS: TestHTTPL2WriteAndDeadline/short-write (0.00s)
-    --- PASS: TestHTTPL2WriteAndDeadline/deadline (0.00s)
-=== RUN   TestHTTPClientGone
---- PASS: TestHTTPClientGone (0.00s)
-=== RUN   TestHTTPResponseAfter100IsL2Response
---- PASS: TestHTTPResponseAfter100IsL2Response (0.00s)
-=== RUN   TestClosedHTTPLabels
---- PASS: TestClosedHTTPLabels (0.00s)
-=== RUN   TestKeepAliveSameHostGauge
---- PASS: TestKeepAliveSameHostGauge (0.01s)
-=== RUN   TestStaleKeepAliveRetry
---- PASS: TestStaleKeepAliveRetry (5.01s)
-=== RUN   TestStaleNonIdempotentPOST
---- PASS: TestStaleNonIdempotentPOST (0.00s)
-=== RUN   TestBodyAbortAfterStatus
---- PASS: TestBodyAbortAfterStatus (0.00s)
-=== RUN   TestIncompleteHeadRejectAttribution
-=== RUN   TestIncompleteHeadRejectAttribution/partial-connect
-=== RUN   TestIncompleteHeadRejectAttribution/partial-get
-=== RUN   TestIncompleteHeadRejectAttribution/empty
---- PASS: TestIncompleteHeadRejectAttribution (0.01s)
-    --- PASS: TestIncompleteHeadRejectAttribution/partial-connect (0.00s)
-    --- PASS: TestIncompleteHeadRejectAttribution/partial-get (0.00s)
-    --- PASS: TestIncompleteHeadRejectAttribution/empty (0.00s)
-=== RUN   TestDocFencesMatchSources
---- PASS: TestDocFencesMatchSources (0.00s)
-=== RUN   TestHistogramInfAndClosedSetup
---- PASS: TestHistogramInfAndClosedSetup (0.01s)
-=== RUN   TestPartialHeaderWriteDoesNotRetry
---- PASS: TestPartialHeaderWriteDoesNotRetry (0.00s)
-=== RUN   TestReusedReadTimeoutDoesNotRetry
---- PASS: TestReusedReadTimeoutDoesNotRetry (0.00s)
-=== RUN   TestPutRetryIsOptIn
-=== RUN   TestPutRetryIsOptIn/default
-=== RUN   TestPutRetryIsOptIn/enabled
-=== RUN   TestPutRetryIsOptIn/config-file
---- PASS: TestPutRetryIsOptIn (0.01s)
-    --- PASS: TestPutRetryIsOptIn/default (0.00s)
-    --- PASS: TestPutRetryIsOptIn/enabled (0.00s)
-    --- PASS: TestPutRetryIsOptIn/config-file (0.00s)
-=== RUN   TestReadSideReset
-=== RUN   TestReadSideReset/get
-=== RUN   TestReadSideReset/put
---- PASS: TestReadSideReset (0.01s)
-    --- PASS: TestReadSideReset/get (0.00s)
-    --- PASS: TestReadSideReset/put (0.00s)
-=== RUN   TestBodyIdleIsIdleTimeout
---- PASS: TestBodyIdleIsIdleTimeout (0.08s)
-=== RUN   TestHalfCloseIdleIsNotAbort
---- PASS: TestHalfCloseIdleIsNotAbort (0.08s)
-=== RUN   TestUpgradeRSTReason
---- PASS: TestUpgradeRSTReason (0.00s)
-=== RUN   TestPartialHeaderTimeout
---- PASS: TestPartialHeaderTimeout (0.25s)
-=== RUN   TestCachedGostRejectsBadHash
-=== RUN   TestCachedGostRejectsBadHash/version
---- PASS: TestCachedGostRejectsBadHash (0.00s)
-    --- PASS: TestCachedGostRejectsBadHash/version (0.00s)
-=== RUN   TestResolveReasonLabelsConnect
-=== RUN   TestResolveReasonLabelsConnect/unknown
-=== RUN   TestResolveReasonLabelsConnect/empty
-=== RUN   TestResolveReasonLabelsConnect/resolver
-=== RUN   TestResolveReasonLabelsConnect/no-healthy
---- PASS: TestResolveReasonLabelsConnect (0.01s)
-    --- PASS: TestResolveReasonLabelsConnect/unknown (0.00s)
-    --- PASS: TestResolveReasonLabelsConnect/empty (0.00s)
-    --- PASS: TestResolveReasonLabelsConnect/resolver (0.00s)
-    --- PASS: TestResolveReasonLabelsConnect/no-healthy (0.00s)
-=== RUN   TestConnectIdleTimeout
---- PASS: TestConnectIdleTimeout (0.15s)
-=== RUN   TestSlowlorisHeaderDeadline
---- PASS: TestSlowlorisHeaderDeadline (0.20s)
-=== RUN   TestLimitsFromConfigBounds
---- PASS: TestLimitsFromConfigBounds (0.00s)
-=== RUN   TestHeaderOrderAndCaseThroughGost
---- PASS: TestHeaderOrderAndCaseThroughGost (0.00s)
-=== RUN   TestChunkedAndContentLength
---- PASS: TestChunkedAndContentLength (0.00s)
-=== RUN   TestExpect100Continue
---- PASS: TestExpect100Continue (10.21s)
-=== RUN   TestExpect100RejectedDoesNotForwardBody
---- PASS: TestExpect100RejectedDoesNotForwardBody (0.21s)
-=== RUN   TestWebSocketUpgrade
---- PASS: TestWebSocketUpgrade (0.01s)
-=== RUN   TestKeepAliveDifferentHostsAndSameHostReuse
---- PASS: TestKeepAliveDifferentHostsAndSameHostReuse (0.01s)
-=== RUN   TestLastAtNodeID
---- PASS: TestLastAtNodeID (0.02s)
-=== RUN   TestLocalRejectsDoNotDial
-=== RUN   TestLocalRejectsDoNotDial/auth
-=== RUN   TestLocalRejectsDoNotDial/no-node
-=== RUN   TestLocalRejectsDoNotDial/origin-form
-=== RUN   TestLocalRejectsDoNotDial/https
---- PASS: TestLocalRejectsDoNotDial (0.01s)
-    --- PASS: TestLocalRejectsDoNotDial/auth (0.00s)
-    --- PASS: TestLocalRejectsDoNotDial/no-node (0.00s)
-    --- PASS: TestLocalRejectsDoNotDial/origin-form (0.00s)
-    --- PASS: TestLocalRejectsDoNotDial/https (0.00s)
-=== RUN   TestBadCredentialDoesNotDial
---- PASS: TestBadCredentialDoesNotDial (0.00s)
-=== RUN   TestL2Auth407
---- PASS: TestL2Auth407 (0.00s)
-=== RUN   TestL2Status502
---- PASS: TestL2Status502 (0.00s)
-=== RUN   TestDialAndResolve502
-=== RUN   TestDialAndResolve502/dial
-=== RUN   TestDialAndResolve502/unknown
-=== RUN   TestDialAndResolve502/no-healthy
-=== RUN   TestDialAndResolve502/empty
-=== RUN   TestDialAndResolve502/resolver
---- PASS: TestDialAndResolve502 (0.02s)
-    --- PASS: TestDialAndResolve502/dial (0.00s)
-    --- PASS: TestDialAndResolve502/unknown (0.00s)
-    --- PASS: TestDialAndResolve502/no-healthy (0.00s)
-    --- PASS: TestDialAndResolve502/empty (0.00s)
-    --- PASS: TestDialAndResolve502/resolver (0.00s)
-=== RUN   TestL2ResponseTimeout
---- PASS: TestL2ResponseTimeout (0.30s)
-=== RUN   TestClientIdleTimeout
---- PASS: TestClientIdleTimeout (0.20s)
-=== RUN   TestAbsoluteFormMutations
---- PASS: TestAbsoluteFormMutations (0.00s)
-=== RUN   TestHopHeaderStripAndHEAD
---- PASS: TestHopHeaderStripAndHEAD (0.00s)
-=== RUN   TestApproachAGostRewritesHeaders
---- PASS: TestApproachAGostRewritesHeaders (0.00s)
-=== RUN   TestClientHelloBytesJA3JA4
-    httpflow_test.go:1732: ja3=8520497e701d328ca849031134f31582 ja4=t13d0206h2_84cdcbea686c_fb71836bce29
---- PASS: TestClientHelloBytesJA3JA4 (0.04s)
-=== RUN   TestHTTPL2WriteAndDeadline
-=== RUN   TestHTTPL2WriteAndDeadline/write-error
-=== RUN   TestHTTPL2WriteAndDeadline/short-write
-=== RUN   TestHTTPL2WriteAndDeadline/deadline
---- PASS: TestHTTPL2WriteAndDeadline (0.01s)
-    --- PASS: TestHTTPL2WriteAndDeadline/write-error (0.00s)
-    --- PASS: TestHTTPL2WriteAndDeadline/short-write (0.00s)
-    --- PASS: TestHTTPL2WriteAndDeadline/deadline (0.00s)
-=== RUN   TestHTTPClientGone
---- PASS: TestHTTPClientGone (0.00s)
-=== RUN   TestHTTPResponseAfter100IsL2Response
---- PASS: TestHTTPResponseAfter100IsL2Response (0.00s)
-=== RUN   TestClosedHTTPLabels
---- PASS: TestClosedHTTPLabels (0.00s)
-=== RUN   TestKeepAliveSameHostGauge
---- PASS: TestKeepAliveSameHostGauge (0.01s)
-=== RUN   TestStaleKeepAliveRetry
---- PASS: TestStaleKeepAliveRetry (5.01s)
-=== RUN   TestStaleNonIdempotentPOST
---- PASS: TestStaleNonIdempotentPOST (0.00s)
-=== RUN   TestBodyAbortAfterStatus
---- PASS: TestBodyAbortAfterStatus (0.00s)
-=== RUN   TestIncompleteHeadRejectAttribution
-=== RUN   TestIncompleteHeadRejectAttribution/partial-connect
-=== RUN   TestIncompleteHeadRejectAttribution/partial-get
-=== RUN   TestIncompleteHeadRejectAttribution/empty
---- PASS: TestIncompleteHeadRejectAttribution (0.01s)
-    --- PASS: TestIncompleteHeadRejectAttribution/partial-connect (0.00s)
-    --- PASS: TestIncompleteHeadRejectAttribution/partial-get (0.00s)
-    --- PASS: TestIncompleteHeadRejectAttribution/empty (0.00s)
-=== RUN   TestDocFencesMatchSources
---- PASS: TestDocFencesMatchSources (0.00s)
-=== RUN   TestHistogramInfAndClosedSetup
---- PASS: TestHistogramInfAndClosedSetup (0.01s)
-=== RUN   TestPartialHeaderWriteDoesNotRetry
---- PASS: TestPartialHeaderWriteDoesNotRetry (0.00s)
-=== RUN   TestReusedReadTimeoutDoesNotRetry
---- PASS: TestReusedReadTimeoutDoesNotRetry (0.00s)
-=== RUN   TestPutRetryIsOptIn
-=== RUN   TestPutRetryIsOptIn/default
-=== RUN   TestPutRetryIsOptIn/enabled
-=== RUN   TestPutRetryIsOptIn/config-file
---- PASS: TestPutRetryIsOptIn (0.01s)
-    --- PASS: TestPutRetryIsOptIn/default (0.00s)
-    --- PASS: TestPutRetryIsOptIn/enabled (0.00s)
-    --- PASS: TestPutRetryIsOptIn/config-file (0.00s)
-=== RUN   TestReadSideReset
-=== RUN   TestReadSideReset/get
-=== RUN   TestReadSideReset/put
---- PASS: TestReadSideReset (0.01s)
-    --- PASS: TestReadSideReset/get (0.00s)
-    --- PASS: TestReadSideReset/put (0.00s)
-=== RUN   TestBodyIdleIsIdleTimeout
---- PASS: TestBodyIdleIsIdleTimeout (0.08s)
-=== RUN   TestHalfCloseIdleIsNotAbort
---- PASS: TestHalfCloseIdleIsNotAbort (0.08s)
-=== RUN   TestUpgradeRSTReason
---- PASS: TestUpgradeRSTReason (0.00s)
-=== RUN   TestPartialHeaderTimeout
---- PASS: TestPartialHeaderTimeout (0.25s)
-=== RUN   TestCachedGostRejectsBadHash
-=== RUN   TestCachedGostRejectsBadHash/version
---- PASS: TestCachedGostRejectsBadHash (0.00s)
-    --- PASS: TestCachedGostRejectsBadHash/version (0.00s)
-=== RUN   TestResolveReasonLabelsConnect
-=== RUN   TestResolveReasonLabelsConnect/unknown
-=== RUN   TestResolveReasonLabelsConnect/empty
-=== RUN   TestResolveReasonLabelsConnect/resolver
-=== RUN   TestResolveReasonLabelsConnect/no-healthy
---- PASS: TestResolveReasonLabelsConnect (0.01s)
-    --- PASS: TestResolveReasonLabelsConnect/unknown (0.00s)
-    --- PASS: TestResolveReasonLabelsConnect/empty (0.00s)
-    --- PASS: TestResolveReasonLabelsConnect/resolver (0.00s)
-    --- PASS: TestResolveReasonLabelsConnect/no-healthy (0.00s)
-=== RUN   TestConnectIdleTimeout
---- PASS: TestConnectIdleTimeout (0.15s)
-=== RUN   TestSlowlorisHeaderDeadline
---- PASS: TestSlowlorisHeaderDeadline (0.20s)
-=== RUN   TestLimitsFromConfigBounds
---- PASS: TestLimitsFromConfigBounds (0.00s)
-=== RUN   TestHeaderOrderAndCaseThroughGost
---- PASS: TestHeaderOrderAndCaseThroughGost (0.00s)
-=== RUN   TestChunkedAndContentLength
---- PASS: TestChunkedAndContentLength (0.00s)
-=== RUN   TestExpect100Continue
---- PASS: TestExpect100Continue (10.21s)
+--- PASS: TestExpect100Continue (0.20s)
 === RUN   TestExpect100RejectedDoesNotForwardBody
 --- PASS: TestExpect100RejectedDoesNotForwardBody (0.20s)
 === RUN   TestWebSocketUpgrade
@@ -1692,8 +643,8 @@ command: GOST_REQUIRED=1 go test -tags docfixture -race -count=20 -v ./internal/
 === RUN   TestLocalRejectsDoNotDial/no-node
 === RUN   TestLocalRejectsDoNotDial/origin-form
 === RUN   TestLocalRejectsDoNotDial/https
---- PASS: TestLocalRejectsDoNotDial (0.02s)
-    --- PASS: TestLocalRejectsDoNotDial/auth (0.01s)
+--- PASS: TestLocalRejectsDoNotDial (0.01s)
+    --- PASS: TestLocalRejectsDoNotDial/auth (0.00s)
     --- PASS: TestLocalRejectsDoNotDial/no-node (0.00s)
     --- PASS: TestLocalRejectsDoNotDial/origin-form (0.00s)
     --- PASS: TestLocalRejectsDoNotDial/https (0.00s)
@@ -1726,7 +677,7 @@ command: GOST_REQUIRED=1 go test -tags docfixture -race -count=20 -v ./internal/
 === RUN   TestApproachAGostRewritesHeaders
 --- PASS: TestApproachAGostRewritesHeaders (0.00s)
 === RUN   TestClientHelloBytesJA3JA4
-    httpflow_test.go:1732: ja3=8520497e701d328ca849031134f31582 ja4=t13d0206h2_84cdcbea686c_fb71836bce29
+    httpflow_test.go:1739: ja3=8520497e701d328ca849031134f31582 ja4=t13d0206h2_84cdcbea686c_fb71836bce29
 --- PASS: TestClientHelloBytesJA3JA4 (0.04s)
 === RUN   TestHTTPL2WriteAndDeadline
 === RUN   TestHTTPL2WriteAndDeadline/write-error
@@ -1806,6 +757,12 @@ command: GOST_REQUIRED=1 go test -tags docfixture -race -count=20 -v ./internal/
 --- PASS: TestConnectIdleTimeout (0.15s)
 === RUN   TestSlowlorisHeaderDeadline
 --- PASS: TestSlowlorisHeaderDeadline (0.20s)
+=== RUN   TestKeepAliveIdleSurvivesHeaderDeadline
+--- PASS: TestKeepAliveIdleSurvivesHeaderDeadline (0.45s)
+=== RUN   TestKeepAliveTrickleHeader
+--- PASS: TestKeepAliveTrickleHeader (0.20s)
+=== RUN   TestConnectHalfClosePreemptsTunnelIdle
+--- PASS: TestConnectHalfClosePreemptsTunnelIdle (0.70s)
 === RUN   TestLimitsFromConfigBounds
 --- PASS: TestLimitsFromConfigBounds (0.00s)
 === RUN   TestHeaderOrderAndCaseThroughGost
@@ -1813,9 +770,9 @@ command: GOST_REQUIRED=1 go test -tags docfixture -race -count=20 -v ./internal/
 === RUN   TestChunkedAndContentLength
 --- PASS: TestChunkedAndContentLength (0.00s)
 === RUN   TestExpect100Continue
---- PASS: TestExpect100Continue (10.21s)
+--- PASS: TestExpect100Continue (0.20s)
 === RUN   TestExpect100RejectedDoesNotForwardBody
---- PASS: TestExpect100RejectedDoesNotForwardBody (0.21s)
+--- PASS: TestExpect100RejectedDoesNotForwardBody (0.20s)
 === RUN   TestWebSocketUpgrade
 --- PASS: TestWebSocketUpgrade (0.01s)
 === RUN   TestKeepAliveDifferentHostsAndSameHostReuse
@@ -1861,7 +818,7 @@ command: GOST_REQUIRED=1 go test -tags docfixture -race -count=20 -v ./internal/
 === RUN   TestApproachAGostRewritesHeaders
 --- PASS: TestApproachAGostRewritesHeaders (0.00s)
 === RUN   TestClientHelloBytesJA3JA4
-    httpflow_test.go:1732: ja3=8520497e701d328ca849031134f31582 ja4=t13d0206h2_84cdcbea686c_fb71836bce29
+    httpflow_test.go:1739: ja3=8520497e701d328ca849031134f31582 ja4=t13d0206h2_84cdcbea686c_fb71836bce29
 --- PASS: TestClientHelloBytesJA3JA4 (0.04s)
 === RUN   TestHTTPL2WriteAndDeadline
 === RUN   TestHTTPL2WriteAndDeadline/write-error
@@ -1941,6 +898,12 @@ command: GOST_REQUIRED=1 go test -tags docfixture -race -count=20 -v ./internal/
 --- PASS: TestConnectIdleTimeout (0.15s)
 === RUN   TestSlowlorisHeaderDeadline
 --- PASS: TestSlowlorisHeaderDeadline (0.20s)
+=== RUN   TestKeepAliveIdleSurvivesHeaderDeadline
+--- PASS: TestKeepAliveIdleSurvivesHeaderDeadline (0.45s)
+=== RUN   TestKeepAliveTrickleHeader
+--- PASS: TestKeepAliveTrickleHeader (0.20s)
+=== RUN   TestConnectHalfClosePreemptsTunnelIdle
+--- PASS: TestConnectHalfClosePreemptsTunnelIdle (0.70s)
 === RUN   TestLimitsFromConfigBounds
 --- PASS: TestLimitsFromConfigBounds (0.00s)
 === RUN   TestHeaderOrderAndCaseThroughGost
@@ -1948,144 +911,9 @@ command: GOST_REQUIRED=1 go test -tags docfixture -race -count=20 -v ./internal/
 === RUN   TestChunkedAndContentLength
 --- PASS: TestChunkedAndContentLength (0.00s)
 === RUN   TestExpect100Continue
---- PASS: TestExpect100Continue (10.21s)
+--- PASS: TestExpect100Continue (0.20s)
 === RUN   TestExpect100RejectedDoesNotForwardBody
---- PASS: TestExpect100RejectedDoesNotForwardBody (0.21s)
-=== RUN   TestWebSocketUpgrade
---- PASS: TestWebSocketUpgrade (0.01s)
-=== RUN   TestKeepAliveDifferentHostsAndSameHostReuse
---- PASS: TestKeepAliveDifferentHostsAndSameHostReuse (0.01s)
-=== RUN   TestLastAtNodeID
---- PASS: TestLastAtNodeID (0.02s)
-=== RUN   TestLocalRejectsDoNotDial
-=== RUN   TestLocalRejectsDoNotDial/auth
-=== RUN   TestLocalRejectsDoNotDial/no-node
-=== RUN   TestLocalRejectsDoNotDial/origin-form
-=== RUN   TestLocalRejectsDoNotDial/https
---- PASS: TestLocalRejectsDoNotDial (0.02s)
-    --- PASS: TestLocalRejectsDoNotDial/auth (0.00s)
-    --- PASS: TestLocalRejectsDoNotDial/no-node (0.00s)
-    --- PASS: TestLocalRejectsDoNotDial/origin-form (0.00s)
-    --- PASS: TestLocalRejectsDoNotDial/https (0.00s)
-=== RUN   TestBadCredentialDoesNotDial
---- PASS: TestBadCredentialDoesNotDial (0.00s)
-=== RUN   TestL2Auth407
---- PASS: TestL2Auth407 (0.00s)
-=== RUN   TestL2Status502
---- PASS: TestL2Status502 (0.00s)
-=== RUN   TestDialAndResolve502
-=== RUN   TestDialAndResolve502/dial
-=== RUN   TestDialAndResolve502/unknown
-=== RUN   TestDialAndResolve502/no-healthy
-=== RUN   TestDialAndResolve502/empty
-=== RUN   TestDialAndResolve502/resolver
---- PASS: TestDialAndResolve502 (0.02s)
-    --- PASS: TestDialAndResolve502/dial (0.00s)
-    --- PASS: TestDialAndResolve502/unknown (0.00s)
-    --- PASS: TestDialAndResolve502/no-healthy (0.00s)
-    --- PASS: TestDialAndResolve502/empty (0.00s)
-    --- PASS: TestDialAndResolve502/resolver (0.00s)
-=== RUN   TestL2ResponseTimeout
---- PASS: TestL2ResponseTimeout (0.30s)
-=== RUN   TestClientIdleTimeout
---- PASS: TestClientIdleTimeout (0.20s)
-=== RUN   TestAbsoluteFormMutations
---- PASS: TestAbsoluteFormMutations (0.00s)
-=== RUN   TestHopHeaderStripAndHEAD
---- PASS: TestHopHeaderStripAndHEAD (0.00s)
-=== RUN   TestApproachAGostRewritesHeaders
---- PASS: TestApproachAGostRewritesHeaders (0.00s)
-=== RUN   TestClientHelloBytesJA3JA4
-    httpflow_test.go:1732: ja3=8520497e701d328ca849031134f31582 ja4=t13d0206h2_84cdcbea686c_fb71836bce29
---- PASS: TestClientHelloBytesJA3JA4 (0.04s)
-=== RUN   TestHTTPL2WriteAndDeadline
-=== RUN   TestHTTPL2WriteAndDeadline/write-error
-=== RUN   TestHTTPL2WriteAndDeadline/short-write
-=== RUN   TestHTTPL2WriteAndDeadline/deadline
---- PASS: TestHTTPL2WriteAndDeadline (0.01s)
-    --- PASS: TestHTTPL2WriteAndDeadline/write-error (0.00s)
-    --- PASS: TestHTTPL2WriteAndDeadline/short-write (0.00s)
-    --- PASS: TestHTTPL2WriteAndDeadline/deadline (0.00s)
-=== RUN   TestHTTPClientGone
---- PASS: TestHTTPClientGone (0.00s)
-=== RUN   TestHTTPResponseAfter100IsL2Response
---- PASS: TestHTTPResponseAfter100IsL2Response (0.00s)
-=== RUN   TestClosedHTTPLabels
---- PASS: TestClosedHTTPLabels (0.00s)
-=== RUN   TestKeepAliveSameHostGauge
---- PASS: TestKeepAliveSameHostGauge (0.01s)
-=== RUN   TestStaleKeepAliveRetry
---- PASS: TestStaleKeepAliveRetry (5.01s)
-=== RUN   TestStaleNonIdempotentPOST
---- PASS: TestStaleNonIdempotentPOST (0.00s)
-=== RUN   TestBodyAbortAfterStatus
---- PASS: TestBodyAbortAfterStatus (0.00s)
-=== RUN   TestIncompleteHeadRejectAttribution
-=== RUN   TestIncompleteHeadRejectAttribution/partial-connect
-=== RUN   TestIncompleteHeadRejectAttribution/partial-get
-=== RUN   TestIncompleteHeadRejectAttribution/empty
---- PASS: TestIncompleteHeadRejectAttribution (0.01s)
-    --- PASS: TestIncompleteHeadRejectAttribution/partial-connect (0.00s)
-    --- PASS: TestIncompleteHeadRejectAttribution/partial-get (0.00s)
-    --- PASS: TestIncompleteHeadRejectAttribution/empty (0.00s)
-=== RUN   TestDocFencesMatchSources
---- PASS: TestDocFencesMatchSources (0.00s)
-=== RUN   TestHistogramInfAndClosedSetup
---- PASS: TestHistogramInfAndClosedSetup (0.01s)
-=== RUN   TestPartialHeaderWriteDoesNotRetry
---- PASS: TestPartialHeaderWriteDoesNotRetry (0.00s)
-=== RUN   TestReusedReadTimeoutDoesNotRetry
---- PASS: TestReusedReadTimeoutDoesNotRetry (0.00s)
-=== RUN   TestPutRetryIsOptIn
-=== RUN   TestPutRetryIsOptIn/default
-=== RUN   TestPutRetryIsOptIn/enabled
-=== RUN   TestPutRetryIsOptIn/config-file
---- PASS: TestPutRetryIsOptIn (0.01s)
-    --- PASS: TestPutRetryIsOptIn/default (0.00s)
-    --- PASS: TestPutRetryIsOptIn/enabled (0.00s)
-    --- PASS: TestPutRetryIsOptIn/config-file (0.00s)
-=== RUN   TestReadSideReset
-=== RUN   TestReadSideReset/get
-=== RUN   TestReadSideReset/put
---- PASS: TestReadSideReset (0.01s)
-    --- PASS: TestReadSideReset/get (0.00s)
-    --- PASS: TestReadSideReset/put (0.00s)
-=== RUN   TestBodyIdleIsIdleTimeout
---- PASS: TestBodyIdleIsIdleTimeout (0.08s)
-=== RUN   TestHalfCloseIdleIsNotAbort
---- PASS: TestHalfCloseIdleIsNotAbort (0.08s)
-=== RUN   TestUpgradeRSTReason
---- PASS: TestUpgradeRSTReason (0.00s)
-=== RUN   TestPartialHeaderTimeout
---- PASS: TestPartialHeaderTimeout (0.25s)
-=== RUN   TestCachedGostRejectsBadHash
-=== RUN   TestCachedGostRejectsBadHash/version
---- PASS: TestCachedGostRejectsBadHash (0.00s)
-    --- PASS: TestCachedGostRejectsBadHash/version (0.00s)
-=== RUN   TestResolveReasonLabelsConnect
-=== RUN   TestResolveReasonLabelsConnect/unknown
-=== RUN   TestResolveReasonLabelsConnect/empty
-=== RUN   TestResolveReasonLabelsConnect/resolver
-=== RUN   TestResolveReasonLabelsConnect/no-healthy
---- PASS: TestResolveReasonLabelsConnect (0.01s)
-    --- PASS: TestResolveReasonLabelsConnect/unknown (0.00s)
-    --- PASS: TestResolveReasonLabelsConnect/empty (0.00s)
-    --- PASS: TestResolveReasonLabelsConnect/resolver (0.00s)
-    --- PASS: TestResolveReasonLabelsConnect/no-healthy (0.00s)
-=== RUN   TestConnectIdleTimeout
---- PASS: TestConnectIdleTimeout (0.15s)
-=== RUN   TestSlowlorisHeaderDeadline
---- PASS: TestSlowlorisHeaderDeadline (0.20s)
-=== RUN   TestLimitsFromConfigBounds
---- PASS: TestLimitsFromConfigBounds (0.00s)
-=== RUN   TestHeaderOrderAndCaseThroughGost
---- PASS: TestHeaderOrderAndCaseThroughGost (0.00s)
-=== RUN   TestChunkedAndContentLength
---- PASS: TestChunkedAndContentLength (0.00s)
-=== RUN   TestExpect100Continue
---- PASS: TestExpect100Continue (10.21s)
-=== RUN   TestExpect100RejectedDoesNotForwardBody
---- PASS: TestExpect100RejectedDoesNotForwardBody (0.21s)
+--- PASS: TestExpect100RejectedDoesNotForwardBody (0.20s)
 === RUN   TestWebSocketUpgrade
 --- PASS: TestWebSocketUpgrade (0.01s)
 === RUN   TestKeepAliveDifferentHostsAndSameHostReuse
@@ -2131,7 +959,7 @@ command: GOST_REQUIRED=1 go test -tags docfixture -race -count=20 -v ./internal/
 === RUN   TestApproachAGostRewritesHeaders
 --- PASS: TestApproachAGostRewritesHeaders (0.00s)
 === RUN   TestClientHelloBytesJA3JA4
-    httpflow_test.go:1732: ja3=8520497e701d328ca849031134f31582 ja4=t13d0206h2_84cdcbea686c_fb71836bce29
+    httpflow_test.go:1739: ja3=8520497e701d328ca849031134f31582 ja4=t13d0206h2_84cdcbea686c_fb71836bce29
 --- PASS: TestClientHelloBytesJA3JA4 (0.04s)
 === RUN   TestHTTPL2WriteAndDeadline
 === RUN   TestHTTPL2WriteAndDeadline/write-error
@@ -2153,141 +981,6 @@ command: GOST_REQUIRED=1 go test -tags docfixture -race -count=20 -v ./internal/
 --- PASS: TestStaleKeepAliveRetry (5.01s)
 === RUN   TestStaleNonIdempotentPOST
 --- PASS: TestStaleNonIdempotentPOST (0.00s)
-=== RUN   TestBodyAbortAfterStatus
---- PASS: TestBodyAbortAfterStatus (0.00s)
-=== RUN   TestIncompleteHeadRejectAttribution
-=== RUN   TestIncompleteHeadRejectAttribution/partial-connect
-=== RUN   TestIncompleteHeadRejectAttribution/partial-get
-=== RUN   TestIncompleteHeadRejectAttribution/empty
---- PASS: TestIncompleteHeadRejectAttribution (0.01s)
-    --- PASS: TestIncompleteHeadRejectAttribution/partial-connect (0.00s)
-    --- PASS: TestIncompleteHeadRejectAttribution/partial-get (0.00s)
-    --- PASS: TestIncompleteHeadRejectAttribution/empty (0.00s)
-=== RUN   TestDocFencesMatchSources
---- PASS: TestDocFencesMatchSources (0.00s)
-=== RUN   TestHistogramInfAndClosedSetup
---- PASS: TestHistogramInfAndClosedSetup (0.01s)
-=== RUN   TestPartialHeaderWriteDoesNotRetry
---- PASS: TestPartialHeaderWriteDoesNotRetry (0.00s)
-=== RUN   TestReusedReadTimeoutDoesNotRetry
---- PASS: TestReusedReadTimeoutDoesNotRetry (0.00s)
-=== RUN   TestPutRetryIsOptIn
-=== RUN   TestPutRetryIsOptIn/default
-=== RUN   TestPutRetryIsOptIn/enabled
-=== RUN   TestPutRetryIsOptIn/config-file
---- PASS: TestPutRetryIsOptIn (0.01s)
-    --- PASS: TestPutRetryIsOptIn/default (0.00s)
-    --- PASS: TestPutRetryIsOptIn/enabled (0.00s)
-    --- PASS: TestPutRetryIsOptIn/config-file (0.01s)
-=== RUN   TestReadSideReset
-=== RUN   TestReadSideReset/get
-=== RUN   TestReadSideReset/put
---- PASS: TestReadSideReset (0.01s)
-    --- PASS: TestReadSideReset/get (0.00s)
-    --- PASS: TestReadSideReset/put (0.00s)
-=== RUN   TestBodyIdleIsIdleTimeout
---- PASS: TestBodyIdleIsIdleTimeout (0.08s)
-=== RUN   TestHalfCloseIdleIsNotAbort
---- PASS: TestHalfCloseIdleIsNotAbort (0.08s)
-=== RUN   TestUpgradeRSTReason
---- PASS: TestUpgradeRSTReason (0.00s)
-=== RUN   TestPartialHeaderTimeout
---- PASS: TestPartialHeaderTimeout (0.25s)
-=== RUN   TestCachedGostRejectsBadHash
-=== RUN   TestCachedGostRejectsBadHash/version
---- PASS: TestCachedGostRejectsBadHash (0.00s)
-    --- PASS: TestCachedGostRejectsBadHash/version (0.00s)
-=== RUN   TestResolveReasonLabelsConnect
-=== RUN   TestResolveReasonLabelsConnect/unknown
-=== RUN   TestResolveReasonLabelsConnect/empty
-=== RUN   TestResolveReasonLabelsConnect/resolver
-=== RUN   TestResolveReasonLabelsConnect/no-healthy
---- PASS: TestResolveReasonLabelsConnect (0.01s)
-    --- PASS: TestResolveReasonLabelsConnect/unknown (0.00s)
-    --- PASS: TestResolveReasonLabelsConnect/empty (0.00s)
-    --- PASS: TestResolveReasonLabelsConnect/resolver (0.00s)
-    --- PASS: TestResolveReasonLabelsConnect/no-healthy (0.00s)
-=== RUN   TestConnectIdleTimeout
---- PASS: TestConnectIdleTimeout (0.15s)
-=== RUN   TestSlowlorisHeaderDeadline
---- PASS: TestSlowlorisHeaderDeadline (0.20s)
-=== RUN   TestLimitsFromConfigBounds
---- PASS: TestLimitsFromConfigBounds (0.00s)
-=== RUN   TestHeaderOrderAndCaseThroughGost
---- PASS: TestHeaderOrderAndCaseThroughGost (0.00s)
-=== RUN   TestChunkedAndContentLength
---- PASS: TestChunkedAndContentLength (0.00s)
-=== RUN   TestExpect100Continue
---- PASS: TestExpect100Continue (10.21s)
-=== RUN   TestExpect100RejectedDoesNotForwardBody
---- PASS: TestExpect100RejectedDoesNotForwardBody (0.21s)
-=== RUN   TestWebSocketUpgrade
---- PASS: TestWebSocketUpgrade (0.01s)
-=== RUN   TestKeepAliveDifferentHostsAndSameHostReuse
---- PASS: TestKeepAliveDifferentHostsAndSameHostReuse (0.01s)
-=== RUN   TestLastAtNodeID
---- PASS: TestLastAtNodeID (0.02s)
-=== RUN   TestLocalRejectsDoNotDial
-=== RUN   TestLocalRejectsDoNotDial/auth
-=== RUN   TestLocalRejectsDoNotDial/no-node
-=== RUN   TestLocalRejectsDoNotDial/origin-form
-=== RUN   TestLocalRejectsDoNotDial/https
---- PASS: TestLocalRejectsDoNotDial (0.02s)
-    --- PASS: TestLocalRejectsDoNotDial/auth (0.00s)
-    --- PASS: TestLocalRejectsDoNotDial/no-node (0.00s)
-    --- PASS: TestLocalRejectsDoNotDial/origin-form (0.00s)
-    --- PASS: TestLocalRejectsDoNotDial/https (0.00s)
-=== RUN   TestBadCredentialDoesNotDial
---- PASS: TestBadCredentialDoesNotDial (0.00s)
-=== RUN   TestL2Auth407
---- PASS: TestL2Auth407 (0.00s)
-=== RUN   TestL2Status502
---- PASS: TestL2Status502 (0.00s)
-=== RUN   TestDialAndResolve502
-=== RUN   TestDialAndResolve502/dial
-=== RUN   TestDialAndResolve502/unknown
-=== RUN   TestDialAndResolve502/no-healthy
-=== RUN   TestDialAndResolve502/empty
-=== RUN   TestDialAndResolve502/resolver
---- PASS: TestDialAndResolve502 (0.02s)
-    --- PASS: TestDialAndResolve502/dial (0.00s)
-    --- PASS: TestDialAndResolve502/unknown (0.00s)
-    --- PASS: TestDialAndResolve502/no-healthy (0.00s)
-    --- PASS: TestDialAndResolve502/empty (0.00s)
-    --- PASS: TestDialAndResolve502/resolver (0.00s)
-=== RUN   TestL2ResponseTimeout
---- PASS: TestL2ResponseTimeout (0.30s)
-=== RUN   TestClientIdleTimeout
---- PASS: TestClientIdleTimeout (0.20s)
-=== RUN   TestAbsoluteFormMutations
---- PASS: TestAbsoluteFormMutations (0.00s)
-=== RUN   TestHopHeaderStripAndHEAD
---- PASS: TestHopHeaderStripAndHEAD (0.00s)
-=== RUN   TestApproachAGostRewritesHeaders
---- PASS: TestApproachAGostRewritesHeaders (0.00s)
-=== RUN   TestClientHelloBytesJA3JA4
-    httpflow_test.go:1732: ja3=8520497e701d328ca849031134f31582 ja4=t13d0206h2_84cdcbea686c_fb71836bce29
---- PASS: TestClientHelloBytesJA3JA4 (0.04s)
-=== RUN   TestHTTPL2WriteAndDeadline
-=== RUN   TestHTTPL2WriteAndDeadline/write-error
-=== RUN   TestHTTPL2WriteAndDeadline/short-write
-=== RUN   TestHTTPL2WriteAndDeadline/deadline
---- PASS: TestHTTPL2WriteAndDeadline (0.01s)
-    --- PASS: TestHTTPL2WriteAndDeadline/write-error (0.00s)
-    --- PASS: TestHTTPL2WriteAndDeadline/short-write (0.00s)
-    --- PASS: TestHTTPL2WriteAndDeadline/deadline (0.00s)
-=== RUN   TestHTTPClientGone
---- PASS: TestHTTPClientGone (0.00s)
-=== RUN   TestHTTPResponseAfter100IsL2Response
---- PASS: TestHTTPResponseAfter100IsL2Response (0.00s)
-=== RUN   TestClosedHTTPLabels
---- PASS: TestClosedHTTPLabels (0.00s)
-=== RUN   TestKeepAliveSameHostGauge
---- PASS: TestKeepAliveSameHostGauge (0.01s)
-=== RUN   TestStaleKeepAliveRetry
---- PASS: TestStaleKeepAliveRetry (5.01s)
-=== RUN   TestStaleNonIdempotentPOST
---- PASS: TestStaleNonIdempotentPOST (0.01s)
 === RUN   TestBodyAbortAfterStatus
 --- PASS: TestBodyAbortAfterStatus (0.00s)
 === RUN   TestIncompleteHeadRejectAttribution
@@ -2346,6 +1039,12 @@ command: GOST_REQUIRED=1 go test -tags docfixture -race -count=20 -v ./internal/
 --- PASS: TestConnectIdleTimeout (0.15s)
 === RUN   TestSlowlorisHeaderDeadline
 --- PASS: TestSlowlorisHeaderDeadline (0.20s)
+=== RUN   TestKeepAliveIdleSurvivesHeaderDeadline
+--- PASS: TestKeepAliveIdleSurvivesHeaderDeadline (0.45s)
+=== RUN   TestKeepAliveTrickleHeader
+--- PASS: TestKeepAliveTrickleHeader (0.21s)
+=== RUN   TestConnectHalfClosePreemptsTunnelIdle
+--- PASS: TestConnectHalfClosePreemptsTunnelIdle (0.70s)
 === RUN   TestLimitsFromConfigBounds
 --- PASS: TestLimitsFromConfigBounds (0.00s)
 === RUN   TestHeaderOrderAndCaseThroughGost
@@ -2353,7 +1052,7 @@ command: GOST_REQUIRED=1 go test -tags docfixture -race -count=20 -v ./internal/
 === RUN   TestChunkedAndContentLength
 --- PASS: TestChunkedAndContentLength (0.00s)
 === RUN   TestExpect100Continue
---- PASS: TestExpect100Continue (10.21s)
+--- PASS: TestExpect100Continue (0.21s)
 === RUN   TestExpect100RejectedDoesNotForwardBody
 --- PASS: TestExpect100RejectedDoesNotForwardBody (0.21s)
 === RUN   TestWebSocketUpgrade
@@ -2367,142 +1066,7 @@ command: GOST_REQUIRED=1 go test -tags docfixture -race -count=20 -v ./internal/
 === RUN   TestLocalRejectsDoNotDial/no-node
 === RUN   TestLocalRejectsDoNotDial/origin-form
 === RUN   TestLocalRejectsDoNotDial/https
---- PASS: TestLocalRejectsDoNotDial (0.02s)
-    --- PASS: TestLocalRejectsDoNotDial/auth (0.00s)
-    --- PASS: TestLocalRejectsDoNotDial/no-node (0.00s)
-    --- PASS: TestLocalRejectsDoNotDial/origin-form (0.00s)
-    --- PASS: TestLocalRejectsDoNotDial/https (0.00s)
-=== RUN   TestBadCredentialDoesNotDial
---- PASS: TestBadCredentialDoesNotDial (0.00s)
-=== RUN   TestL2Auth407
---- PASS: TestL2Auth407 (0.00s)
-=== RUN   TestL2Status502
---- PASS: TestL2Status502 (0.00s)
-=== RUN   TestDialAndResolve502
-=== RUN   TestDialAndResolve502/dial
-=== RUN   TestDialAndResolve502/unknown
-=== RUN   TestDialAndResolve502/no-healthy
-=== RUN   TestDialAndResolve502/empty
-=== RUN   TestDialAndResolve502/resolver
---- PASS: TestDialAndResolve502 (0.02s)
-    --- PASS: TestDialAndResolve502/dial (0.00s)
-    --- PASS: TestDialAndResolve502/unknown (0.00s)
-    --- PASS: TestDialAndResolve502/no-healthy (0.00s)
-    --- PASS: TestDialAndResolve502/empty (0.00s)
-    --- PASS: TestDialAndResolve502/resolver (0.00s)
-=== RUN   TestL2ResponseTimeout
---- PASS: TestL2ResponseTimeout (0.30s)
-=== RUN   TestClientIdleTimeout
---- PASS: TestClientIdleTimeout (0.20s)
-=== RUN   TestAbsoluteFormMutations
---- PASS: TestAbsoluteFormMutations (0.00s)
-=== RUN   TestHopHeaderStripAndHEAD
---- PASS: TestHopHeaderStripAndHEAD (0.00s)
-=== RUN   TestApproachAGostRewritesHeaders
---- PASS: TestApproachAGostRewritesHeaders (0.00s)
-=== RUN   TestClientHelloBytesJA3JA4
-    httpflow_test.go:1732: ja3=8520497e701d328ca849031134f31582 ja4=t13d0206h2_84cdcbea686c_fb71836bce29
---- PASS: TestClientHelloBytesJA3JA4 (0.04s)
-=== RUN   TestHTTPL2WriteAndDeadline
-=== RUN   TestHTTPL2WriteAndDeadline/write-error
-=== RUN   TestHTTPL2WriteAndDeadline/short-write
-=== RUN   TestHTTPL2WriteAndDeadline/deadline
---- PASS: TestHTTPL2WriteAndDeadline (0.01s)
-    --- PASS: TestHTTPL2WriteAndDeadline/write-error (0.00s)
-    --- PASS: TestHTTPL2WriteAndDeadline/short-write (0.00s)
-    --- PASS: TestHTTPL2WriteAndDeadline/deadline (0.00s)
-=== RUN   TestHTTPClientGone
---- PASS: TestHTTPClientGone (0.00s)
-=== RUN   TestHTTPResponseAfter100IsL2Response
---- PASS: TestHTTPResponseAfter100IsL2Response (0.00s)
-=== RUN   TestClosedHTTPLabels
---- PASS: TestClosedHTTPLabels (0.00s)
-=== RUN   TestKeepAliveSameHostGauge
---- PASS: TestKeepAliveSameHostGauge (0.01s)
-=== RUN   TestStaleKeepAliveRetry
---- PASS: TestStaleKeepAliveRetry (5.01s)
-=== RUN   TestStaleNonIdempotentPOST
---- PASS: TestStaleNonIdempotentPOST (0.00s)
-=== RUN   TestBodyAbortAfterStatus
---- PASS: TestBodyAbortAfterStatus (0.00s)
-=== RUN   TestIncompleteHeadRejectAttribution
-=== RUN   TestIncompleteHeadRejectAttribution/partial-connect
-=== RUN   TestIncompleteHeadRejectAttribution/partial-get
-=== RUN   TestIncompleteHeadRejectAttribution/empty
---- PASS: TestIncompleteHeadRejectAttribution (0.01s)
-    --- PASS: TestIncompleteHeadRejectAttribution/partial-connect (0.00s)
-    --- PASS: TestIncompleteHeadRejectAttribution/partial-get (0.00s)
-    --- PASS: TestIncompleteHeadRejectAttribution/empty (0.00s)
-=== RUN   TestDocFencesMatchSources
---- PASS: TestDocFencesMatchSources (0.00s)
-=== RUN   TestHistogramInfAndClosedSetup
---- PASS: TestHistogramInfAndClosedSetup (0.01s)
-=== RUN   TestPartialHeaderWriteDoesNotRetry
---- PASS: TestPartialHeaderWriteDoesNotRetry (0.00s)
-=== RUN   TestReusedReadTimeoutDoesNotRetry
---- PASS: TestReusedReadTimeoutDoesNotRetry (0.00s)
-=== RUN   TestPutRetryIsOptIn
-=== RUN   TestPutRetryIsOptIn/default
-=== RUN   TestPutRetryIsOptIn/enabled
-=== RUN   TestPutRetryIsOptIn/config-file
---- PASS: TestPutRetryIsOptIn (0.01s)
-    --- PASS: TestPutRetryIsOptIn/default (0.00s)
-    --- PASS: TestPutRetryIsOptIn/enabled (0.00s)
-    --- PASS: TestPutRetryIsOptIn/config-file (0.01s)
-=== RUN   TestReadSideReset
-=== RUN   TestReadSideReset/get
-=== RUN   TestReadSideReset/put
---- PASS: TestReadSideReset (0.01s)
-    --- PASS: TestReadSideReset/get (0.00s)
-    --- PASS: TestReadSideReset/put (0.00s)
-=== RUN   TestBodyIdleIsIdleTimeout
---- PASS: TestBodyIdleIsIdleTimeout (0.08s)
-=== RUN   TestHalfCloseIdleIsNotAbort
---- PASS: TestHalfCloseIdleIsNotAbort (0.08s)
-=== RUN   TestUpgradeRSTReason
---- PASS: TestUpgradeRSTReason (0.00s)
-=== RUN   TestPartialHeaderTimeout
---- PASS: TestPartialHeaderTimeout (0.25s)
-=== RUN   TestCachedGostRejectsBadHash
-=== RUN   TestCachedGostRejectsBadHash/version
---- PASS: TestCachedGostRejectsBadHash (0.00s)
-    --- PASS: TestCachedGostRejectsBadHash/version (0.00s)
-=== RUN   TestResolveReasonLabelsConnect
-=== RUN   TestResolveReasonLabelsConnect/unknown
-=== RUN   TestResolveReasonLabelsConnect/empty
-=== RUN   TestResolveReasonLabelsConnect/resolver
-=== RUN   TestResolveReasonLabelsConnect/no-healthy
---- PASS: TestResolveReasonLabelsConnect (0.02s)
-    --- PASS: TestResolveReasonLabelsConnect/unknown (0.00s)
-    --- PASS: TestResolveReasonLabelsConnect/empty (0.00s)
-    --- PASS: TestResolveReasonLabelsConnect/resolver (0.00s)
-    --- PASS: TestResolveReasonLabelsConnect/no-healthy (0.00s)
-=== RUN   TestConnectIdleTimeout
---- PASS: TestConnectIdleTimeout (0.15s)
-=== RUN   TestSlowlorisHeaderDeadline
---- PASS: TestSlowlorisHeaderDeadline (0.20s)
-=== RUN   TestLimitsFromConfigBounds
---- PASS: TestLimitsFromConfigBounds (0.00s)
-=== RUN   TestHeaderOrderAndCaseThroughGost
---- PASS: TestHeaderOrderAndCaseThroughGost (0.00s)
-=== RUN   TestChunkedAndContentLength
---- PASS: TestChunkedAndContentLength (0.00s)
-=== RUN   TestExpect100Continue
---- PASS: TestExpect100Continue (10.21s)
-=== RUN   TestExpect100RejectedDoesNotForwardBody
---- PASS: TestExpect100RejectedDoesNotForwardBody (0.21s)
-=== RUN   TestWebSocketUpgrade
---- PASS: TestWebSocketUpgrade (0.01s)
-=== RUN   TestKeepAliveDifferentHostsAndSameHostReuse
---- PASS: TestKeepAliveDifferentHostsAndSameHostReuse (0.01s)
-=== RUN   TestLastAtNodeID
---- PASS: TestLastAtNodeID (0.02s)
-=== RUN   TestLocalRejectsDoNotDial
-=== RUN   TestLocalRejectsDoNotDial/auth
-=== RUN   TestLocalRejectsDoNotDial/no-node
-=== RUN   TestLocalRejectsDoNotDial/origin-form
-=== RUN   TestLocalRejectsDoNotDial/https
---- PASS: TestLocalRejectsDoNotDial (0.02s)
+--- PASS: TestLocalRejectsDoNotDial (0.01s)
     --- PASS: TestLocalRejectsDoNotDial/auth (0.00s)
     --- PASS: TestLocalRejectsDoNotDial/no-node (0.00s)
     --- PASS: TestLocalRejectsDoNotDial/origin-form (0.00s)
@@ -2528,7 +1092,7 @@ command: GOST_REQUIRED=1 go test -tags docfixture -race -count=20 -v ./internal/
 === RUN   TestL2ResponseTimeout
 --- PASS: TestL2ResponseTimeout (0.31s)
 === RUN   TestClientIdleTimeout
---- PASS: TestClientIdleTimeout (0.21s)
+--- PASS: TestClientIdleTimeout (0.20s)
 === RUN   TestAbsoluteFormMutations
 --- PASS: TestAbsoluteFormMutations (0.00s)
 === RUN   TestHopHeaderStripAndHEAD
@@ -2536,7 +1100,7 @@ command: GOST_REQUIRED=1 go test -tags docfixture -race -count=20 -v ./internal/
 === RUN   TestApproachAGostRewritesHeaders
 --- PASS: TestApproachAGostRewritesHeaders (0.00s)
 === RUN   TestClientHelloBytesJA3JA4
-    httpflow_test.go:1732: ja3=8520497e701d328ca849031134f31582 ja4=t13d0206h2_84cdcbea686c_fb71836bce29
+    httpflow_test.go:1739: ja3=8520497e701d328ca849031134f31582 ja4=t13d0206h2_84cdcbea686c_fb71836bce29
 --- PASS: TestClientHelloBytesJA3JA4 (0.04s)
 === RUN   TestHTTPL2WriteAndDeadline
 === RUN   TestHTTPL2WriteAndDeadline/write-error
@@ -2557,7 +1121,7 @@ command: GOST_REQUIRED=1 go test -tags docfixture -race -count=20 -v ./internal/
 === RUN   TestStaleKeepAliveRetry
 --- PASS: TestStaleKeepAliveRetry (5.01s)
 === RUN   TestStaleNonIdempotentPOST
---- PASS: TestStaleNonIdempotentPOST (0.01s)
+--- PASS: TestStaleNonIdempotentPOST (0.00s)
 === RUN   TestBodyAbortAfterStatus
 --- PASS: TestBodyAbortAfterStatus (0.00s)
 === RUN   TestIncompleteHeadRejectAttribution
@@ -2571,7 +1135,7 @@ command: GOST_REQUIRED=1 go test -tags docfixture -race -count=20 -v ./internal/
 === RUN   TestDocFencesMatchSources
 --- PASS: TestDocFencesMatchSources (0.00s)
 === RUN   TestHistogramInfAndClosedSetup
---- PASS: TestHistogramInfAndClosedSetup (0.02s)
+--- PASS: TestHistogramInfAndClosedSetup (0.01s)
 === RUN   TestPartialHeaderWriteDoesNotRetry
 --- PASS: TestPartialHeaderWriteDoesNotRetry (0.00s)
 === RUN   TestReusedReadTimeoutDoesNotRetry
@@ -2583,7 +1147,7 @@ command: GOST_REQUIRED=1 go test -tags docfixture -race -count=20 -v ./internal/
 --- PASS: TestPutRetryIsOptIn (0.01s)
     --- PASS: TestPutRetryIsOptIn/default (0.00s)
     --- PASS: TestPutRetryIsOptIn/enabled (0.00s)
-    --- PASS: TestPutRetryIsOptIn/config-file (0.01s)
+    --- PASS: TestPutRetryIsOptIn/config-file (0.00s)
 === RUN   TestReadSideReset
 === RUN   TestReadSideReset/get
 === RUN   TestReadSideReset/put
@@ -2591,9 +1155,9 @@ command: GOST_REQUIRED=1 go test -tags docfixture -race -count=20 -v ./internal/
     --- PASS: TestReadSideReset/get (0.00s)
     --- PASS: TestReadSideReset/put (0.00s)
 === RUN   TestBodyIdleIsIdleTimeout
---- PASS: TestBodyIdleIsIdleTimeout (0.09s)
+--- PASS: TestBodyIdleIsIdleTimeout (0.08s)
 === RUN   TestHalfCloseIdleIsNotAbort
---- PASS: TestHalfCloseIdleIsNotAbort (0.09s)
+--- PASS: TestHalfCloseIdleIsNotAbort (0.08s)
 === RUN   TestUpgradeRSTReason
 --- PASS: TestUpgradeRSTReason (0.00s)
 === RUN   TestPartialHeaderTimeout
@@ -2607,15 +1171,21 @@ command: GOST_REQUIRED=1 go test -tags docfixture -race -count=20 -v ./internal/
 === RUN   TestResolveReasonLabelsConnect/empty
 === RUN   TestResolveReasonLabelsConnect/resolver
 === RUN   TestResolveReasonLabelsConnect/no-healthy
---- PASS: TestResolveReasonLabelsConnect (0.02s)
+--- PASS: TestResolveReasonLabelsConnect (0.01s)
     --- PASS: TestResolveReasonLabelsConnect/unknown (0.00s)
     --- PASS: TestResolveReasonLabelsConnect/empty (0.00s)
     --- PASS: TestResolveReasonLabelsConnect/resolver (0.00s)
     --- PASS: TestResolveReasonLabelsConnect/no-healthy (0.00s)
 === RUN   TestConnectIdleTimeout
---- PASS: TestConnectIdleTimeout (0.16s)
+--- PASS: TestConnectIdleTimeout (0.15s)
 === RUN   TestSlowlorisHeaderDeadline
 --- PASS: TestSlowlorisHeaderDeadline (0.20s)
+=== RUN   TestKeepAliveIdleSurvivesHeaderDeadline
+--- PASS: TestKeepAliveIdleSurvivesHeaderDeadline (0.46s)
+=== RUN   TestKeepAliveTrickleHeader
+--- PASS: TestKeepAliveTrickleHeader (0.20s)
+=== RUN   TestConnectHalfClosePreemptsTunnelIdle
+--- PASS: TestConnectHalfClosePreemptsTunnelIdle (0.71s)
 === RUN   TestLimitsFromConfigBounds
 --- PASS: TestLimitsFromConfigBounds (0.00s)
 === RUN   TestHeaderOrderAndCaseThroughGost
@@ -2623,7 +1193,7 @@ command: GOST_REQUIRED=1 go test -tags docfixture -race -count=20 -v ./internal/
 === RUN   TestChunkedAndContentLength
 --- PASS: TestChunkedAndContentLength (0.00s)
 === RUN   TestExpect100Continue
---- PASS: TestExpect100Continue (10.21s)
+--- PASS: TestExpect100Continue (0.20s)
 === RUN   TestExpect100RejectedDoesNotForwardBody
 --- PASS: TestExpect100RejectedDoesNotForwardBody (0.21s)
 === RUN   TestWebSocketUpgrade
@@ -2671,7 +1241,1135 @@ command: GOST_REQUIRED=1 go test -tags docfixture -race -count=20 -v ./internal/
 === RUN   TestApproachAGostRewritesHeaders
 --- PASS: TestApproachAGostRewritesHeaders (0.00s)
 === RUN   TestClientHelloBytesJA3JA4
-    httpflow_test.go:1732: ja3=8520497e701d328ca849031134f31582 ja4=t13d0206h2_84cdcbea686c_fb71836bce29
+    httpflow_test.go:1739: ja3=8520497e701d328ca849031134f31582 ja4=t13d0206h2_84cdcbea686c_fb71836bce29
+--- PASS: TestClientHelloBytesJA3JA4 (0.04s)
+=== RUN   TestHTTPL2WriteAndDeadline
+=== RUN   TestHTTPL2WriteAndDeadline/write-error
+=== RUN   TestHTTPL2WriteAndDeadline/short-write
+=== RUN   TestHTTPL2WriteAndDeadline/deadline
+--- PASS: TestHTTPL2WriteAndDeadline (0.01s)
+    --- PASS: TestHTTPL2WriteAndDeadline/write-error (0.00s)
+    --- PASS: TestHTTPL2WriteAndDeadline/short-write (0.00s)
+    --- PASS: TestHTTPL2WriteAndDeadline/deadline (0.00s)
+=== RUN   TestHTTPClientGone
+--- PASS: TestHTTPClientGone (0.00s)
+=== RUN   TestHTTPResponseAfter100IsL2Response
+--- PASS: TestHTTPResponseAfter100IsL2Response (0.00s)
+=== RUN   TestClosedHTTPLabels
+--- PASS: TestClosedHTTPLabels (0.00s)
+=== RUN   TestKeepAliveSameHostGauge
+--- PASS: TestKeepAliveSameHostGauge (0.01s)
+=== RUN   TestStaleKeepAliveRetry
+--- PASS: TestStaleKeepAliveRetry (5.01s)
+=== RUN   TestStaleNonIdempotentPOST
+--- PASS: TestStaleNonIdempotentPOST (0.00s)
+=== RUN   TestBodyAbortAfterStatus
+--- PASS: TestBodyAbortAfterStatus (0.00s)
+=== RUN   TestIncompleteHeadRejectAttribution
+=== RUN   TestIncompleteHeadRejectAttribution/partial-connect
+=== RUN   TestIncompleteHeadRejectAttribution/partial-get
+=== RUN   TestIncompleteHeadRejectAttribution/empty
+--- PASS: TestIncompleteHeadRejectAttribution (0.01s)
+    --- PASS: TestIncompleteHeadRejectAttribution/partial-connect (0.00s)
+    --- PASS: TestIncompleteHeadRejectAttribution/partial-get (0.00s)
+    --- PASS: TestIncompleteHeadRejectAttribution/empty (0.00s)
+=== RUN   TestDocFencesMatchSources
+--- PASS: TestDocFencesMatchSources (0.00s)
+=== RUN   TestHistogramInfAndClosedSetup
+--- PASS: TestHistogramInfAndClosedSetup (0.01s)
+=== RUN   TestPartialHeaderWriteDoesNotRetry
+--- PASS: TestPartialHeaderWriteDoesNotRetry (0.00s)
+=== RUN   TestReusedReadTimeoutDoesNotRetry
+--- PASS: TestReusedReadTimeoutDoesNotRetry (0.00s)
+=== RUN   TestPutRetryIsOptIn
+=== RUN   TestPutRetryIsOptIn/default
+=== RUN   TestPutRetryIsOptIn/enabled
+=== RUN   TestPutRetryIsOptIn/config-file
+--- PASS: TestPutRetryIsOptIn (0.01s)
+    --- PASS: TestPutRetryIsOptIn/default (0.00s)
+    --- PASS: TestPutRetryIsOptIn/enabled (0.00s)
+    --- PASS: TestPutRetryIsOptIn/config-file (0.00s)
+=== RUN   TestReadSideReset
+=== RUN   TestReadSideReset/get
+=== RUN   TestReadSideReset/put
+--- PASS: TestReadSideReset (0.01s)
+    --- PASS: TestReadSideReset/get (0.00s)
+    --- PASS: TestReadSideReset/put (0.00s)
+=== RUN   TestBodyIdleIsIdleTimeout
+--- PASS: TestBodyIdleIsIdleTimeout (0.08s)
+=== RUN   TestHalfCloseIdleIsNotAbort
+--- PASS: TestHalfCloseIdleIsNotAbort (0.08s)
+=== RUN   TestUpgradeRSTReason
+--- PASS: TestUpgradeRSTReason (0.00s)
+=== RUN   TestPartialHeaderTimeout
+--- PASS: TestPartialHeaderTimeout (0.25s)
+=== RUN   TestCachedGostRejectsBadHash
+=== RUN   TestCachedGostRejectsBadHash/version
+--- PASS: TestCachedGostRejectsBadHash (0.00s)
+    --- PASS: TestCachedGostRejectsBadHash/version (0.00s)
+=== RUN   TestResolveReasonLabelsConnect
+=== RUN   TestResolveReasonLabelsConnect/unknown
+=== RUN   TestResolveReasonLabelsConnect/empty
+=== RUN   TestResolveReasonLabelsConnect/resolver
+=== RUN   TestResolveReasonLabelsConnect/no-healthy
+--- PASS: TestResolveReasonLabelsConnect (0.01s)
+    --- PASS: TestResolveReasonLabelsConnect/unknown (0.00s)
+    --- PASS: TestResolveReasonLabelsConnect/empty (0.00s)
+    --- PASS: TestResolveReasonLabelsConnect/resolver (0.00s)
+    --- PASS: TestResolveReasonLabelsConnect/no-healthy (0.00s)
+=== RUN   TestConnectIdleTimeout
+--- PASS: TestConnectIdleTimeout (0.15s)
+=== RUN   TestSlowlorisHeaderDeadline
+--- PASS: TestSlowlorisHeaderDeadline (0.20s)
+=== RUN   TestKeepAliveIdleSurvivesHeaderDeadline
+--- PASS: TestKeepAliveIdleSurvivesHeaderDeadline (0.46s)
+=== RUN   TestKeepAliveTrickleHeader
+--- PASS: TestKeepAliveTrickleHeader (0.20s)
+=== RUN   TestConnectHalfClosePreemptsTunnelIdle
+--- PASS: TestConnectHalfClosePreemptsTunnelIdle (0.70s)
+=== RUN   TestLimitsFromConfigBounds
+--- PASS: TestLimitsFromConfigBounds (0.00s)
+=== RUN   TestHeaderOrderAndCaseThroughGost
+--- PASS: TestHeaderOrderAndCaseThroughGost (0.00s)
+=== RUN   TestChunkedAndContentLength
+--- PASS: TestChunkedAndContentLength (0.00s)
+=== RUN   TestExpect100Continue
+--- PASS: TestExpect100Continue (0.20s)
+=== RUN   TestExpect100RejectedDoesNotForwardBody
+--- PASS: TestExpect100RejectedDoesNotForwardBody (0.20s)
+=== RUN   TestWebSocketUpgrade
+--- PASS: TestWebSocketUpgrade (0.01s)
+=== RUN   TestKeepAliveDifferentHostsAndSameHostReuse
+--- PASS: TestKeepAliveDifferentHostsAndSameHostReuse (0.01s)
+=== RUN   TestLastAtNodeID
+--- PASS: TestLastAtNodeID (0.02s)
+=== RUN   TestLocalRejectsDoNotDial
+=== RUN   TestLocalRejectsDoNotDial/auth
+=== RUN   TestLocalRejectsDoNotDial/no-node
+=== RUN   TestLocalRejectsDoNotDial/origin-form
+=== RUN   TestLocalRejectsDoNotDial/https
+--- PASS: TestLocalRejectsDoNotDial (0.01s)
+    --- PASS: TestLocalRejectsDoNotDial/auth (0.00s)
+    --- PASS: TestLocalRejectsDoNotDial/no-node (0.00s)
+    --- PASS: TestLocalRejectsDoNotDial/origin-form (0.00s)
+    --- PASS: TestLocalRejectsDoNotDial/https (0.00s)
+=== RUN   TestBadCredentialDoesNotDial
+--- PASS: TestBadCredentialDoesNotDial (0.00s)
+=== RUN   TestL2Auth407
+--- PASS: TestL2Auth407 (0.00s)
+=== RUN   TestL2Status502
+--- PASS: TestL2Status502 (0.00s)
+=== RUN   TestDialAndResolve502
+=== RUN   TestDialAndResolve502/dial
+=== RUN   TestDialAndResolve502/unknown
+=== RUN   TestDialAndResolve502/no-healthy
+=== RUN   TestDialAndResolve502/empty
+=== RUN   TestDialAndResolve502/resolver
+--- PASS: TestDialAndResolve502 (0.02s)
+    --- PASS: TestDialAndResolve502/dial (0.00s)
+    --- PASS: TestDialAndResolve502/unknown (0.00s)
+    --- PASS: TestDialAndResolve502/no-healthy (0.00s)
+    --- PASS: TestDialAndResolve502/empty (0.00s)
+    --- PASS: TestDialAndResolve502/resolver (0.00s)
+=== RUN   TestL2ResponseTimeout
+--- PASS: TestL2ResponseTimeout (0.30s)
+=== RUN   TestClientIdleTimeout
+--- PASS: TestClientIdleTimeout (0.20s)
+=== RUN   TestAbsoluteFormMutations
+--- PASS: TestAbsoluteFormMutations (0.00s)
+=== RUN   TestHopHeaderStripAndHEAD
+--- PASS: TestHopHeaderStripAndHEAD (0.00s)
+=== RUN   TestApproachAGostRewritesHeaders
+--- PASS: TestApproachAGostRewritesHeaders (0.00s)
+=== RUN   TestClientHelloBytesJA3JA4
+    httpflow_test.go:1739: ja3=8520497e701d328ca849031134f31582 ja4=t13d0206h2_84cdcbea686c_fb71836bce29
+--- PASS: TestClientHelloBytesJA3JA4 (0.04s)
+=== RUN   TestHTTPL2WriteAndDeadline
+=== RUN   TestHTTPL2WriteAndDeadline/write-error
+=== RUN   TestHTTPL2WriteAndDeadline/short-write
+=== RUN   TestHTTPL2WriteAndDeadline/deadline
+--- PASS: TestHTTPL2WriteAndDeadline (0.01s)
+    --- PASS: TestHTTPL2WriteAndDeadline/write-error (0.00s)
+    --- PASS: TestHTTPL2WriteAndDeadline/short-write (0.00s)
+    --- PASS: TestHTTPL2WriteAndDeadline/deadline (0.00s)
+=== RUN   TestHTTPClientGone
+--- PASS: TestHTTPClientGone (0.00s)
+=== RUN   TestHTTPResponseAfter100IsL2Response
+--- PASS: TestHTTPResponseAfter100IsL2Response (0.00s)
+=== RUN   TestClosedHTTPLabels
+--- PASS: TestClosedHTTPLabels (0.00s)
+=== RUN   TestKeepAliveSameHostGauge
+--- PASS: TestKeepAliveSameHostGauge (0.01s)
+=== RUN   TestStaleKeepAliveRetry
+--- PASS: TestStaleKeepAliveRetry (5.01s)
+=== RUN   TestStaleNonIdempotentPOST
+--- PASS: TestStaleNonIdempotentPOST (0.00s)
+=== RUN   TestBodyAbortAfterStatus
+--- PASS: TestBodyAbortAfterStatus (0.00s)
+=== RUN   TestIncompleteHeadRejectAttribution
+=== RUN   TestIncompleteHeadRejectAttribution/partial-connect
+=== RUN   TestIncompleteHeadRejectAttribution/partial-get
+=== RUN   TestIncompleteHeadRejectAttribution/empty
+--- PASS: TestIncompleteHeadRejectAttribution (0.01s)
+    --- PASS: TestIncompleteHeadRejectAttribution/partial-connect (0.00s)
+    --- PASS: TestIncompleteHeadRejectAttribution/partial-get (0.00s)
+    --- PASS: TestIncompleteHeadRejectAttribution/empty (0.00s)
+=== RUN   TestDocFencesMatchSources
+--- PASS: TestDocFencesMatchSources (0.00s)
+=== RUN   TestHistogramInfAndClosedSetup
+--- PASS: TestHistogramInfAndClosedSetup (0.01s)
+=== RUN   TestPartialHeaderWriteDoesNotRetry
+--- PASS: TestPartialHeaderWriteDoesNotRetry (0.00s)
+=== RUN   TestReusedReadTimeoutDoesNotRetry
+--- PASS: TestReusedReadTimeoutDoesNotRetry (0.00s)
+=== RUN   TestPutRetryIsOptIn
+=== RUN   TestPutRetryIsOptIn/default
+=== RUN   TestPutRetryIsOptIn/enabled
+=== RUN   TestPutRetryIsOptIn/config-file
+--- PASS: TestPutRetryIsOptIn (0.01s)
+    --- PASS: TestPutRetryIsOptIn/default (0.00s)
+    --- PASS: TestPutRetryIsOptIn/enabled (0.00s)
+    --- PASS: TestPutRetryIsOptIn/config-file (0.00s)
+=== RUN   TestReadSideReset
+=== RUN   TestReadSideReset/get
+=== RUN   TestReadSideReset/put
+--- PASS: TestReadSideReset (0.01s)
+    --- PASS: TestReadSideReset/get (0.00s)
+    --- PASS: TestReadSideReset/put (0.00s)
+=== RUN   TestBodyIdleIsIdleTimeout
+--- PASS: TestBodyIdleIsIdleTimeout (0.08s)
+=== RUN   TestHalfCloseIdleIsNotAbort
+--- PASS: TestHalfCloseIdleIsNotAbort (0.08s)
+=== RUN   TestUpgradeRSTReason
+--- PASS: TestUpgradeRSTReason (0.00s)
+=== RUN   TestPartialHeaderTimeout
+--- PASS: TestPartialHeaderTimeout (0.25s)
+=== RUN   TestCachedGostRejectsBadHash
+=== RUN   TestCachedGostRejectsBadHash/version
+--- PASS: TestCachedGostRejectsBadHash (0.00s)
+    --- PASS: TestCachedGostRejectsBadHash/version (0.00s)
+=== RUN   TestResolveReasonLabelsConnect
+=== RUN   TestResolveReasonLabelsConnect/unknown
+=== RUN   TestResolveReasonLabelsConnect/empty
+=== RUN   TestResolveReasonLabelsConnect/resolver
+=== RUN   TestResolveReasonLabelsConnect/no-healthy
+--- PASS: TestResolveReasonLabelsConnect (0.01s)
+    --- PASS: TestResolveReasonLabelsConnect/unknown (0.00s)
+    --- PASS: TestResolveReasonLabelsConnect/empty (0.00s)
+    --- PASS: TestResolveReasonLabelsConnect/resolver (0.00s)
+    --- PASS: TestResolveReasonLabelsConnect/no-healthy (0.00s)
+=== RUN   TestConnectIdleTimeout
+--- PASS: TestConnectIdleTimeout (0.15s)
+=== RUN   TestSlowlorisHeaderDeadline
+--- PASS: TestSlowlorisHeaderDeadline (0.20s)
+=== RUN   TestKeepAliveIdleSurvivesHeaderDeadline
+--- PASS: TestKeepAliveIdleSurvivesHeaderDeadline (0.46s)
+=== RUN   TestKeepAliveTrickleHeader
+--- PASS: TestKeepAliveTrickleHeader (0.21s)
+=== RUN   TestConnectHalfClosePreemptsTunnelIdle
+--- PASS: TestConnectHalfClosePreemptsTunnelIdle (0.71s)
+=== RUN   TestLimitsFromConfigBounds
+--- PASS: TestLimitsFromConfigBounds (0.00s)
+=== RUN   TestHeaderOrderAndCaseThroughGost
+--- PASS: TestHeaderOrderAndCaseThroughGost (0.00s)
+=== RUN   TestChunkedAndContentLength
+--- PASS: TestChunkedAndContentLength (0.00s)
+=== RUN   TestExpect100Continue
+--- PASS: TestExpect100Continue (0.21s)
+=== RUN   TestExpect100RejectedDoesNotForwardBody
+--- PASS: TestExpect100RejectedDoesNotForwardBody (0.20s)
+=== RUN   TestWebSocketUpgrade
+--- PASS: TestWebSocketUpgrade (0.01s)
+=== RUN   TestKeepAliveDifferentHostsAndSameHostReuse
+--- PASS: TestKeepAliveDifferentHostsAndSameHostReuse (0.01s)
+=== RUN   TestLastAtNodeID
+--- PASS: TestLastAtNodeID (0.02s)
+=== RUN   TestLocalRejectsDoNotDial
+=== RUN   TestLocalRejectsDoNotDial/auth
+=== RUN   TestLocalRejectsDoNotDial/no-node
+=== RUN   TestLocalRejectsDoNotDial/origin-form
+=== RUN   TestLocalRejectsDoNotDial/https
+--- PASS: TestLocalRejectsDoNotDial (0.01s)
+    --- PASS: TestLocalRejectsDoNotDial/auth (0.00s)
+    --- PASS: TestLocalRejectsDoNotDial/no-node (0.00s)
+    --- PASS: TestLocalRejectsDoNotDial/origin-form (0.00s)
+    --- PASS: TestLocalRejectsDoNotDial/https (0.00s)
+=== RUN   TestBadCredentialDoesNotDial
+--- PASS: TestBadCredentialDoesNotDial (0.00s)
+=== RUN   TestL2Auth407
+--- PASS: TestL2Auth407 (0.00s)
+=== RUN   TestL2Status502
+--- PASS: TestL2Status502 (0.00s)
+=== RUN   TestDialAndResolve502
+=== RUN   TestDialAndResolve502/dial
+=== RUN   TestDialAndResolve502/unknown
+=== RUN   TestDialAndResolve502/no-healthy
+=== RUN   TestDialAndResolve502/empty
+=== RUN   TestDialAndResolve502/resolver
+--- PASS: TestDialAndResolve502 (0.02s)
+    --- PASS: TestDialAndResolve502/dial (0.00s)
+    --- PASS: TestDialAndResolve502/unknown (0.00s)
+    --- PASS: TestDialAndResolve502/no-healthy (0.00s)
+    --- PASS: TestDialAndResolve502/empty (0.00s)
+    --- PASS: TestDialAndResolve502/resolver (0.00s)
+=== RUN   TestL2ResponseTimeout
+--- PASS: TestL2ResponseTimeout (0.30s)
+=== RUN   TestClientIdleTimeout
+--- PASS: TestClientIdleTimeout (0.20s)
+=== RUN   TestAbsoluteFormMutations
+--- PASS: TestAbsoluteFormMutations (0.00s)
+=== RUN   TestHopHeaderStripAndHEAD
+--- PASS: TestHopHeaderStripAndHEAD (0.00s)
+=== RUN   TestApproachAGostRewritesHeaders
+--- PASS: TestApproachAGostRewritesHeaders (0.00s)
+=== RUN   TestClientHelloBytesJA3JA4
+    httpflow_test.go:1739: ja3=8520497e701d328ca849031134f31582 ja4=t13d0206h2_84cdcbea686c_fb71836bce29
+--- PASS: TestClientHelloBytesJA3JA4 (0.04s)
+=== RUN   TestHTTPL2WriteAndDeadline
+=== RUN   TestHTTPL2WriteAndDeadline/write-error
+=== RUN   TestHTTPL2WriteAndDeadline/short-write
+=== RUN   TestHTTPL2WriteAndDeadline/deadline
+--- PASS: TestHTTPL2WriteAndDeadline (0.01s)
+    --- PASS: TestHTTPL2WriteAndDeadline/write-error (0.00s)
+    --- PASS: TestHTTPL2WriteAndDeadline/short-write (0.00s)
+    --- PASS: TestHTTPL2WriteAndDeadline/deadline (0.00s)
+=== RUN   TestHTTPClientGone
+--- PASS: TestHTTPClientGone (0.01s)
+=== RUN   TestHTTPResponseAfter100IsL2Response
+--- PASS: TestHTTPResponseAfter100IsL2Response (0.00s)
+=== RUN   TestClosedHTTPLabels
+--- PASS: TestClosedHTTPLabels (0.00s)
+=== RUN   TestKeepAliveSameHostGauge
+--- PASS: TestKeepAliveSameHostGauge (0.01s)
+=== RUN   TestStaleKeepAliveRetry
+--- PASS: TestStaleKeepAliveRetry (5.01s)
+=== RUN   TestStaleNonIdempotentPOST
+--- PASS: TestStaleNonIdempotentPOST (0.00s)
+=== RUN   TestBodyAbortAfterStatus
+--- PASS: TestBodyAbortAfterStatus (0.00s)
+=== RUN   TestIncompleteHeadRejectAttribution
+=== RUN   TestIncompleteHeadRejectAttribution/partial-connect
+=== RUN   TestIncompleteHeadRejectAttribution/partial-get
+=== RUN   TestIncompleteHeadRejectAttribution/empty
+--- PASS: TestIncompleteHeadRejectAttribution (0.01s)
+    --- PASS: TestIncompleteHeadRejectAttribution/partial-connect (0.00s)
+    --- PASS: TestIncompleteHeadRejectAttribution/partial-get (0.00s)
+    --- PASS: TestIncompleteHeadRejectAttribution/empty (0.00s)
+=== RUN   TestDocFencesMatchSources
+--- PASS: TestDocFencesMatchSources (0.00s)
+=== RUN   TestHistogramInfAndClosedSetup
+--- PASS: TestHistogramInfAndClosedSetup (0.01s)
+=== RUN   TestPartialHeaderWriteDoesNotRetry
+--- PASS: TestPartialHeaderWriteDoesNotRetry (0.00s)
+=== RUN   TestReusedReadTimeoutDoesNotRetry
+--- PASS: TestReusedReadTimeoutDoesNotRetry (0.00s)
+=== RUN   TestPutRetryIsOptIn
+=== RUN   TestPutRetryIsOptIn/default
+=== RUN   TestPutRetryIsOptIn/enabled
+=== RUN   TestPutRetryIsOptIn/config-file
+--- PASS: TestPutRetryIsOptIn (0.01s)
+    --- PASS: TestPutRetryIsOptIn/default (0.00s)
+    --- PASS: TestPutRetryIsOptIn/enabled (0.00s)
+    --- PASS: TestPutRetryIsOptIn/config-file (0.00s)
+=== RUN   TestReadSideReset
+=== RUN   TestReadSideReset/get
+=== RUN   TestReadSideReset/put
+--- PASS: TestReadSideReset (0.01s)
+    --- PASS: TestReadSideReset/get (0.00s)
+    --- PASS: TestReadSideReset/put (0.00s)
+=== RUN   TestBodyIdleIsIdleTimeout
+--- PASS: TestBodyIdleIsIdleTimeout (0.08s)
+=== RUN   TestHalfCloseIdleIsNotAbort
+--- PASS: TestHalfCloseIdleIsNotAbort (0.08s)
+=== RUN   TestUpgradeRSTReason
+--- PASS: TestUpgradeRSTReason (0.00s)
+=== RUN   TestPartialHeaderTimeout
+--- PASS: TestPartialHeaderTimeout (0.25s)
+=== RUN   TestCachedGostRejectsBadHash
+=== RUN   TestCachedGostRejectsBadHash/version
+--- PASS: TestCachedGostRejectsBadHash (0.00s)
+    --- PASS: TestCachedGostRejectsBadHash/version (0.00s)
+=== RUN   TestResolveReasonLabelsConnect
+=== RUN   TestResolveReasonLabelsConnect/unknown
+=== RUN   TestResolveReasonLabelsConnect/empty
+=== RUN   TestResolveReasonLabelsConnect/resolver
+=== RUN   TestResolveReasonLabelsConnect/no-healthy
+--- PASS: TestResolveReasonLabelsConnect (0.01s)
+    --- PASS: TestResolveReasonLabelsConnect/unknown (0.00s)
+    --- PASS: TestResolveReasonLabelsConnect/empty (0.00s)
+    --- PASS: TestResolveReasonLabelsConnect/resolver (0.00s)
+    --- PASS: TestResolveReasonLabelsConnect/no-healthy (0.00s)
+=== RUN   TestConnectIdleTimeout
+--- PASS: TestConnectIdleTimeout (0.15s)
+=== RUN   TestSlowlorisHeaderDeadline
+--- PASS: TestSlowlorisHeaderDeadline (0.20s)
+=== RUN   TestKeepAliveIdleSurvivesHeaderDeadline
+--- PASS: TestKeepAliveIdleSurvivesHeaderDeadline (0.45s)
+=== RUN   TestKeepAliveTrickleHeader
+--- PASS: TestKeepAliveTrickleHeader (0.21s)
+=== RUN   TestConnectHalfClosePreemptsTunnelIdle
+--- PASS: TestConnectHalfClosePreemptsTunnelIdle (0.71s)
+=== RUN   TestLimitsFromConfigBounds
+--- PASS: TestLimitsFromConfigBounds (0.00s)
+=== RUN   TestHeaderOrderAndCaseThroughGost
+--- PASS: TestHeaderOrderAndCaseThroughGost (0.00s)
+=== RUN   TestChunkedAndContentLength
+--- PASS: TestChunkedAndContentLength (0.00s)
+=== RUN   TestExpect100Continue
+--- PASS: TestExpect100Continue (0.21s)
+=== RUN   TestExpect100RejectedDoesNotForwardBody
+--- PASS: TestExpect100RejectedDoesNotForwardBody (0.20s)
+=== RUN   TestWebSocketUpgrade
+--- PASS: TestWebSocketUpgrade (0.01s)
+=== RUN   TestKeepAliveDifferentHostsAndSameHostReuse
+--- PASS: TestKeepAliveDifferentHostsAndSameHostReuse (0.01s)
+=== RUN   TestLastAtNodeID
+--- PASS: TestLastAtNodeID (0.02s)
+=== RUN   TestLocalRejectsDoNotDial
+=== RUN   TestLocalRejectsDoNotDial/auth
+=== RUN   TestLocalRejectsDoNotDial/no-node
+=== RUN   TestLocalRejectsDoNotDial/origin-form
+=== RUN   TestLocalRejectsDoNotDial/https
+--- PASS: TestLocalRejectsDoNotDial (0.01s)
+    --- PASS: TestLocalRejectsDoNotDial/auth (0.00s)
+    --- PASS: TestLocalRejectsDoNotDial/no-node (0.00s)
+    --- PASS: TestLocalRejectsDoNotDial/origin-form (0.00s)
+    --- PASS: TestLocalRejectsDoNotDial/https (0.00s)
+=== RUN   TestBadCredentialDoesNotDial
+--- PASS: TestBadCredentialDoesNotDial (0.00s)
+=== RUN   TestL2Auth407
+--- PASS: TestL2Auth407 (0.00s)
+=== RUN   TestL2Status502
+--- PASS: TestL2Status502 (0.00s)
+=== RUN   TestDialAndResolve502
+=== RUN   TestDialAndResolve502/dial
+=== RUN   TestDialAndResolve502/unknown
+=== RUN   TestDialAndResolve502/no-healthy
+=== RUN   TestDialAndResolve502/empty
+=== RUN   TestDialAndResolve502/resolver
+--- PASS: TestDialAndResolve502 (0.02s)
+    --- PASS: TestDialAndResolve502/dial (0.00s)
+    --- PASS: TestDialAndResolve502/unknown (0.00s)
+    --- PASS: TestDialAndResolve502/no-healthy (0.00s)
+    --- PASS: TestDialAndResolve502/empty (0.00s)
+    --- PASS: TestDialAndResolve502/resolver (0.00s)
+=== RUN   TestL2ResponseTimeout
+--- PASS: TestL2ResponseTimeout (0.30s)
+=== RUN   TestClientIdleTimeout
+--- PASS: TestClientIdleTimeout (0.20s)
+=== RUN   TestAbsoluteFormMutations
+--- PASS: TestAbsoluteFormMutations (0.00s)
+=== RUN   TestHopHeaderStripAndHEAD
+--- PASS: TestHopHeaderStripAndHEAD (0.00s)
+=== RUN   TestApproachAGostRewritesHeaders
+--- PASS: TestApproachAGostRewritesHeaders (0.00s)
+=== RUN   TestClientHelloBytesJA3JA4
+    httpflow_test.go:1739: ja3=8520497e701d328ca849031134f31582 ja4=t13d0206h2_84cdcbea686c_fb71836bce29
+--- PASS: TestClientHelloBytesJA3JA4 (0.04s)
+=== RUN   TestHTTPL2WriteAndDeadline
+=== RUN   TestHTTPL2WriteAndDeadline/write-error
+=== RUN   TestHTTPL2WriteAndDeadline/short-write
+=== RUN   TestHTTPL2WriteAndDeadline/deadline
+--- PASS: TestHTTPL2WriteAndDeadline (0.01s)
+    --- PASS: TestHTTPL2WriteAndDeadline/write-error (0.00s)
+    --- PASS: TestHTTPL2WriteAndDeadline/short-write (0.00s)
+    --- PASS: TestHTTPL2WriteAndDeadline/deadline (0.00s)
+=== RUN   TestHTTPClientGone
+--- PASS: TestHTTPClientGone (0.00s)
+=== RUN   TestHTTPResponseAfter100IsL2Response
+--- PASS: TestHTTPResponseAfter100IsL2Response (0.00s)
+=== RUN   TestClosedHTTPLabels
+--- PASS: TestClosedHTTPLabels (0.00s)
+=== RUN   TestKeepAliveSameHostGauge
+--- PASS: TestKeepAliveSameHostGauge (0.01s)
+=== RUN   TestStaleKeepAliveRetry
+--- PASS: TestStaleKeepAliveRetry (5.01s)
+=== RUN   TestStaleNonIdempotentPOST
+--- PASS: TestStaleNonIdempotentPOST (0.00s)
+=== RUN   TestBodyAbortAfterStatus
+--- PASS: TestBodyAbortAfterStatus (0.00s)
+=== RUN   TestIncompleteHeadRejectAttribution
+=== RUN   TestIncompleteHeadRejectAttribution/partial-connect
+=== RUN   TestIncompleteHeadRejectAttribution/partial-get
+=== RUN   TestIncompleteHeadRejectAttribution/empty
+--- PASS: TestIncompleteHeadRejectAttribution (0.01s)
+    --- PASS: TestIncompleteHeadRejectAttribution/partial-connect (0.00s)
+    --- PASS: TestIncompleteHeadRejectAttribution/partial-get (0.00s)
+    --- PASS: TestIncompleteHeadRejectAttribution/empty (0.00s)
+=== RUN   TestDocFencesMatchSources
+--- PASS: TestDocFencesMatchSources (0.00s)
+=== RUN   TestHistogramInfAndClosedSetup
+--- PASS: TestHistogramInfAndClosedSetup (0.01s)
+=== RUN   TestPartialHeaderWriteDoesNotRetry
+--- PASS: TestPartialHeaderWriteDoesNotRetry (0.00s)
+=== RUN   TestReusedReadTimeoutDoesNotRetry
+--- PASS: TestReusedReadTimeoutDoesNotRetry (0.00s)
+=== RUN   TestPutRetryIsOptIn
+=== RUN   TestPutRetryIsOptIn/default
+=== RUN   TestPutRetryIsOptIn/enabled
+=== RUN   TestPutRetryIsOptIn/config-file
+--- PASS: TestPutRetryIsOptIn (0.01s)
+    --- PASS: TestPutRetryIsOptIn/default (0.00s)
+    --- PASS: TestPutRetryIsOptIn/enabled (0.00s)
+    --- PASS: TestPutRetryIsOptIn/config-file (0.00s)
+=== RUN   TestReadSideReset
+=== RUN   TestReadSideReset/get
+=== RUN   TestReadSideReset/put
+--- PASS: TestReadSideReset (0.01s)
+    --- PASS: TestReadSideReset/get (0.00s)
+    --- PASS: TestReadSideReset/put (0.00s)
+=== RUN   TestBodyIdleIsIdleTimeout
+--- PASS: TestBodyIdleIsIdleTimeout (0.08s)
+=== RUN   TestHalfCloseIdleIsNotAbort
+--- PASS: TestHalfCloseIdleIsNotAbort (0.08s)
+=== RUN   TestUpgradeRSTReason
+--- PASS: TestUpgradeRSTReason (0.00s)
+=== RUN   TestPartialHeaderTimeout
+--- PASS: TestPartialHeaderTimeout (0.25s)
+=== RUN   TestCachedGostRejectsBadHash
+=== RUN   TestCachedGostRejectsBadHash/version
+--- PASS: TestCachedGostRejectsBadHash (0.00s)
+    --- PASS: TestCachedGostRejectsBadHash/version (0.00s)
+=== RUN   TestResolveReasonLabelsConnect
+=== RUN   TestResolveReasonLabelsConnect/unknown
+=== RUN   TestResolveReasonLabelsConnect/empty
+=== RUN   TestResolveReasonLabelsConnect/resolver
+=== RUN   TestResolveReasonLabelsConnect/no-healthy
+--- PASS: TestResolveReasonLabelsConnect (0.01s)
+    --- PASS: TestResolveReasonLabelsConnect/unknown (0.00s)
+    --- PASS: TestResolveReasonLabelsConnect/empty (0.00s)
+    --- PASS: TestResolveReasonLabelsConnect/resolver (0.00s)
+    --- PASS: TestResolveReasonLabelsConnect/no-healthy (0.00s)
+=== RUN   TestConnectIdleTimeout
+--- PASS: TestConnectIdleTimeout (0.15s)
+=== RUN   TestSlowlorisHeaderDeadline
+--- PASS: TestSlowlorisHeaderDeadline (0.21s)
+=== RUN   TestKeepAliveIdleSurvivesHeaderDeadline
+--- PASS: TestKeepAliveIdleSurvivesHeaderDeadline (0.45s)
+=== RUN   TestKeepAliveTrickleHeader
+--- PASS: TestKeepAliveTrickleHeader (0.20s)
+=== RUN   TestConnectHalfClosePreemptsTunnelIdle
+--- PASS: TestConnectHalfClosePreemptsTunnelIdle (0.71s)
+=== RUN   TestLimitsFromConfigBounds
+--- PASS: TestLimitsFromConfigBounds (0.00s)
+=== RUN   TestHeaderOrderAndCaseThroughGost
+--- PASS: TestHeaderOrderAndCaseThroughGost (0.00s)
+=== RUN   TestChunkedAndContentLength
+--- PASS: TestChunkedAndContentLength (0.00s)
+=== RUN   TestExpect100Continue
+--- PASS: TestExpect100Continue (0.20s)
+=== RUN   TestExpect100RejectedDoesNotForwardBody
+--- PASS: TestExpect100RejectedDoesNotForwardBody (0.20s)
+=== RUN   TestWebSocketUpgrade
+--- PASS: TestWebSocketUpgrade (0.01s)
+=== RUN   TestKeepAliveDifferentHostsAndSameHostReuse
+--- PASS: TestKeepAliveDifferentHostsAndSameHostReuse (0.01s)
+=== RUN   TestLastAtNodeID
+--- PASS: TestLastAtNodeID (0.02s)
+=== RUN   TestLocalRejectsDoNotDial
+=== RUN   TestLocalRejectsDoNotDial/auth
+=== RUN   TestLocalRejectsDoNotDial/no-node
+=== RUN   TestLocalRejectsDoNotDial/origin-form
+=== RUN   TestLocalRejectsDoNotDial/https
+--- PASS: TestLocalRejectsDoNotDial (0.01s)
+    --- PASS: TestLocalRejectsDoNotDial/auth (0.00s)
+    --- PASS: TestLocalRejectsDoNotDial/no-node (0.00s)
+    --- PASS: TestLocalRejectsDoNotDial/origin-form (0.00s)
+    --- PASS: TestLocalRejectsDoNotDial/https (0.00s)
+=== RUN   TestBadCredentialDoesNotDial
+--- PASS: TestBadCredentialDoesNotDial (0.00s)
+=== RUN   TestL2Auth407
+--- PASS: TestL2Auth407 (0.00s)
+=== RUN   TestL2Status502
+--- PASS: TestL2Status502 (0.00s)
+=== RUN   TestDialAndResolve502
+=== RUN   TestDialAndResolve502/dial
+=== RUN   TestDialAndResolve502/unknown
+=== RUN   TestDialAndResolve502/no-healthy
+=== RUN   TestDialAndResolve502/empty
+=== RUN   TestDialAndResolve502/resolver
+--- PASS: TestDialAndResolve502 (0.02s)
+    --- PASS: TestDialAndResolve502/dial (0.00s)
+    --- PASS: TestDialAndResolve502/unknown (0.00s)
+    --- PASS: TestDialAndResolve502/no-healthy (0.00s)
+    --- PASS: TestDialAndResolve502/empty (0.00s)
+    --- PASS: TestDialAndResolve502/resolver (0.00s)
+=== RUN   TestL2ResponseTimeout
+--- PASS: TestL2ResponseTimeout (0.30s)
+=== RUN   TestClientIdleTimeout
+--- PASS: TestClientIdleTimeout (0.20s)
+=== RUN   TestAbsoluteFormMutations
+--- PASS: TestAbsoluteFormMutations (0.00s)
+=== RUN   TestHopHeaderStripAndHEAD
+--- PASS: TestHopHeaderStripAndHEAD (0.00s)
+=== RUN   TestApproachAGostRewritesHeaders
+--- PASS: TestApproachAGostRewritesHeaders (0.00s)
+=== RUN   TestClientHelloBytesJA3JA4
+    httpflow_test.go:1739: ja3=8520497e701d328ca849031134f31582 ja4=t13d0206h2_84cdcbea686c_fb71836bce29
+--- PASS: TestClientHelloBytesJA3JA4 (0.04s)
+=== RUN   TestHTTPL2WriteAndDeadline
+=== RUN   TestHTTPL2WriteAndDeadline/write-error
+=== RUN   TestHTTPL2WriteAndDeadline/short-write
+=== RUN   TestHTTPL2WriteAndDeadline/deadline
+--- PASS: TestHTTPL2WriteAndDeadline (0.01s)
+    --- PASS: TestHTTPL2WriteAndDeadline/write-error (0.00s)
+    --- PASS: TestHTTPL2WriteAndDeadline/short-write (0.00s)
+    --- PASS: TestHTTPL2WriteAndDeadline/deadline (0.00s)
+=== RUN   TestHTTPClientGone
+--- PASS: TestHTTPClientGone (0.00s)
+=== RUN   TestHTTPResponseAfter100IsL2Response
+--- PASS: TestHTTPResponseAfter100IsL2Response (0.00s)
+=== RUN   TestClosedHTTPLabels
+--- PASS: TestClosedHTTPLabels (0.00s)
+=== RUN   TestKeepAliveSameHostGauge
+--- PASS: TestKeepAliveSameHostGauge (0.01s)
+=== RUN   TestStaleKeepAliveRetry
+--- PASS: TestStaleKeepAliveRetry (5.01s)
+=== RUN   TestStaleNonIdempotentPOST
+--- PASS: TestStaleNonIdempotentPOST (0.00s)
+=== RUN   TestBodyAbortAfterStatus
+--- PASS: TestBodyAbortAfterStatus (0.00s)
+=== RUN   TestIncompleteHeadRejectAttribution
+=== RUN   TestIncompleteHeadRejectAttribution/partial-connect
+=== RUN   TestIncompleteHeadRejectAttribution/partial-get
+=== RUN   TestIncompleteHeadRejectAttribution/empty
+--- PASS: TestIncompleteHeadRejectAttribution (0.01s)
+    --- PASS: TestIncompleteHeadRejectAttribution/partial-connect (0.00s)
+    --- PASS: TestIncompleteHeadRejectAttribution/partial-get (0.00s)
+    --- PASS: TestIncompleteHeadRejectAttribution/empty (0.00s)
+=== RUN   TestDocFencesMatchSources
+--- PASS: TestDocFencesMatchSources (0.00s)
+=== RUN   TestHistogramInfAndClosedSetup
+--- PASS: TestHistogramInfAndClosedSetup (0.01s)
+=== RUN   TestPartialHeaderWriteDoesNotRetry
+--- PASS: TestPartialHeaderWriteDoesNotRetry (0.00s)
+=== RUN   TestReusedReadTimeoutDoesNotRetry
+--- PASS: TestReusedReadTimeoutDoesNotRetry (0.00s)
+=== RUN   TestPutRetryIsOptIn
+=== RUN   TestPutRetryIsOptIn/default
+=== RUN   TestPutRetryIsOptIn/enabled
+=== RUN   TestPutRetryIsOptIn/config-file
+--- PASS: TestPutRetryIsOptIn (0.01s)
+    --- PASS: TestPutRetryIsOptIn/default (0.00s)
+    --- PASS: TestPutRetryIsOptIn/enabled (0.00s)
+    --- PASS: TestPutRetryIsOptIn/config-file (0.00s)
+=== RUN   TestReadSideReset
+=== RUN   TestReadSideReset/get
+=== RUN   TestReadSideReset/put
+--- PASS: TestReadSideReset (0.01s)
+    --- PASS: TestReadSideReset/get (0.00s)
+    --- PASS: TestReadSideReset/put (0.00s)
+=== RUN   TestBodyIdleIsIdleTimeout
+--- PASS: TestBodyIdleIsIdleTimeout (0.08s)
+=== RUN   TestHalfCloseIdleIsNotAbort
+--- PASS: TestHalfCloseIdleIsNotAbort (0.08s)
+=== RUN   TestUpgradeRSTReason
+--- PASS: TestUpgradeRSTReason (0.00s)
+=== RUN   TestPartialHeaderTimeout
+--- PASS: TestPartialHeaderTimeout (0.25s)
+=== RUN   TestCachedGostRejectsBadHash
+=== RUN   TestCachedGostRejectsBadHash/version
+--- PASS: TestCachedGostRejectsBadHash (0.00s)
+    --- PASS: TestCachedGostRejectsBadHash/version (0.00s)
+=== RUN   TestResolveReasonLabelsConnect
+=== RUN   TestResolveReasonLabelsConnect/unknown
+=== RUN   TestResolveReasonLabelsConnect/empty
+=== RUN   TestResolveReasonLabelsConnect/resolver
+=== RUN   TestResolveReasonLabelsConnect/no-healthy
+--- PASS: TestResolveReasonLabelsConnect (0.01s)
+    --- PASS: TestResolveReasonLabelsConnect/unknown (0.00s)
+    --- PASS: TestResolveReasonLabelsConnect/empty (0.00s)
+    --- PASS: TestResolveReasonLabelsConnect/resolver (0.00s)
+    --- PASS: TestResolveReasonLabelsConnect/no-healthy (0.00s)
+=== RUN   TestConnectIdleTimeout
+--- PASS: TestConnectIdleTimeout (0.15s)
+=== RUN   TestSlowlorisHeaderDeadline
+--- PASS: TestSlowlorisHeaderDeadline (0.20s)
+=== RUN   TestKeepAliveIdleSurvivesHeaderDeadline
+--- PASS: TestKeepAliveIdleSurvivesHeaderDeadline (0.46s)
+=== RUN   TestKeepAliveTrickleHeader
+--- PASS: TestKeepAliveTrickleHeader (0.20s)
+=== RUN   TestConnectHalfClosePreemptsTunnelIdle
+--- PASS: TestConnectHalfClosePreemptsTunnelIdle (0.70s)
+=== RUN   TestLimitsFromConfigBounds
+--- PASS: TestLimitsFromConfigBounds (0.00s)
+=== RUN   TestHeaderOrderAndCaseThroughGost
+--- PASS: TestHeaderOrderAndCaseThroughGost (0.00s)
+=== RUN   TestChunkedAndContentLength
+--- PASS: TestChunkedAndContentLength (0.00s)
+=== RUN   TestExpect100Continue
+--- PASS: TestExpect100Continue (0.21s)
+=== RUN   TestExpect100RejectedDoesNotForwardBody
+--- PASS: TestExpect100RejectedDoesNotForwardBody (0.21s)
+=== RUN   TestWebSocketUpgrade
+--- PASS: TestWebSocketUpgrade (0.01s)
+=== RUN   TestKeepAliveDifferentHostsAndSameHostReuse
+--- PASS: TestKeepAliveDifferentHostsAndSameHostReuse (0.01s)
+=== RUN   TestLastAtNodeID
+--- PASS: TestLastAtNodeID (0.02s)
+=== RUN   TestLocalRejectsDoNotDial
+=== RUN   TestLocalRejectsDoNotDial/auth
+=== RUN   TestLocalRejectsDoNotDial/no-node
+=== RUN   TestLocalRejectsDoNotDial/origin-form
+=== RUN   TestLocalRejectsDoNotDial/https
+--- PASS: TestLocalRejectsDoNotDial (0.01s)
+    --- PASS: TestLocalRejectsDoNotDial/auth (0.00s)
+    --- PASS: TestLocalRejectsDoNotDial/no-node (0.00s)
+    --- PASS: TestLocalRejectsDoNotDial/origin-form (0.00s)
+    --- PASS: TestLocalRejectsDoNotDial/https (0.00s)
+=== RUN   TestBadCredentialDoesNotDial
+--- PASS: TestBadCredentialDoesNotDial (0.00s)
+=== RUN   TestL2Auth407
+--- PASS: TestL2Auth407 (0.00s)
+=== RUN   TestL2Status502
+--- PASS: TestL2Status502 (0.00s)
+=== RUN   TestDialAndResolve502
+=== RUN   TestDialAndResolve502/dial
+=== RUN   TestDialAndResolve502/unknown
+=== RUN   TestDialAndResolve502/no-healthy
+=== RUN   TestDialAndResolve502/empty
+=== RUN   TestDialAndResolve502/resolver
+--- PASS: TestDialAndResolve502 (0.02s)
+    --- PASS: TestDialAndResolve502/dial (0.00s)
+    --- PASS: TestDialAndResolve502/unknown (0.00s)
+    --- PASS: TestDialAndResolve502/no-healthy (0.00s)
+    --- PASS: TestDialAndResolve502/empty (0.00s)
+    --- PASS: TestDialAndResolve502/resolver (0.00s)
+=== RUN   TestL2ResponseTimeout
+--- PASS: TestL2ResponseTimeout (0.30s)
+=== RUN   TestClientIdleTimeout
+--- PASS: TestClientIdleTimeout (0.20s)
+=== RUN   TestAbsoluteFormMutations
+--- PASS: TestAbsoluteFormMutations (0.00s)
+=== RUN   TestHopHeaderStripAndHEAD
+--- PASS: TestHopHeaderStripAndHEAD (0.00s)
+=== RUN   TestApproachAGostRewritesHeaders
+--- PASS: TestApproachAGostRewritesHeaders (0.00s)
+=== RUN   TestClientHelloBytesJA3JA4
+    httpflow_test.go:1739: ja3=8520497e701d328ca849031134f31582 ja4=t13d0206h2_84cdcbea686c_fb71836bce29
+--- PASS: TestClientHelloBytesJA3JA4 (0.04s)
+=== RUN   TestHTTPL2WriteAndDeadline
+=== RUN   TestHTTPL2WriteAndDeadline/write-error
+=== RUN   TestHTTPL2WriteAndDeadline/short-write
+=== RUN   TestHTTPL2WriteAndDeadline/deadline
+--- PASS: TestHTTPL2WriteAndDeadline (0.01s)
+    --- PASS: TestHTTPL2WriteAndDeadline/write-error (0.00s)
+    --- PASS: TestHTTPL2WriteAndDeadline/short-write (0.00s)
+    --- PASS: TestHTTPL2WriteAndDeadline/deadline (0.00s)
+=== RUN   TestHTTPClientGone
+--- PASS: TestHTTPClientGone (0.00s)
+=== RUN   TestHTTPResponseAfter100IsL2Response
+--- PASS: TestHTTPResponseAfter100IsL2Response (0.00s)
+=== RUN   TestClosedHTTPLabels
+--- PASS: TestClosedHTTPLabels (0.00s)
+=== RUN   TestKeepAliveSameHostGauge
+--- PASS: TestKeepAliveSameHostGauge (0.01s)
+=== RUN   TestStaleKeepAliveRetry
+--- PASS: TestStaleKeepAliveRetry (5.01s)
+=== RUN   TestStaleNonIdempotentPOST
+--- PASS: TestStaleNonIdempotentPOST (0.00s)
+=== RUN   TestBodyAbortAfterStatus
+--- PASS: TestBodyAbortAfterStatus (0.00s)
+=== RUN   TestIncompleteHeadRejectAttribution
+=== RUN   TestIncompleteHeadRejectAttribution/partial-connect
+=== RUN   TestIncompleteHeadRejectAttribution/partial-get
+=== RUN   TestIncompleteHeadRejectAttribution/empty
+--- PASS: TestIncompleteHeadRejectAttribution (0.01s)
+    --- PASS: TestIncompleteHeadRejectAttribution/partial-connect (0.00s)
+    --- PASS: TestIncompleteHeadRejectAttribution/partial-get (0.00s)
+    --- PASS: TestIncompleteHeadRejectAttribution/empty (0.00s)
+=== RUN   TestDocFencesMatchSources
+--- PASS: TestDocFencesMatchSources (0.00s)
+=== RUN   TestHistogramInfAndClosedSetup
+--- PASS: TestHistogramInfAndClosedSetup (0.01s)
+=== RUN   TestPartialHeaderWriteDoesNotRetry
+--- PASS: TestPartialHeaderWriteDoesNotRetry (0.00s)
+=== RUN   TestReusedReadTimeoutDoesNotRetry
+--- PASS: TestReusedReadTimeoutDoesNotRetry (0.00s)
+=== RUN   TestPutRetryIsOptIn
+=== RUN   TestPutRetryIsOptIn/default
+=== RUN   TestPutRetryIsOptIn/enabled
+=== RUN   TestPutRetryIsOptIn/config-file
+--- PASS: TestPutRetryIsOptIn (0.01s)
+    --- PASS: TestPutRetryIsOptIn/default (0.00s)
+    --- PASS: TestPutRetryIsOptIn/enabled (0.00s)
+    --- PASS: TestPutRetryIsOptIn/config-file (0.00s)
+=== RUN   TestReadSideReset
+=== RUN   TestReadSideReset/get
+=== RUN   TestReadSideReset/put
+--- PASS: TestReadSideReset (0.01s)
+    --- PASS: TestReadSideReset/get (0.00s)
+    --- PASS: TestReadSideReset/put (0.00s)
+=== RUN   TestBodyIdleIsIdleTimeout
+--- PASS: TestBodyIdleIsIdleTimeout (0.08s)
+=== RUN   TestHalfCloseIdleIsNotAbort
+--- PASS: TestHalfCloseIdleIsNotAbort (0.08s)
+=== RUN   TestUpgradeRSTReason
+--- PASS: TestUpgradeRSTReason (0.00s)
+=== RUN   TestPartialHeaderTimeout
+--- PASS: TestPartialHeaderTimeout (0.25s)
+=== RUN   TestCachedGostRejectsBadHash
+=== RUN   TestCachedGostRejectsBadHash/version
+--- PASS: TestCachedGostRejectsBadHash (0.00s)
+    --- PASS: TestCachedGostRejectsBadHash/version (0.00s)
+=== RUN   TestResolveReasonLabelsConnect
+=== RUN   TestResolveReasonLabelsConnect/unknown
+=== RUN   TestResolveReasonLabelsConnect/empty
+=== RUN   TestResolveReasonLabelsConnect/resolver
+=== RUN   TestResolveReasonLabelsConnect/no-healthy
+--- PASS: TestResolveReasonLabelsConnect (0.01s)
+    --- PASS: TestResolveReasonLabelsConnect/unknown (0.00s)
+    --- PASS: TestResolveReasonLabelsConnect/empty (0.00s)
+    --- PASS: TestResolveReasonLabelsConnect/resolver (0.00s)
+    --- PASS: TestResolveReasonLabelsConnect/no-healthy (0.00s)
+=== RUN   TestConnectIdleTimeout
+--- PASS: TestConnectIdleTimeout (0.15s)
+=== RUN   TestSlowlorisHeaderDeadline
+--- PASS: TestSlowlorisHeaderDeadline (0.20s)
+=== RUN   TestKeepAliveIdleSurvivesHeaderDeadline
+--- PASS: TestKeepAliveIdleSurvivesHeaderDeadline (0.45s)
+=== RUN   TestKeepAliveTrickleHeader
+--- PASS: TestKeepAliveTrickleHeader (0.20s)
+=== RUN   TestConnectHalfClosePreemptsTunnelIdle
+--- PASS: TestConnectHalfClosePreemptsTunnelIdle (0.70s)
+=== RUN   TestLimitsFromConfigBounds
+--- PASS: TestLimitsFromConfigBounds (0.00s)
+=== RUN   TestHeaderOrderAndCaseThroughGost
+--- PASS: TestHeaderOrderAndCaseThroughGost (0.00s)
+=== RUN   TestChunkedAndContentLength
+--- PASS: TestChunkedAndContentLength (0.00s)
+=== RUN   TestExpect100Continue
+--- PASS: TestExpect100Continue (0.21s)
+=== RUN   TestExpect100RejectedDoesNotForwardBody
+--- PASS: TestExpect100RejectedDoesNotForwardBody (0.20s)
+=== RUN   TestWebSocketUpgrade
+--- PASS: TestWebSocketUpgrade (0.01s)
+=== RUN   TestKeepAliveDifferentHostsAndSameHostReuse
+--- PASS: TestKeepAliveDifferentHostsAndSameHostReuse (0.01s)
+=== RUN   TestLastAtNodeID
+--- PASS: TestLastAtNodeID (0.02s)
+=== RUN   TestLocalRejectsDoNotDial
+=== RUN   TestLocalRejectsDoNotDial/auth
+=== RUN   TestLocalRejectsDoNotDial/no-node
+=== RUN   TestLocalRejectsDoNotDial/origin-form
+=== RUN   TestLocalRejectsDoNotDial/https
+--- PASS: TestLocalRejectsDoNotDial (0.01s)
+    --- PASS: TestLocalRejectsDoNotDial/auth (0.00s)
+    --- PASS: TestLocalRejectsDoNotDial/no-node (0.00s)
+    --- PASS: TestLocalRejectsDoNotDial/origin-form (0.00s)
+    --- PASS: TestLocalRejectsDoNotDial/https (0.00s)
+=== RUN   TestBadCredentialDoesNotDial
+--- PASS: TestBadCredentialDoesNotDial (0.00s)
+=== RUN   TestL2Auth407
+--- PASS: TestL2Auth407 (0.00s)
+=== RUN   TestL2Status502
+--- PASS: TestL2Status502 (0.00s)
+=== RUN   TestDialAndResolve502
+=== RUN   TestDialAndResolve502/dial
+=== RUN   TestDialAndResolve502/unknown
+=== RUN   TestDialAndResolve502/no-healthy
+=== RUN   TestDialAndResolve502/empty
+=== RUN   TestDialAndResolve502/resolver
+--- PASS: TestDialAndResolve502 (0.02s)
+    --- PASS: TestDialAndResolve502/dial (0.00s)
+    --- PASS: TestDialAndResolve502/unknown (0.00s)
+    --- PASS: TestDialAndResolve502/no-healthy (0.00s)
+    --- PASS: TestDialAndResolve502/empty (0.00s)
+    --- PASS: TestDialAndResolve502/resolver (0.00s)
+=== RUN   TestL2ResponseTimeout
+--- PASS: TestL2ResponseTimeout (0.30s)
+=== RUN   TestClientIdleTimeout
+--- PASS: TestClientIdleTimeout (0.20s)
+=== RUN   TestAbsoluteFormMutations
+--- PASS: TestAbsoluteFormMutations (0.00s)
+=== RUN   TestHopHeaderStripAndHEAD
+--- PASS: TestHopHeaderStripAndHEAD (0.00s)
+=== RUN   TestApproachAGostRewritesHeaders
+--- PASS: TestApproachAGostRewritesHeaders (0.00s)
+=== RUN   TestClientHelloBytesJA3JA4
+    httpflow_test.go:1739: ja3=8520497e701d328ca849031134f31582 ja4=t13d0206h2_84cdcbea686c_fb71836bce29
+--- PASS: TestClientHelloBytesJA3JA4 (0.04s)
+=== RUN   TestHTTPL2WriteAndDeadline
+=== RUN   TestHTTPL2WriteAndDeadline/write-error
+=== RUN   TestHTTPL2WriteAndDeadline/short-write
+=== RUN   TestHTTPL2WriteAndDeadline/deadline
+--- PASS: TestHTTPL2WriteAndDeadline (0.01s)
+    --- PASS: TestHTTPL2WriteAndDeadline/write-error (0.00s)
+    --- PASS: TestHTTPL2WriteAndDeadline/short-write (0.00s)
+    --- PASS: TestHTTPL2WriteAndDeadline/deadline (0.00s)
+=== RUN   TestHTTPClientGone
+--- PASS: TestHTTPClientGone (0.00s)
+=== RUN   TestHTTPResponseAfter100IsL2Response
+--- PASS: TestHTTPResponseAfter100IsL2Response (0.00s)
+=== RUN   TestClosedHTTPLabels
+--- PASS: TestClosedHTTPLabels (0.00s)
+=== RUN   TestKeepAliveSameHostGauge
+--- PASS: TestKeepAliveSameHostGauge (0.01s)
+=== RUN   TestStaleKeepAliveRetry
+--- PASS: TestStaleKeepAliveRetry (5.01s)
+=== RUN   TestStaleNonIdempotentPOST
+--- PASS: TestStaleNonIdempotentPOST (0.00s)
+=== RUN   TestBodyAbortAfterStatus
+--- PASS: TestBodyAbortAfterStatus (0.00s)
+=== RUN   TestIncompleteHeadRejectAttribution
+=== RUN   TestIncompleteHeadRejectAttribution/partial-connect
+=== RUN   TestIncompleteHeadRejectAttribution/partial-get
+=== RUN   TestIncompleteHeadRejectAttribution/empty
+--- PASS: TestIncompleteHeadRejectAttribution (0.01s)
+    --- PASS: TestIncompleteHeadRejectAttribution/partial-connect (0.00s)
+    --- PASS: TestIncompleteHeadRejectAttribution/partial-get (0.00s)
+    --- PASS: TestIncompleteHeadRejectAttribution/empty (0.00s)
+=== RUN   TestDocFencesMatchSources
+--- PASS: TestDocFencesMatchSources (0.00s)
+=== RUN   TestHistogramInfAndClosedSetup
+--- PASS: TestHistogramInfAndClosedSetup (0.01s)
+=== RUN   TestPartialHeaderWriteDoesNotRetry
+--- PASS: TestPartialHeaderWriteDoesNotRetry (0.00s)
+=== RUN   TestReusedReadTimeoutDoesNotRetry
+--- PASS: TestReusedReadTimeoutDoesNotRetry (0.00s)
+=== RUN   TestPutRetryIsOptIn
+=== RUN   TestPutRetryIsOptIn/default
+=== RUN   TestPutRetryIsOptIn/enabled
+=== RUN   TestPutRetryIsOptIn/config-file
+--- PASS: TestPutRetryIsOptIn (0.01s)
+    --- PASS: TestPutRetryIsOptIn/default (0.00s)
+    --- PASS: TestPutRetryIsOptIn/enabled (0.00s)
+    --- PASS: TestPutRetryIsOptIn/config-file (0.00s)
+=== RUN   TestReadSideReset
+=== RUN   TestReadSideReset/get
+=== RUN   TestReadSideReset/put
+--- PASS: TestReadSideReset (0.01s)
+    --- PASS: TestReadSideReset/get (0.00s)
+    --- PASS: TestReadSideReset/put (0.00s)
+=== RUN   TestBodyIdleIsIdleTimeout
+--- PASS: TestBodyIdleIsIdleTimeout (0.08s)
+=== RUN   TestHalfCloseIdleIsNotAbort
+--- PASS: TestHalfCloseIdleIsNotAbort (0.08s)
+=== RUN   TestUpgradeRSTReason
+--- PASS: TestUpgradeRSTReason (0.00s)
+=== RUN   TestPartialHeaderTimeout
+--- PASS: TestPartialHeaderTimeout (0.25s)
+=== RUN   TestCachedGostRejectsBadHash
+=== RUN   TestCachedGostRejectsBadHash/version
+--- PASS: TestCachedGostRejectsBadHash (0.00s)
+    --- PASS: TestCachedGostRejectsBadHash/version (0.00s)
+=== RUN   TestResolveReasonLabelsConnect
+=== RUN   TestResolveReasonLabelsConnect/unknown
+=== RUN   TestResolveReasonLabelsConnect/empty
+=== RUN   TestResolveReasonLabelsConnect/resolver
+=== RUN   TestResolveReasonLabelsConnect/no-healthy
+--- PASS: TestResolveReasonLabelsConnect (0.01s)
+    --- PASS: TestResolveReasonLabelsConnect/unknown (0.00s)
+    --- PASS: TestResolveReasonLabelsConnect/empty (0.00s)
+    --- PASS: TestResolveReasonLabelsConnect/resolver (0.00s)
+    --- PASS: TestResolveReasonLabelsConnect/no-healthy (0.00s)
+=== RUN   TestConnectIdleTimeout
+--- PASS: TestConnectIdleTimeout (0.15s)
+=== RUN   TestSlowlorisHeaderDeadline
+--- PASS: TestSlowlorisHeaderDeadline (0.20s)
+=== RUN   TestKeepAliveIdleSurvivesHeaderDeadline
+--- PASS: TestKeepAliveIdleSurvivesHeaderDeadline (0.46s)
+=== RUN   TestKeepAliveTrickleHeader
+--- PASS: TestKeepAliveTrickleHeader (0.21s)
+=== RUN   TestConnectHalfClosePreemptsTunnelIdle
+--- PASS: TestConnectHalfClosePreemptsTunnelIdle (0.70s)
+=== RUN   TestLimitsFromConfigBounds
+--- PASS: TestLimitsFromConfigBounds (0.00s)
+=== RUN   TestHeaderOrderAndCaseThroughGost
+--- PASS: TestHeaderOrderAndCaseThroughGost (0.00s)
+=== RUN   TestChunkedAndContentLength
+--- PASS: TestChunkedAndContentLength (0.00s)
+=== RUN   TestExpect100Continue
+--- PASS: TestExpect100Continue (0.21s)
+=== RUN   TestExpect100RejectedDoesNotForwardBody
+--- PASS: TestExpect100RejectedDoesNotForwardBody (0.20s)
+=== RUN   TestWebSocketUpgrade
+--- PASS: TestWebSocketUpgrade (0.01s)
+=== RUN   TestKeepAliveDifferentHostsAndSameHostReuse
+--- PASS: TestKeepAliveDifferentHostsAndSameHostReuse (0.01s)
+=== RUN   TestLastAtNodeID
+--- PASS: TestLastAtNodeID (0.02s)
+=== RUN   TestLocalRejectsDoNotDial
+=== RUN   TestLocalRejectsDoNotDial/auth
+=== RUN   TestLocalRejectsDoNotDial/no-node
+=== RUN   TestLocalRejectsDoNotDial/origin-form
+=== RUN   TestLocalRejectsDoNotDial/https
+--- PASS: TestLocalRejectsDoNotDial (0.01s)
+    --- PASS: TestLocalRejectsDoNotDial/auth (0.00s)
+    --- PASS: TestLocalRejectsDoNotDial/no-node (0.00s)
+    --- PASS: TestLocalRejectsDoNotDial/origin-form (0.00s)
+    --- PASS: TestLocalRejectsDoNotDial/https (0.00s)
+=== RUN   TestBadCredentialDoesNotDial
+--- PASS: TestBadCredentialDoesNotDial (0.00s)
+=== RUN   TestL2Auth407
+--- PASS: TestL2Auth407 (0.00s)
+=== RUN   TestL2Status502
+--- PASS: TestL2Status502 (0.00s)
+=== RUN   TestDialAndResolve502
+=== RUN   TestDialAndResolve502/dial
+=== RUN   TestDialAndResolve502/unknown
+=== RUN   TestDialAndResolve502/no-healthy
+=== RUN   TestDialAndResolve502/empty
+=== RUN   TestDialAndResolve502/resolver
+--- PASS: TestDialAndResolve502 (0.02s)
+    --- PASS: TestDialAndResolve502/dial (0.00s)
+    --- PASS: TestDialAndResolve502/unknown (0.00s)
+    --- PASS: TestDialAndResolve502/no-healthy (0.00s)
+    --- PASS: TestDialAndResolve502/empty (0.00s)
+    --- PASS: TestDialAndResolve502/resolver (0.00s)
+=== RUN   TestL2ResponseTimeout
+--- PASS: TestL2ResponseTimeout (0.30s)
+=== RUN   TestClientIdleTimeout
+--- PASS: TestClientIdleTimeout (0.20s)
+=== RUN   TestAbsoluteFormMutations
+--- PASS: TestAbsoluteFormMutations (0.00s)
+=== RUN   TestHopHeaderStripAndHEAD
+--- PASS: TestHopHeaderStripAndHEAD (0.00s)
+=== RUN   TestApproachAGostRewritesHeaders
+--- PASS: TestApproachAGostRewritesHeaders (0.00s)
+=== RUN   TestClientHelloBytesJA3JA4
+    httpflow_test.go:1739: ja3=8520497e701d328ca849031134f31582 ja4=t13d0206h2_84cdcbea686c_fb71836bce29
+--- PASS: TestClientHelloBytesJA3JA4 (0.04s)
+=== RUN   TestHTTPL2WriteAndDeadline
+=== RUN   TestHTTPL2WriteAndDeadline/write-error
+=== RUN   TestHTTPL2WriteAndDeadline/short-write
+=== RUN   TestHTTPL2WriteAndDeadline/deadline
+--- PASS: TestHTTPL2WriteAndDeadline (0.01s)
+    --- PASS: TestHTTPL2WriteAndDeadline/write-error (0.00s)
+    --- PASS: TestHTTPL2WriteAndDeadline/short-write (0.00s)
+    --- PASS: TestHTTPL2WriteAndDeadline/deadline (0.00s)
+=== RUN   TestHTTPClientGone
+--- PASS: TestHTTPClientGone (0.00s)
+=== RUN   TestHTTPResponseAfter100IsL2Response
+--- PASS: TestHTTPResponseAfter100IsL2Response (0.00s)
+=== RUN   TestClosedHTTPLabels
+--- PASS: TestClosedHTTPLabels (0.00s)
+=== RUN   TestKeepAliveSameHostGauge
+--- PASS: TestKeepAliveSameHostGauge (0.01s)
+=== RUN   TestStaleKeepAliveRetry
+--- PASS: TestStaleKeepAliveRetry (5.01s)
+=== RUN   TestStaleNonIdempotentPOST
+--- PASS: TestStaleNonIdempotentPOST (0.00s)
+=== RUN   TestBodyAbortAfterStatus
+--- PASS: TestBodyAbortAfterStatus (0.00s)
+=== RUN   TestIncompleteHeadRejectAttribution
+=== RUN   TestIncompleteHeadRejectAttribution/partial-connect
+=== RUN   TestIncompleteHeadRejectAttribution/partial-get
+=== RUN   TestIncompleteHeadRejectAttribution/empty
+--- PASS: TestIncompleteHeadRejectAttribution (0.01s)
+    --- PASS: TestIncompleteHeadRejectAttribution/partial-connect (0.00s)
+    --- PASS: TestIncompleteHeadRejectAttribution/partial-get (0.00s)
+    --- PASS: TestIncompleteHeadRejectAttribution/empty (0.00s)
+=== RUN   TestDocFencesMatchSources
+--- PASS: TestDocFencesMatchSources (0.00s)
+=== RUN   TestHistogramInfAndClosedSetup
+--- PASS: TestHistogramInfAndClosedSetup (0.01s)
+=== RUN   TestPartialHeaderWriteDoesNotRetry
+--- PASS: TestPartialHeaderWriteDoesNotRetry (0.00s)
+=== RUN   TestReusedReadTimeoutDoesNotRetry
+--- PASS: TestReusedReadTimeoutDoesNotRetry (0.00s)
+=== RUN   TestPutRetryIsOptIn
+=== RUN   TestPutRetryIsOptIn/default
+=== RUN   TestPutRetryIsOptIn/enabled
+=== RUN   TestPutRetryIsOptIn/config-file
+--- PASS: TestPutRetryIsOptIn (0.01s)
+    --- PASS: TestPutRetryIsOptIn/default (0.00s)
+    --- PASS: TestPutRetryIsOptIn/enabled (0.00s)
+    --- PASS: TestPutRetryIsOptIn/config-file (0.00s)
+=== RUN   TestReadSideReset
+=== RUN   TestReadSideReset/get
+=== RUN   TestReadSideReset/put
+--- PASS: TestReadSideReset (0.01s)
+    --- PASS: TestReadSideReset/get (0.00s)
+    --- PASS: TestReadSideReset/put (0.00s)
+=== RUN   TestBodyIdleIsIdleTimeout
+--- PASS: TestBodyIdleIsIdleTimeout (0.08s)
+=== RUN   TestHalfCloseIdleIsNotAbort
+--- PASS: TestHalfCloseIdleIsNotAbort (0.08s)
+=== RUN   TestUpgradeRSTReason
+--- PASS: TestUpgradeRSTReason (0.00s)
+=== RUN   TestPartialHeaderTimeout
+--- PASS: TestPartialHeaderTimeout (0.25s)
+=== RUN   TestCachedGostRejectsBadHash
+=== RUN   TestCachedGostRejectsBadHash/version
+--- PASS: TestCachedGostRejectsBadHash (0.00s)
+    --- PASS: TestCachedGostRejectsBadHash/version (0.00s)
+=== RUN   TestResolveReasonLabelsConnect
+=== RUN   TestResolveReasonLabelsConnect/unknown
+=== RUN   TestResolveReasonLabelsConnect/empty
+=== RUN   TestResolveReasonLabelsConnect/resolver
+=== RUN   TestResolveReasonLabelsConnect/no-healthy
+--- PASS: TestResolveReasonLabelsConnect (0.01s)
+    --- PASS: TestResolveReasonLabelsConnect/unknown (0.00s)
+    --- PASS: TestResolveReasonLabelsConnect/empty (0.00s)
+    --- PASS: TestResolveReasonLabelsConnect/resolver (0.00s)
+    --- PASS: TestResolveReasonLabelsConnect/no-healthy (0.00s)
+=== RUN   TestConnectIdleTimeout
+--- PASS: TestConnectIdleTimeout (0.15s)
+=== RUN   TestSlowlorisHeaderDeadline
+--- PASS: TestSlowlorisHeaderDeadline (0.20s)
+=== RUN   TestKeepAliveIdleSurvivesHeaderDeadline
+--- PASS: TestKeepAliveIdleSurvivesHeaderDeadline (0.46s)
+=== RUN   TestKeepAliveTrickleHeader
+--- PASS: TestKeepAliveTrickleHeader (0.21s)
+=== RUN   TestConnectHalfClosePreemptsTunnelIdle
+--- PASS: TestConnectHalfClosePreemptsTunnelIdle (0.70s)
+=== RUN   TestLimitsFromConfigBounds
+--- PASS: TestLimitsFromConfigBounds (0.00s)
+=== RUN   TestHeaderOrderAndCaseThroughGost
+--- PASS: TestHeaderOrderAndCaseThroughGost (0.00s)
+=== RUN   TestChunkedAndContentLength
+--- PASS: TestChunkedAndContentLength (0.00s)
+=== RUN   TestExpect100Continue
+--- PASS: TestExpect100Continue (0.21s)
+=== RUN   TestExpect100RejectedDoesNotForwardBody
+--- PASS: TestExpect100RejectedDoesNotForwardBody (0.21s)
+=== RUN   TestWebSocketUpgrade
+--- PASS: TestWebSocketUpgrade (0.01s)
+=== RUN   TestKeepAliveDifferentHostsAndSameHostReuse
+--- PASS: TestKeepAliveDifferentHostsAndSameHostReuse (0.01s)
+=== RUN   TestLastAtNodeID
+--- PASS: TestLastAtNodeID (0.02s)
+=== RUN   TestLocalRejectsDoNotDial
+=== RUN   TestLocalRejectsDoNotDial/auth
+=== RUN   TestLocalRejectsDoNotDial/no-node
+=== RUN   TestLocalRejectsDoNotDial/origin-form
+=== RUN   TestLocalRejectsDoNotDial/https
+--- PASS: TestLocalRejectsDoNotDial (0.01s)
+    --- PASS: TestLocalRejectsDoNotDial/auth (0.00s)
+    --- PASS: TestLocalRejectsDoNotDial/no-node (0.00s)
+    --- PASS: TestLocalRejectsDoNotDial/origin-form (0.00s)
+    --- PASS: TestLocalRejectsDoNotDial/https (0.00s)
+=== RUN   TestBadCredentialDoesNotDial
+--- PASS: TestBadCredentialDoesNotDial (0.00s)
+=== RUN   TestL2Auth407
+--- PASS: TestL2Auth407 (0.00s)
+=== RUN   TestL2Status502
+--- PASS: TestL2Status502 (0.00s)
+=== RUN   TestDialAndResolve502
+=== RUN   TestDialAndResolve502/dial
+=== RUN   TestDialAndResolve502/unknown
+=== RUN   TestDialAndResolve502/no-healthy
+=== RUN   TestDialAndResolve502/empty
+=== RUN   TestDialAndResolve502/resolver
+--- PASS: TestDialAndResolve502 (0.02s)
+    --- PASS: TestDialAndResolve502/dial (0.00s)
+    --- PASS: TestDialAndResolve502/unknown (0.00s)
+    --- PASS: TestDialAndResolve502/no-healthy (0.00s)
+    --- PASS: TestDialAndResolve502/empty (0.00s)
+    --- PASS: TestDialAndResolve502/resolver (0.00s)
+=== RUN   TestL2ResponseTimeout
+--- PASS: TestL2ResponseTimeout (0.30s)
+=== RUN   TestClientIdleTimeout
+--- PASS: TestClientIdleTimeout (0.20s)
+=== RUN   TestAbsoluteFormMutations
+--- PASS: TestAbsoluteFormMutations (0.00s)
+=== RUN   TestHopHeaderStripAndHEAD
+--- PASS: TestHopHeaderStripAndHEAD (0.00s)
+=== RUN   TestApproachAGostRewritesHeaders
+--- PASS: TestApproachAGostRewritesHeaders (0.00s)
+=== RUN   TestClientHelloBytesJA3JA4
+    httpflow_test.go:1739: ja3=8520497e701d328ca849031134f31582 ja4=t13d0206h2_84cdcbea686c_fb71836bce29
 --- PASS: TestClientHelloBytesJA3JA4 (0.04s)
 === RUN   TestHTTPL2WriteAndDeadline
 === RUN   TestHTTPL2WriteAndDeadline/write-error
@@ -2703,5 +2401,428 @@ command: GOST_REQUIRED=1 go test -tags docfixture -race -count=20 -v ./internal/
     --- PASS: TestIncompleteHeadRejectAttribution/partial-connect (0.00s)
     --- PASS: TestIncompleteHeadRejectAttribution/partial-get (0.00s)
     --- PASS: TestIncompleteHeadRejectAttribution/empty (0.00s)
+=== RUN   TestDocFencesMatchSources
+--- PASS: TestDocFencesMatchSources (0.00s)
+=== RUN   TestHistogramInfAndClosedSetup
+--- PASS: TestHistogramInfAndClosedSetup (0.01s)
+=== RUN   TestPartialHeaderWriteDoesNotRetry
+--- PASS: TestPartialHeaderWriteDoesNotRetry (0.00s)
+=== RUN   TestReusedReadTimeoutDoesNotRetry
+--- PASS: TestReusedReadTimeoutDoesNotRetry (0.00s)
+=== RUN   TestPutRetryIsOptIn
+=== RUN   TestPutRetryIsOptIn/default
+=== RUN   TestPutRetryIsOptIn/enabled
+=== RUN   TestPutRetryIsOptIn/config-file
+--- PASS: TestPutRetryIsOptIn (0.01s)
+    --- PASS: TestPutRetryIsOptIn/default (0.00s)
+    --- PASS: TestPutRetryIsOptIn/enabled (0.00s)
+    --- PASS: TestPutRetryIsOptIn/config-file (0.00s)
+=== RUN   TestReadSideReset
+=== RUN   TestReadSideReset/get
+=== RUN   TestReadSideReset/put
+--- PASS: TestReadSideReset (0.01s)
+    --- PASS: TestReadSideReset/get (0.00s)
+    --- PASS: TestReadSideReset/put (0.00s)
+=== RUN   TestBodyIdleIsIdleTimeout
+--- PASS: TestBodyIdleIsIdleTimeout (0.08s)
+=== RUN   TestHalfCloseIdleIsNotAbort
+--- PASS: TestHalfCloseIdleIsNotAbort (0.08s)
+=== RUN   TestUpgradeRSTReason
+--- PASS: TestUpgradeRSTReason (0.00s)
+=== RUN   TestPartialHeaderTimeout
+--- PASS: TestPartialHeaderTimeout (0.25s)
+=== RUN   TestCachedGostRejectsBadHash
+=== RUN   TestCachedGostRejectsBadHash/version
+--- PASS: TestCachedGostRejectsBadHash (0.00s)
+    --- PASS: TestCachedGostRejectsBadHash/version (0.00s)
+=== RUN   TestResolveReasonLabelsConnect
+=== RUN   TestResolveReasonLabelsConnect/unknown
+=== RUN   TestResolveReasonLabelsConnect/empty
+=== RUN   TestResolveReasonLabelsConnect/resolver
+=== RUN   TestResolveReasonLabelsConnect/no-healthy
+--- PASS: TestResolveReasonLabelsConnect (0.02s)
+    --- PASS: TestResolveReasonLabelsConnect/unknown (0.00s)
+    --- PASS: TestResolveReasonLabelsConnect/empty (0.00s)
+    --- PASS: TestResolveReasonLabelsConnect/resolver (0.00s)
+    --- PASS: TestResolveReasonLabelsConnect/no-healthy (0.00s)
+=== RUN   TestConnectIdleTimeout
+--- PASS: TestConnectIdleTimeout (0.15s)
+=== RUN   TestSlowlorisHeaderDeadline
+--- PASS: TestSlowlorisHeaderDeadline (0.20s)
+=== RUN   TestKeepAliveIdleSurvivesHeaderDeadline
+--- PASS: TestKeepAliveIdleSurvivesHeaderDeadline (0.46s)
+=== RUN   TestKeepAliveTrickleHeader
+--- PASS: TestKeepAliveTrickleHeader (0.21s)
+=== RUN   TestConnectHalfClosePreemptsTunnelIdle
+--- PASS: TestConnectHalfClosePreemptsTunnelIdle (0.71s)
+=== RUN   TestLimitsFromConfigBounds
+--- PASS: TestLimitsFromConfigBounds (0.00s)
+=== RUN   TestHeaderOrderAndCaseThroughGost
+--- PASS: TestHeaderOrderAndCaseThroughGost (0.00s)
+=== RUN   TestChunkedAndContentLength
+--- PASS: TestChunkedAndContentLength (0.00s)
+=== RUN   TestExpect100Continue
+--- PASS: TestExpect100Continue (0.21s)
+=== RUN   TestExpect100RejectedDoesNotForwardBody
+--- PASS: TestExpect100RejectedDoesNotForwardBody (0.20s)
+=== RUN   TestWebSocketUpgrade
+--- PASS: TestWebSocketUpgrade (0.01s)
+=== RUN   TestKeepAliveDifferentHostsAndSameHostReuse
+--- PASS: TestKeepAliveDifferentHostsAndSameHostReuse (0.01s)
+=== RUN   TestLastAtNodeID
+--- PASS: TestLastAtNodeID (0.02s)
+=== RUN   TestLocalRejectsDoNotDial
+=== RUN   TestLocalRejectsDoNotDial/auth
+=== RUN   TestLocalRejectsDoNotDial/no-node
+=== RUN   TestLocalRejectsDoNotDial/origin-form
+=== RUN   TestLocalRejectsDoNotDial/https
+--- PASS: TestLocalRejectsDoNotDial (0.02s)
+    --- PASS: TestLocalRejectsDoNotDial/auth (0.00s)
+    --- PASS: TestLocalRejectsDoNotDial/no-node (0.00s)
+    --- PASS: TestLocalRejectsDoNotDial/origin-form (0.00s)
+    --- PASS: TestLocalRejectsDoNotDial/https (0.00s)
+=== RUN   TestBadCredentialDoesNotDial
+--- PASS: TestBadCredentialDoesNotDial (0.00s)
+=== RUN   TestL2Auth407
+--- PASS: TestL2Auth407 (0.00s)
+=== RUN   TestL2Status502
+--- PASS: TestL2Status502 (0.00s)
+=== RUN   TestDialAndResolve502
+=== RUN   TestDialAndResolve502/dial
+=== RUN   TestDialAndResolve502/unknown
+=== RUN   TestDialAndResolve502/no-healthy
+=== RUN   TestDialAndResolve502/empty
+=== RUN   TestDialAndResolve502/resolver
+--- PASS: TestDialAndResolve502 (0.02s)
+    --- PASS: TestDialAndResolve502/dial (0.00s)
+    --- PASS: TestDialAndResolve502/unknown (0.00s)
+    --- PASS: TestDialAndResolve502/no-healthy (0.00s)
+    --- PASS: TestDialAndResolve502/empty (0.00s)
+    --- PASS: TestDialAndResolve502/resolver (0.00s)
+=== RUN   TestL2ResponseTimeout
+--- PASS: TestL2ResponseTimeout (0.30s)
+=== RUN   TestClientIdleTimeout
+--- PASS: TestClientIdleTimeout (0.20s)
+=== RUN   TestAbsoluteFormMutations
+--- PASS: TestAbsoluteFormMutations (0.00s)
+=== RUN   TestHopHeaderStripAndHEAD
+--- PASS: TestHopHeaderStripAndHEAD (0.00s)
+=== RUN   TestApproachAGostRewritesHeaders
+--- PASS: TestApproachAGostRewritesHeaders (0.00s)
+=== RUN   TestClientHelloBytesJA3JA4
+    httpflow_test.go:1739: ja3=8520497e701d328ca849031134f31582 ja4=t13d0206h2_84cdcbea686c_fb71836bce29
+--- PASS: TestClientHelloBytesJA3JA4 (0.04s)
+=== RUN   TestHTTPL2WriteAndDeadline
+=== RUN   TestHTTPL2WriteAndDeadline/write-error
+=== RUN   TestHTTPL2WriteAndDeadline/short-write
+=== RUN   TestHTTPL2WriteAndDeadline/deadline
+--- PASS: TestHTTPL2WriteAndDeadline (0.01s)
+    --- PASS: TestHTTPL2WriteAndDeadline/write-error (0.00s)
+    --- PASS: TestHTTPL2WriteAndDeadline/short-write (0.00s)
+    --- PASS: TestHTTPL2WriteAndDeadline/deadline (0.00s)
+=== RUN   TestHTTPClientGone
+--- PASS: TestHTTPClientGone (0.00s)
+=== RUN   TestHTTPResponseAfter100IsL2Response
+--- PASS: TestHTTPResponseAfter100IsL2Response (0.00s)
+=== RUN   TestClosedHTTPLabels
+--- PASS: TestClosedHTTPLabels (0.00s)
+=== RUN   TestKeepAliveSameHostGauge
+--- PASS: TestKeepAliveSameHostGauge (0.01s)
+=== RUN   TestStaleKeepAliveRetry
+--- PASS: TestStaleKeepAliveRetry (5.01s)
+=== RUN   TestStaleNonIdempotentPOST
+--- PASS: TestStaleNonIdempotentPOST (0.00s)
+=== RUN   TestBodyAbortAfterStatus
+--- PASS: TestBodyAbortAfterStatus (0.00s)
+=== RUN   TestIncompleteHeadRejectAttribution
+=== RUN   TestIncompleteHeadRejectAttribution/partial-connect
+=== RUN   TestIncompleteHeadRejectAttribution/partial-get
+=== RUN   TestIncompleteHeadRejectAttribution/empty
+--- PASS: TestIncompleteHeadRejectAttribution (0.01s)
+    --- PASS: TestIncompleteHeadRejectAttribution/partial-connect (0.00s)
+    --- PASS: TestIncompleteHeadRejectAttribution/partial-get (0.00s)
+    --- PASS: TestIncompleteHeadRejectAttribution/empty (0.00s)
+=== RUN   TestDocFencesMatchSources
+--- PASS: TestDocFencesMatchSources (0.00s)
+=== RUN   TestHistogramInfAndClosedSetup
+--- PASS: TestHistogramInfAndClosedSetup (0.01s)
+=== RUN   TestPartialHeaderWriteDoesNotRetry
+--- PASS: TestPartialHeaderWriteDoesNotRetry (0.00s)
+=== RUN   TestReusedReadTimeoutDoesNotRetry
+--- PASS: TestReusedReadTimeoutDoesNotRetry (0.00s)
+=== RUN   TestPutRetryIsOptIn
+=== RUN   TestPutRetryIsOptIn/default
+=== RUN   TestPutRetryIsOptIn/enabled
+=== RUN   TestPutRetryIsOptIn/config-file
+--- PASS: TestPutRetryIsOptIn (0.01s)
+    --- PASS: TestPutRetryIsOptIn/default (0.00s)
+    --- PASS: TestPutRetryIsOptIn/enabled (0.00s)
+    --- PASS: TestPutRetryIsOptIn/config-file (0.00s)
+=== RUN   TestReadSideReset
+=== RUN   TestReadSideReset/get
+=== RUN   TestReadSideReset/put
+--- PASS: TestReadSideReset (0.01s)
+    --- PASS: TestReadSideReset/get (0.00s)
+    --- PASS: TestReadSideReset/put (0.00s)
+=== RUN   TestBodyIdleIsIdleTimeout
+--- PASS: TestBodyIdleIsIdleTimeout (0.08s)
+=== RUN   TestHalfCloseIdleIsNotAbort
+--- PASS: TestHalfCloseIdleIsNotAbort (0.08s)
+=== RUN   TestUpgradeRSTReason
+--- PASS: TestUpgradeRSTReason (0.00s)
+=== RUN   TestPartialHeaderTimeout
+--- PASS: TestPartialHeaderTimeout (0.25s)
+=== RUN   TestCachedGostRejectsBadHash
+=== RUN   TestCachedGostRejectsBadHash/version
+--- PASS: TestCachedGostRejectsBadHash (0.00s)
+    --- PASS: TestCachedGostRejectsBadHash/version (0.00s)
+=== RUN   TestResolveReasonLabelsConnect
+=== RUN   TestResolveReasonLabelsConnect/unknown
+=== RUN   TestResolveReasonLabelsConnect/empty
+=== RUN   TestResolveReasonLabelsConnect/resolver
+=== RUN   TestResolveReasonLabelsConnect/no-healthy
+--- PASS: TestResolveReasonLabelsConnect (0.01s)
+    --- PASS: TestResolveReasonLabelsConnect/unknown (0.00s)
+    --- PASS: TestResolveReasonLabelsConnect/empty (0.00s)
+    --- PASS: TestResolveReasonLabelsConnect/resolver (0.00s)
+    --- PASS: TestResolveReasonLabelsConnect/no-healthy (0.00s)
+=== RUN   TestConnectIdleTimeout
+--- PASS: TestConnectIdleTimeout (0.15s)
+=== RUN   TestSlowlorisHeaderDeadline
+--- PASS: TestSlowlorisHeaderDeadline (0.20s)
+=== RUN   TestKeepAliveIdleSurvivesHeaderDeadline
+--- PASS: TestKeepAliveIdleSurvivesHeaderDeadline (0.46s)
+=== RUN   TestKeepAliveTrickleHeader
+--- PASS: TestKeepAliveTrickleHeader (0.21s)
+=== RUN   TestConnectHalfClosePreemptsTunnelIdle
+--- PASS: TestConnectHalfClosePreemptsTunnelIdle (0.71s)
+=== RUN   TestLimitsFromConfigBounds
+--- PASS: TestLimitsFromConfigBounds (0.00s)
+=== RUN   TestHeaderOrderAndCaseThroughGost
+--- PASS: TestHeaderOrderAndCaseThroughGost (0.00s)
+=== RUN   TestChunkedAndContentLength
+--- PASS: TestChunkedAndContentLength (0.00s)
+=== RUN   TestExpect100Continue
+--- PASS: TestExpect100Continue (0.21s)
+=== RUN   TestExpect100RejectedDoesNotForwardBody
+--- PASS: TestExpect100RejectedDoesNotForwardBody (0.20s)
+=== RUN   TestWebSocketUpgrade
+--- PASS: TestWebSocketUpgrade (0.01s)
+=== RUN   TestKeepAliveDifferentHostsAndSameHostReuse
+--- PASS: TestKeepAliveDifferentHostsAndSameHostReuse (0.01s)
+=== RUN   TestLastAtNodeID
+--- PASS: TestLastAtNodeID (0.02s)
+=== RUN   TestLocalRejectsDoNotDial
+=== RUN   TestLocalRejectsDoNotDial/auth
+=== RUN   TestLocalRejectsDoNotDial/no-node
+=== RUN   TestLocalRejectsDoNotDial/origin-form
+=== RUN   TestLocalRejectsDoNotDial/https
+--- PASS: TestLocalRejectsDoNotDial (0.02s)
+    --- PASS: TestLocalRejectsDoNotDial/auth (0.00s)
+    --- PASS: TestLocalRejectsDoNotDial/no-node (0.00s)
+    --- PASS: TestLocalRejectsDoNotDial/origin-form (0.00s)
+    --- PASS: TestLocalRejectsDoNotDial/https (0.00s)
+=== RUN   TestBadCredentialDoesNotDial
+--- PASS: TestBadCredentialDoesNotDial (0.00s)
+=== RUN   TestL2Auth407
+--- PASS: TestL2Auth407 (0.00s)
+=== RUN   TestL2Status502
+--- PASS: TestL2Status502 (0.00s)
+=== RUN   TestDialAndResolve502
+=== RUN   TestDialAndResolve502/dial
+=== RUN   TestDialAndResolve502/unknown
+=== RUN   TestDialAndResolve502/no-healthy
+=== RUN   TestDialAndResolve502/empty
+=== RUN   TestDialAndResolve502/resolver
+--- PASS: TestDialAndResolve502 (0.02s)
+    --- PASS: TestDialAndResolve502/dial (0.00s)
+    --- PASS: TestDialAndResolve502/unknown (0.00s)
+    --- PASS: TestDialAndResolve502/no-healthy (0.00s)
+    --- PASS: TestDialAndResolve502/empty (0.00s)
+    --- PASS: TestDialAndResolve502/resolver (0.00s)
+=== RUN   TestL2ResponseTimeout
+--- PASS: TestL2ResponseTimeout (0.30s)
+=== RUN   TestClientIdleTimeout
+--- PASS: TestClientIdleTimeout (0.20s)
+=== RUN   TestAbsoluteFormMutations
+--- PASS: TestAbsoluteFormMutations (0.00s)
+=== RUN   TestHopHeaderStripAndHEAD
+--- PASS: TestHopHeaderStripAndHEAD (0.00s)
+=== RUN   TestApproachAGostRewritesHeaders
+--- PASS: TestApproachAGostRewritesHeaders (0.00s)
+=== RUN   TestClientHelloBytesJA3JA4
+    httpflow_test.go:1739: ja3=8520497e701d328ca849031134f31582 ja4=t13d0206h2_84cdcbea686c_fb71836bce29
+--- PASS: TestClientHelloBytesJA3JA4 (0.04s)
+=== RUN   TestHTTPL2WriteAndDeadline
+=== RUN   TestHTTPL2WriteAndDeadline/write-error
+=== RUN   TestHTTPL2WriteAndDeadline/short-write
+=== RUN   TestHTTPL2WriteAndDeadline/deadline
+--- PASS: TestHTTPL2WriteAndDeadline (0.01s)
+    --- PASS: TestHTTPL2WriteAndDeadline/write-error (0.00s)
+    --- PASS: TestHTTPL2WriteAndDeadline/short-write (0.00s)
+    --- PASS: TestHTTPL2WriteAndDeadline/deadline (0.00s)
+=== RUN   TestHTTPClientGone
+--- PASS: TestHTTPClientGone (0.00s)
+=== RUN   TestHTTPResponseAfter100IsL2Response
+--- PASS: TestHTTPResponseAfter100IsL2Response (0.00s)
+=== RUN   TestClosedHTTPLabels
+--- PASS: TestClosedHTTPLabels (0.00s)
+=== RUN   TestKeepAliveSameHostGauge
+--- PASS: TestKeepAliveSameHostGauge (0.01s)
+=== RUN   TestStaleKeepAliveRetry
+--- PASS: TestStaleKeepAliveRetry (5.01s)
+=== RUN   TestStaleNonIdempotentPOST
+--- PASS: TestStaleNonIdempotentPOST (0.00s)
+=== RUN   TestBodyAbortAfterStatus
+--- PASS: TestBodyAbortAfterStatus (0.00s)
+=== RUN   TestIncompleteHeadRejectAttribution
+=== RUN   TestIncompleteHeadRejectAttribution/partial-connect
+=== RUN   TestIncompleteHeadRejectAttribution/partial-get
+=== RUN   TestIncompleteHeadRejectAttribution/empty
+--- PASS: TestIncompleteHeadRejectAttribution (0.01s)
+    --- PASS: TestIncompleteHeadRejectAttribution/partial-connect (0.00s)
+    --- PASS: TestIncompleteHeadRejectAttribution/partial-get (0.00s)
+    --- PASS: TestIncompleteHeadRejectAttribution/empty (0.00s)
+=== RUN   TestDocFencesMatchSources
+--- PASS: TestDocFencesMatchSources (0.00s)
+=== RUN   TestHistogramInfAndClosedSetup
+--- PASS: TestHistogramInfAndClosedSetup (0.01s)
+=== RUN   TestPartialHeaderWriteDoesNotRetry
+--- PASS: TestPartialHeaderWriteDoesNotRetry (0.00s)
+=== RUN   TestReusedReadTimeoutDoesNotRetry
+--- PASS: TestReusedReadTimeoutDoesNotRetry (0.00s)
+=== RUN   TestPutRetryIsOptIn
+=== RUN   TestPutRetryIsOptIn/default
+=== RUN   TestPutRetryIsOptIn/enabled
+=== RUN   TestPutRetryIsOptIn/config-file
+--- PASS: TestPutRetryIsOptIn (0.01s)
+    --- PASS: TestPutRetryIsOptIn/default (0.00s)
+    --- PASS: TestPutRetryIsOptIn/enabled (0.00s)
+    --- PASS: TestPutRetryIsOptIn/config-file (0.00s)
+=== RUN   TestReadSideReset
+=== RUN   TestReadSideReset/get
+=== RUN   TestReadSideReset/put
+--- PASS: TestReadSideReset (0.01s)
+    --- PASS: TestReadSideReset/get (0.00s)
+    --- PASS: TestReadSideReset/put (0.00s)
+=== RUN   TestBodyIdleIsIdleTimeout
+--- PASS: TestBodyIdleIsIdleTimeout (0.08s)
+=== RUN   TestHalfCloseIdleIsNotAbort
+--- PASS: TestHalfCloseIdleIsNotAbort (0.08s)
+=== RUN   TestUpgradeRSTReason
+--- PASS: TestUpgradeRSTReason (0.00s)
+=== RUN   TestPartialHeaderTimeout
+--- PASS: TestPartialHeaderTimeout (0.25s)
+=== RUN   TestCachedGostRejectsBadHash
+=== RUN   TestCachedGostRejectsBadHash/version
+--- PASS: TestCachedGostRejectsBadHash (0.00s)
+    --- PASS: TestCachedGostRejectsBadHash/version (0.00s)
+=== RUN   TestResolveReasonLabelsConnect
+=== RUN   TestResolveReasonLabelsConnect/unknown
+=== RUN   TestResolveReasonLabelsConnect/empty
+=== RUN   TestResolveReasonLabelsConnect/resolver
+=== RUN   TestResolveReasonLabelsConnect/no-healthy
+--- PASS: TestResolveReasonLabelsConnect (0.02s)
+    --- PASS: TestResolveReasonLabelsConnect/unknown (0.00s)
+    --- PASS: TestResolveReasonLabelsConnect/empty (0.00s)
+    --- PASS: TestResolveReasonLabelsConnect/resolver (0.00s)
+    --- PASS: TestResolveReasonLabelsConnect/no-healthy (0.00s)
+=== RUN   TestConnectIdleTimeout
+--- PASS: TestConnectIdleTimeout (0.15s)
+=== RUN   TestSlowlorisHeaderDeadline
+--- PASS: TestSlowlorisHeaderDeadline (0.20s)
+=== RUN   TestKeepAliveIdleSurvivesHeaderDeadline
+--- PASS: TestKeepAliveIdleSurvivesHeaderDeadline (0.46s)
+=== RUN   TestKeepAliveTrickleHeader
+--- PASS: TestKeepAliveTrickleHeader (0.20s)
+=== RUN   TestConnectHalfClosePreemptsTunnelIdle
+--- PASS: TestConnectHalfClosePreemptsTunnelIdle (0.71s)
+=== RUN   TestLimitsFromConfigBounds
+--- PASS: TestLimitsFromConfigBounds (0.00s)
+=== RUN   TestHeaderOrderAndCaseThroughGost
+--- PASS: TestHeaderOrderAndCaseThroughGost (0.00s)
+=== RUN   TestChunkedAndContentLength
+--- PASS: TestChunkedAndContentLength (0.00s)
+=== RUN   TestExpect100Continue
+--- PASS: TestExpect100Continue (0.21s)
+=== RUN   TestExpect100RejectedDoesNotForwardBody
+--- PASS: TestExpect100RejectedDoesNotForwardBody (0.21s)
+=== RUN   TestWebSocketUpgrade
+--- PASS: TestWebSocketUpgrade (0.01s)
+=== RUN   TestKeepAliveDifferentHostsAndSameHostReuse
+--- PASS: TestKeepAliveDifferentHostsAndSameHostReuse (0.01s)
+=== RUN   TestLastAtNodeID
+--- PASS: TestLastAtNodeID (0.02s)
+=== RUN   TestLocalRejectsDoNotDial
+=== RUN   TestLocalRejectsDoNotDial/auth
+=== RUN   TestLocalRejectsDoNotDial/no-node
+=== RUN   TestLocalRejectsDoNotDial/origin-form
+=== RUN   TestLocalRejectsDoNotDial/https
+--- PASS: TestLocalRejectsDoNotDial (0.01s)
+    --- PASS: TestLocalRejectsDoNotDial/auth (0.00s)
+    --- PASS: TestLocalRejectsDoNotDial/no-node (0.00s)
+    --- PASS: TestLocalRejectsDoNotDial/origin-form (0.00s)
+    --- PASS: TestLocalRejectsDoNotDial/https (0.00s)
+=== RUN   TestBadCredentialDoesNotDial
+--- PASS: TestBadCredentialDoesNotDial (0.00s)
+=== RUN   TestL2Auth407
+--- PASS: TestL2Auth407 (0.00s)
+=== RUN   TestL2Status502
+--- PASS: TestL2Status502 (0.00s)
+=== RUN   TestDialAndResolve502
+=== RUN   TestDialAndResolve502/dial
+=== RUN   TestDialAndResolve502/unknown
+=== RUN   TestDialAndResolve502/no-healthy
+=== RUN   TestDialAndResolve502/empty
+=== RUN   TestDialAndResolve502/resolver
+--- PASS: TestDialAndResolve502 (0.02s)
+    --- PASS: TestDialAndResolve502/dial (0.00s)
+    --- PASS: TestDialAndResolve502/unknown (0.00s)
+    --- PASS: TestDialAndResolve502/no-healthy (0.00s)
+    --- PASS: TestDialAndResolve502/empty (0.00s)
+    --- PASS: TestDialAndResolve502/resolver (0.00s)
+=== RUN   TestL2ResponseTimeout
+--- PASS: TestL2ResponseTimeout (0.30s)
+=== RUN   TestClientIdleTimeout
+--- PASS: TestClientIdleTimeout (0.20s)
+=== RUN   TestAbsoluteFormMutations
+--- PASS: TestAbsoluteFormMutations (0.00s)
+=== RUN   TestHopHeaderStripAndHEAD
+--- PASS: TestHopHeaderStripAndHEAD (0.00s)
+=== RUN   TestApproachAGostRewritesHeaders
+--- PASS: TestApproachAGostRewritesHeaders (0.00s)
+=== RUN   TestClientHelloBytesJA3JA4
+    httpflow_test.go:1739: ja3=8520497e701d328ca849031134f31582 ja4=t13d0206h2_84cdcbea686c_fb71836bce29
+--- PASS: TestClientHelloBytesJA3JA4 (0.04s)
+=== RUN   TestHTTPL2WriteAndDeadline
+=== RUN   TestHTTPL2WriteAndDeadline/write-error
+=== RUN   TestHTTPL2WriteAndDeadline/short-write
+=== RUN   TestHTTPL2WriteAndDeadline/deadline
+--- PASS: TestHTTPL2WriteAndDeadline (0.01s)
+    --- PASS: TestHTTPL2WriteAndDeadline/write-error (0.00s)
+    --- PASS: TestHTTPL2WriteAndDeadline/short-write (0.00s)
+    --- PASS: TestHTTPL2WriteAndDeadline/deadline (0.00s)
+=== RUN   TestHTTPClientGone
+--- PASS: TestHTTPClientGone (0.00s)
+=== RUN   TestHTTPResponseAfter100IsL2Response
+--- PASS: TestHTTPResponseAfter100IsL2Response (0.01s)
+=== RUN   TestClosedHTTPLabels
+--- PASS: TestClosedHTTPLabels (0.00s)
+=== RUN   TestKeepAliveSameHostGauge
+--- PASS: TestKeepAliveSameHostGauge (0.01s)
+=== RUN   TestStaleKeepAliveRetry
+--- PASS: TestStaleKeepAliveRetry (5.01s)
+=== RUN   TestStaleNonIdempotentPOST
+--- PASS: TestStaleNonIdempotentPOST (0.00s)
+=== RUN   TestBodyAbortAfterStatus
+--- PASS: TestBodyAbortAfterStatus (0.01s)
+=== RUN   TestIncompleteHeadRejectAttribution
+=== RUN   TestIncompleteHeadRejectAttribution/partial-connect
+=== RUN   TestIncompleteHeadRejectAttribution/partial-get
+=== RUN   TestIncompleteHeadRejectAttribution/empty
+--- PASS: TestIncompleteHeadRejectAttribution (0.01s)
+    --- PASS: TestIncompleteHeadRejectAttribution/partial-connect (0.00s)
+    --- PASS: TestIncompleteHeadRejectAttribution/partial-get (0.00s)
+    --- PASS: TestIncompleteHeadRejectAttribution/empty (0.00s)
 PASS
-ok  	github.com/f-ishelly/relay-proxy/internal/docfixture/proxy	339.909s
+ok  	github.com/f-ishelly/relay-proxy/internal/docfixture/proxy	167.100s
