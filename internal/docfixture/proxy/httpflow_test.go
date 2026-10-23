@@ -900,6 +900,7 @@ func TestExpect100Continue(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("origin did not see body")
 	}
+	_ = c.Close()
 	handlers.Wait()
 	snap := waitCalls(t, func(c metricSnap) bool {
 		return len(c.HTTPObserves) == 1 && len(c.Events) == 1 && c.HTTPEntered == 1 && c.HTTPLeft == 1 && c.HTTPTunnels == 1
@@ -1467,18 +1468,24 @@ func TestL2ResponseTimeout(t *testing.T) {
 func TestClientIdleTimeout(t *testing.T) {
 	resetMetrics()
 	lim := defaultLimits()
-	lim.headerDeadline = 200 * time.Millisecond
+	lim.tunnelIdle = 200 * time.Millisecond
+	lim.headerDeadline = 2 * time.Second
 	l1 := startL1Limited(t, staticResolver{}, lim)
 	c, err := net.Dial("tcp", l1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_ = c.SetReadDeadline(time.Now().Add(3 * time.Second))
+	start := time.Now()
 	buf := make([]byte, 1)
 	_, err = c.Read(buf)
+	elapsed := time.Since(start)
 	if err == nil {
 		t.Fatal("expected idle close")
+	}
+	if elapsed > time.Second {
+		t.Fatalf("zero-byte wait used header deadline: %s", elapsed)
 	}
 	handlers.Wait()
 	snap := snapMetrics()
@@ -2316,6 +2323,7 @@ func TestHTTPResponseAfter100IsL2Response(t *testing.T) {
 func TestClosedHTTPLabels(t *testing.T) {
 	resetMetrics()
 	l1metrics.RejectHTTP("typo")
+	l1metrics.Fail502("node-z", "typo")
 	l1metrics.FailHTTP("node-a", "client_gone")
 	l1metrics.FailHTTP("node-a", "nope")
 	l1metrics.AbortHTTP("node-a", "dial")
@@ -2327,7 +2335,13 @@ func TestClosedHTTPLabels(t *testing.T) {
 	l1metrics.AddHTTPBytes("node-a", l1metrics.DirUp, 0)
 	l1metrics.TryEmit(l1metrics.MeterEvent{Protocol: "nope", Result: "ok"})
 	snap := snapMetrics()
-	if len(snap.HTTPRejects) != 0 || len(snap.HTTPFails) != 0 || len(snap.HTTPAborts) != 0 || len(snap.HTTPObserves) != 0 || len(snap.HTTPSetup) != 0 || snap.HTTPUp != 0 || len(snap.Events) != 0 || snap.Drops != 1 {
+	if len(snap.Fails) != 1 || snap.Fails[0] != [2]string{"node-z", l1metrics.ReasonOther} {
+		t.Fatalf("Fail502 fallback %#v", snap.Fails)
+	}
+	if len(snap.HTTPFails) != 2 || snap.HTTPFails[0] != [2]string{"node-a", l1metrics.ReasonOther} || snap.HTTPFails[1] != [2]string{"node-a", l1metrics.ReasonOther} {
+		t.Fatalf("FailHTTP fallback %#v", snap.HTTPFails)
+	}
+	if len(snap.HTTPRejects) != 0 || len(snap.HTTPAborts) != 0 || len(snap.HTTPObserves) != 0 || len(snap.HTTPSetup) != 0 || snap.HTTPUp != 0 || len(snap.Events) != 0 || snap.Drops != 1 {
 		t.Fatalf("closed set created series: %+v", snap)
 	}
 }

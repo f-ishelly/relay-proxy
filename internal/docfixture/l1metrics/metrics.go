@@ -31,6 +31,10 @@ const (
 	ReasonEmptyAddr     = "empty_addr"
 	ReasonResolverError = "resolver_error"
 
+	// ReasonOther 是 Fail502 / FailHTTP 收到闭合集合以外的 reason 时的回退。
+	// 仍然计数，不静默丢掉。node_id 用调用方传入的值。
+	ReasonOther = "other"
+
 	// ReasonClientGone 只用于 proxy_client_abort_total，以及建连时延的 result。
 	// 不要传给 Fail502。它不进入上游失败率的分子。
 	ReasonClientGone = "client_gone"
@@ -97,7 +101,7 @@ var (
 
 	proxyUpstreamFail = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "proxy_upstream_fail_total",
-		Help: "没有建成隧道的上游结果。l2_auth 对应交给客户端的 L2 407，其余 reason 对应 502。不含 client_gone。unknown_node、empty_addr、resolver_error 只出现在 node_id=unknown。",
+		Help: "没有建成隧道的上游结果。l2_auth 对应交给客户端的 L2 407，其余 reason 对应 502。不含 client_gone。unknown_node、empty_addr、resolver_error 只出现在 node_id=unknown。集合外的 reason 记 other。",
 	}, []string{"node_id", "reason"})
 
 	proxyClientReject = prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -155,7 +159,7 @@ var (
 
 	proxyHTTPUpstreamFail = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "proxy_http_upstream_fail_total",
-		Help: "明文请求没有完成。reason 比 proxy_upstream_fail_total 多 stale_tunnel，不含 client_gone。已经写出源站字节时不再补 502，计数仍然加。unknown_node、empty_addr、resolver_error 只出现在 node_id=unknown。",
+		Help: "明文请求没有完成。reason 比 proxy_upstream_fail_total 多 stale_tunnel，不含 client_gone。已经写出源站字节时不再补 502，计数仍然加。unknown_node、empty_addr、resolver_error 只出现在 node_id=unknown。集合外的 reason 记 other。",
 	}, []string{"node_id", "reason"})
 
 	proxyHTTPClientReject = prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -249,10 +253,10 @@ func sentinelNode(nodeID, reason string) string {
 // ReasonNoUpstream、ReasonDial、ReasonL2Write、ReasonL2Deadline、ReasonL2Response、ReasonL2Status
 // 由调用方接着对客户端写 502。ReasonL2Auth 时调用方把 L2 的 407 原样交还，不改写成 502。
 // ReasonUnknownNode、ReasonEmptyAddr、ReasonResolverError 也写 502，标签 node_id 固定为 unknown。
-// ReasonClientGone 不是这里的 reason。集合外的字符串直接丢掉。
+// ReasonClientGone 不是这里的 reason。集合外的字符串改记 ReasonOther，不丢掉。
 func Fail502(nodeID, reason string) {
 	if !knownUpstreamFail(reason) {
-		return
+		reason = ReasonOther
 	}
 	proxyUpstreamFail.WithLabelValues(sentinelNode(nodeID, reason), reason).Inc()
 }
@@ -345,10 +349,10 @@ func knownHTTPReject(reason string) bool {
 
 // FailHTTP 增加 proxy_http_upstream_fail_total。
 // reason 是七个上游失败值再加 stale_tunnel，以及三种只出现在 unknown 上的解析失败，不含 client_gone。
-// 其它字符串直接丢掉。已经向客户端写出过源站字节时，调用方不再补 502，这个计数仍然加。
+// 其它字符串改记 ReasonOther，不丢掉。已经向客户端写出过源站字节时，调用方不再补 502，这个计数仍然加。
 func FailHTTP(nodeID, reason string) {
 	if !knownHTTPFail(reason) {
-		return
+		reason = ReasonOther
 	}
 	proxyHTTPUpstreamFail.WithLabelValues(sentinelNode(nodeID, reason), reason).Inc()
 }

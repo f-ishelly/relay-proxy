@@ -919,6 +919,172 @@ func TestSlowlorisHeaderDeadline(t *testing.T) {
 	}
 }
 
+func serveKeepAliveOrigin(t *testing.T) string {
+	t.Helper()
+	return serveRaw(t, func(c net.Conn) {
+		defer c.Close()
+		br := bufio.NewReader(c)
+		_ = c.SetDeadline(time.Now().Add(4 * time.Second))
+		if _, err := readHTTPHead(br); err != nil {
+			return
+		}
+		if _, err := io.WriteString(c, "HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
+			return
+		}
+		for {
+			if _, err := readOriginRequest(br); err != nil {
+				return
+			}
+			if _, err := io.WriteString(c, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"); err != nil {
+				return
+			}
+		}
+	})
+}
+
+func TestKeepAliveIdleSurvivesHeaderDeadline(t *testing.T) {
+	resetMetrics()
+	origin := serveKeepAliveOrigin(t)
+	lim := defaultLimits()
+	lim.headerDeadline = 200 * time.Millisecond
+	lim.tunnelIdle = time.Second
+	l1 := startL1Limited(t, mapResolver{m: map[string]string{"node-a": origin}}, lim)
+	c, err := net.Dial("tcp", l1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(3 * time.Second))
+	br := bufio.NewReader(c)
+	req := fmt.Sprintf("GET http://%s/a HTTP/1.1\r\nHost: h\r\nProxy-Authorization: Basic %s\r\n\r\n",
+		origin, basicToken("app@node-a", "s3cret"))
+	if _, err := io.WriteString(c, req); err != nil {
+		t.Fatal(err)
+	}
+	head, err := readHTTPHead(br)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustStatus(t, head, 200)
+	time.Sleep(450 * time.Millisecond)
+	if _, err := io.WriteString(c, req); err != nil {
+		t.Fatalf("keep-alive closed inside header deadline: %v", err)
+	}
+	head, err = readHTTPHead(br)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustStatus(t, head, 200)
+	_ = c.Close()
+	handlers.Wait()
+	snap := snapMetrics()
+	if len(snap.HTTPRejects) != 0 {
+		t.Fatalf("idle keep-alive counted a reject %#v", snap.HTTPRejects)
+	}
+	if len(snap.HTTPObserves) != 2 {
+		t.Fatalf("observes %#v", snap.HTTPObserves)
+	}
+}
+
+func TestKeepAliveTrickleHeader(t *testing.T) {
+	resetMetrics()
+	origin := serveKeepAliveOrigin(t)
+	lim := defaultLimits()
+	lim.headerDeadline = 200 * time.Millisecond
+	lim.tunnelIdle = 5 * time.Second
+	l1 := startL1Limited(t, mapResolver{m: map[string]string{"node-a": origin}}, lim)
+	c, err := net.Dial("tcp", l1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(3 * time.Second))
+	br := bufio.NewReader(c)
+	req := fmt.Sprintf("GET http://%s/a HTTP/1.1\r\nHost: h\r\nProxy-Authorization: Basic %s\r\n\r\n",
+		origin, basicToken("app@node-a", "s3cret"))
+	if _, err := io.WriteString(c, req); err != nil {
+		t.Fatal(err)
+	}
+	head, err := readHTTPHead(br)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustStatus(t, head, 200)
+	start := time.Now()
+	go func() {
+		if _, err := c.Write([]byte("GET ")); err != nil {
+			return
+		}
+		tick := time.NewTicker(40 * time.Millisecond)
+		defer tick.Stop()
+		for range tick.C {
+			if _, err := c.Write([]byte("x")); err != nil {
+				return
+			}
+		}
+	}()
+	buf := make([]byte, 256)
+	n, _ := c.Read(buf)
+	elapsed := time.Since(start)
+	if elapsed < 150*time.Millisecond || elapsed > time.Second {
+		t.Fatalf("second header cut at %s", elapsed)
+	}
+	handlers.Wait()
+	snap := snapMetrics()
+	if len(snap.HTTPRejects) != 1 || snap.HTTPRejects[0] != l1metrics.ReasonRejectHeaderTimeout {
+		t.Fatalf("rejects %#v status %s", snap.HTTPRejects, strconv.Quote(string(buf[:n])))
+	}
+	if len(snap.HTTPObserves) != 1 || snap.HTTPObserves[0] != l1metrics.ResultOK {
+		t.Fatalf("first request %#v", snap.HTTPObserves)
+	}
+}
+
+func TestConnectHalfClosePreemptsTunnelIdle(t *testing.T) {
+	resetMetrics()
+	origin := serveRaw(t, func(c net.Conn) {
+		defer c.Close()
+		br := bufio.NewReader(c)
+		_ = c.SetDeadline(time.Now().Add(3 * time.Second))
+		if _, err := readHTTPHead(br); err != nil {
+			return
+		}
+		if _, err := io.WriteString(c, "HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
+			return
+		}
+		if cw, ok := c.(interface{ CloseWrite() error }); ok {
+			_ = cw.CloseWrite()
+		}
+		_, _ = io.Copy(io.Discard, c)
+	})
+	lim := defaultLimits()
+	lim.tunnelIdle = 120 * time.Millisecond
+	lim.halfCloseIdle = 700 * time.Millisecond
+	l1 := startL1Limited(t, mapResolver{m: map[string]string{"node-a": origin}}, lim)
+	c, err := net.Dial("tcp", l1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	req := fmt.Sprintf("CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nProxy-Authorization: Basic %s\r\n\r\n",
+		basicToken("app@node-a", "s3cret"))
+	_ = c.SetDeadline(time.Now().Add(3 * time.Second))
+	resp := writeAndRead(t, c, req)
+	mustStatus(t, resp, 200)
+	start := time.Now()
+	handlers.Wait()
+	elapsed := time.Since(start)
+	if elapsed < 400*time.Millisecond {
+		t.Fatalf("tunnel idle closed the half-close at %s", elapsed)
+	}
+	snap := snapMetrics()
+	if snap.TunnelByReason[l1metrics.ReasonAbortIdleTimeout] != 0 {
+		t.Fatalf("half-close recorded as abort %#v", snap.TunnelByReason)
+	}
+	if snap.Entered < 1 || len(snap.Observes) == 0 || snap.Observes[0] != l1metrics.ResultOK {
+		t.Fatalf("tunnel was not established: %+v", snap)
+	}
+}
+
 func TestLimitsFromConfigBounds(t *testing.T) {
 	dir := t.TempDir()
 	write := func(body string) string {
@@ -952,6 +1118,17 @@ func TestLimitsFromConfigBounds(t *testing.T) {
 	}
 	if _, err := LimitsFromConfig("", []string{"-tunnel-idle=10s"}); err == nil {
 		t.Fatal("flag left half-close idle above tunnel idle")
+	}
+	if _, err := LimitsFromConfig(write("{\"tunnel_idle\":\"5m\"}\n"), nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LimitsFromConfig(write(`{"tunnel_idle":"5m"}{"header_deadline":"1s"}`), nil); err == nil {
+		t.Fatal("trailing JSON object accepted")
+	}
+	for _, arg := range []string{"-tunnel-idle=1h1s", "-half-close-idle=1h1s", "-l2-response-timeout=2m1s", "-header-deadline=1m1s", "-tunnel-idle=0s", "-header-deadline=-1s"} {
+		if _, err := LimitsFromConfig("", []string{arg}); err == nil {
+			t.Fatalf("flag %s accepted", arg)
+		}
 	}
 	lim, err := LimitsFromConfig(write(`{"tunnel_idle":"1h","half_close_idle":"1h","l2_response_timeout":"2m","header_deadline":"1m"}`), nil)
 	if err != nil {

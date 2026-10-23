@@ -43,7 +43,7 @@ func serveProxyConnLimited(conn net.Conn, resolver Resolver, lim proxyLimits) er
 	br := bufio.NewReaderSize(mc, maxHTTPHead)
 	head, err := readRequestHead(mc, br)
 	if err != nil {
-		// 一个字节都没有：不计数。零字节的空闲超时也在这里，不记拒绝。
+		// 一个字节都没有：不计数。等第一个字节的空闲是 tunnelIdle，不记拒绝。
 		// 已经读到一部分才超时：slowloris，记 header_timeout。
 		// 已经读到一部分但不是超时：头不完整，记 bad_target。
 		// 请求行已经是 CONNECT 时，这两项走 CONNECT 的拒绝计数。
@@ -1171,7 +1171,8 @@ func parseChunkSize(line []byte) (int64, error) {
 }
 
 // pipeUpgrade 在 101 之后进入与 CONNECT 相同的双向字节转发。
-// 半关闭后的空闲上限是这条连接的 halfCloseIdle，整条隧道的空闲兜底仍是 tunnelIdle。
+// 半关闭后的空闲上限是这条连接的 halfCloseIdle。半关闭一开始就停掉会话空闲计时，
+// 整条隧道的 tunnelIdle 不再把这次拆除记成 idle_timeout。
 // io.Copy 在 EOF 上返回 nil。随后的 closeWrite 失败不当成隧道中断，也不去关另一端，
 // 否则另一方向会读到 use of closed network connection，把正常的 101 结束记成 abort。
 // 某一方向先失败时，用 sync.Once 记下第一个真实错误，再关两端。
@@ -1224,6 +1225,10 @@ func pipeUpgrade(client net.Conn, clientR io.Reader, up net.Conn, upR io.Reader,
 	go func() { relay(client, upR, clientMode, false) }()
 	<-done
 	<-done
+	if kept.reason == l1metrics.ReasonAbortIdleTimeout &&
+		((clientMode != nil && clientMode.half.Load()) || (upMode != nil && upMode.half.Load())) {
+		return "", kept.err
+	}
 	return kept.reason, kept.err
 }
 
@@ -1261,15 +1266,20 @@ func writeHTTPError(w io.Writer, status int, reason, header string) {
 	_, _ = io.WriteString(w, b.String())
 }
 
-// readRequestHead 用这条连接的 headerDeadline 做绝对截止。
-// 截止时间在开始读头时设一次，读到字节不顺延，slowloris 不能靠慢慢送字节把连接留住。
-// 读完或失败后清掉，后面的正文和空闲仍用 tunnelIdle。
+// readRequestHead 先等请求头的第一个字节，这段用 tunnelIdle，keep-alive 空等可以到 5 分钟。
+// 第一个字节进缓冲之后才武装 headerDeadline：绝对截止，读到后续字节不顺延。
+// 读完或失败后清掉，后面的正文和空闲仍用 tunnelIdle。一个字节都没有不记 header_timeout。
 func readRequestHead(mc *modeConn, br *bufio.Reader) ([]byte, error) {
-	d := headerDeadline
-	if mc != nil && mc.session != nil && mc.session.lim.headerDeadline > 0 {
-		d = mc.session.lim.headerDeadline
+	if br.Buffered() == 0 {
+		if _, err := br.Peek(1); err != nil {
+			return nil, err
+		}
 	}
 	if mc != nil {
+		d := headerDeadline
+		if mc.session != nil && mc.session.lim.headerDeadline > 0 {
+			d = mc.session.lim.headerDeadline
+		}
 		mc.beginHeader(time.Now().Add(d))
 		defer mc.endHeader()
 	}
@@ -1422,7 +1432,7 @@ func isTimeout(err error) bool {
 
 // modeConn 在每次 Read 前刷新空闲截止时间。半关闭后改用这条连接的 halfCloseIdle。
 // disabled 时不再改截止时间，留给 handleConnect 自己的 idleConn。
-// headerUntil 非零时是读请求头的绝对截止，不因读到字节而刷新，也不去拨会话空闲计时。
+// headerUntil 非零时是已经读到请求头第一个字节之后的绝对截止，不因后续字节而刷新，也不去拨会话空闲计时。
 // 会话空闲计时到点会先置位再 Close。这时的读错误记成 errIdleExpired，而不是 net.ErrClosed。
 type modeConn struct {
 	net.Conn
@@ -1446,6 +1456,7 @@ func (m *modeConn) endHeader() {
 }
 
 // noteHalf 和 Read 共用 mu，避免 Read 在看到半关闭之前把截止时间又拨回整条隧道的空闲。
+// 同时停掉会话空闲计时，半关闭期间 tunnelIdle 不再先到点。
 func (m *modeConn) noteHalf(d time.Duration) {
 	m.mu.Lock()
 	m.half.Store(true)
@@ -1454,6 +1465,9 @@ func (m *modeConn) noteHalf(d time.Duration) {
 	}
 	_ = m.Conn.SetReadDeadline(time.Now().Add(d))
 	m.mu.Unlock()
+	if m.session != nil {
+		m.session.stop()
+	}
 }
 
 func (m *modeConn) Read(p []byte) (int, error) {
@@ -1478,11 +1492,12 @@ func (m *modeConn) Read(p []byte) (int, error) {
 	if err == nil || m.session == nil {
 		return n, err
 	}
+	// 半关闭优先：会话计时器先关掉连接时也不把这次读记成整条隧道的 idle_timeout。
+	if m.half.Load() && (isTimeout(err) || m.session.idleExpired.Load()) {
+		return n, errHalfCloseIdle
+	}
 	if m.session.idleExpired.Load() {
 		return n, errIdleExpired
-	}
-	if m.half.Load() && isTimeout(err) {
-		return n, errHalfCloseIdle
 	}
 	return n, err
 }

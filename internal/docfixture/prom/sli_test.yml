@@ -429,13 +429,14 @@ tests:
             exp_annotations:
               summary: combined failure rate above 2%
 
-  # node_id="unknown" stays out of the healthy failure rate.
-  # A wiped table is a large unknown_node series and no healthy samples: the healthy
-  # page stays silent, and ProxyUnknownUpstream fires.
+  # unknown_node is client misconfig after auth. A large volume does not page,
+  # and it stays out of the healthy failure rate.
   - interval: 1m
     input_series:
       - series: 'proxy_http_upstream_fail_total{node_id="unknown",reason="unknown_node"}'
-        values: '0+400x40'
+        values: '0+80x40'
+      - series: 'proxy_upstream_fail_total{node_id="unknown",reason="unknown_node"}'
+        values: '0+80x40'
     promql_expr_test:
       - eval_time: 15m
         expr: sum(increase(proxy_http_upstream_fail_total{node_id!="unknown"}[5m])) or vector(0)
@@ -443,11 +444,36 @@ tests:
           - labels: '{}'
             value: 0
     alert_rule_test:
-      - eval_time: 3m
+      - eval_time: 15m
         alertname: ProxyHTTPFailureRate
         exp_alerts: []
+      - eval_time: 15m
+        alertname: ProxyHTTPFailureRateByNode
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: ProxyConnectFailureRate
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: ProxyResolverUpstream
+        exp_alerts: []
+
+  # 20% resolver_error against healthy oks. The healthy rate stays at 0 because the
+  # failures are on node_id=unknown. ProxyResolverUpstream still pages: no ratio gate.
+  - interval: 1m
+    input_series:
+      - series: 'proxy_http_upstream_fail_total{node_id="unknown",reason="resolver_error"}'
+        values: '0+20x40'
+      - series: 'proxy_http_request_latency_ms_count{node_id="n1",result="ok"}'
+        values: '0+80x40'
+    promql_expr_test:
+      - eval_time: 15m
+        expr: (sum(increase(proxy_http_upstream_fail_total{node_id="unknown",reason="resolver_error"}[5m])) or vector(0))
+        exp_samples:
+          - labels: '{}'
+            value: 100
+    alert_rule_test:
       - eval_time: 3m
-        alertname: ProxyUnknownUpstream
+        alertname: ProxyResolverUpstream
         exp_alerts: []
       - eval_time: 15m
         alertname: ProxyHTTPFailureRate
@@ -456,14 +482,69 @@ tests:
         alertname: ProxyHTTPFailureRateByNode
         exp_alerts: []
       - eval_time: 15m
-        alertname: ProxyUnknownUpstream
+        alertname: ProxyResolverUpstream
         exp_alerts:
           - exp_labels:
               severity: page
             exp_annotations:
-              summary: routing failures on node_id=unknown above half of all attempts
+              summary: resolver failures on node_id=unknown
 
-  # A few stray unknown lookups do not page, and do not move the healthy rate.
+  # Low-traffic total outage on the CONNECT counter only: 15 empty_addr in 5m, no ok series.
+  # The healthy denominator never reaches 100. The server-side alert still pages.
+  - interval: 1m
+    input_series:
+      - series: 'proxy_upstream_fail_total{node_id="unknown",reason="empty_addr"}'
+        values: '0+3x40'
+    promql_expr_test:
+      - eval_time: 15m
+        expr: (sum(increase(proxy_upstream_fail_total{node_id="unknown",reason="empty_addr"}[5m])) or vector(0))
+        exp_samples:
+          - labels: '{}'
+            value: 15
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: ProxyResolverUpstream
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: ProxyConnectFailureRate
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: ProxyHTTPFailureRate
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: ProxyResolverUpstream
+        exp_alerts:
+          - exp_labels:
+              severity: page
+            exp_annotations:
+              summary: resolver failures on node_id=unknown
+
+  # Each protocol contributes 5. Either counter alone stays under 10; together they page.
+  - interval: 1m
+    input_series:
+      - series: 'proxy_upstream_fail_total{node_id="unknown",reason="resolver_error"}'
+        values: '0+1x40'
+      - series: 'proxy_http_upstream_fail_total{node_id="unknown",reason="empty_addr"}'
+        values: '0+1x40'
+    promql_expr_test:
+      - eval_time: 15m
+        expr: (sum(increase(proxy_upstream_fail_total{node_id="unknown",reason=~"empty_addr|resolver_error"}[5m])) or vector(0)) + (sum(increase(proxy_http_upstream_fail_total{node_id="unknown",reason=~"empty_addr|resolver_error"}[5m])) or vector(0))
+        exp_samples:
+          - labels: '{}'
+            value: 10
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: ProxyResolverUpstream
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: ProxyResolverUpstream
+        exp_alerts:
+          - exp_labels:
+              severity: page
+            exp_annotations:
+              summary: resolver failures on node_id=unknown
+
+  # A few stray resolver errors (5 in 5m) do not page and do not move the healthy rate.
   - interval: 1m
     input_series:
       - series: 'proxy_http_upstream_fail_total{node_id="unknown",reason="resolver_error"}'
@@ -480,5 +561,5 @@ tests:
         alertname: ProxyHTTPFailureRateByNode
         exp_alerts: []
       - eval_time: 15m
-        alertname: ProxyUnknownUpstream
+        alertname: ProxyResolverUpstream
         exp_alerts: []

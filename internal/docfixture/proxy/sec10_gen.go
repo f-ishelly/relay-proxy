@@ -79,8 +79,9 @@ var halfCloseIdleTimeout = 30 * time.Second
 // gost 的 idleTimeout 默认是 0（不限制），L1 不能靠它把两边都安静的隧道收掉。默认 5 分钟。
 var tunnelIdleTimeout = 5 * time.Minute
 
-// headerDeadline 是读请求头的绝对上限，从这次开始读头起算，不因读到一个字节而顺延。
-// 默认 10s。用来切断 slowloris。一个字节都没有仍不记拒绝；已经读到一部分才到点记 header_timeout。
+// headerDeadline 是读请求头的绝对上限。等第一个字节用 tunnelIdle，不占用这段截止。
+// 读到第一个字节之后设一次，之后的读不顺延。默认 10s。用来切断 slowloris。
+// 一个字节都没有仍不记拒绝；已经读到一部分才到点记 header_timeout。
 var headerDeadline = 10 * time.Second
 
 // 配置里的时长上限。超过就拒绝这份配置，避免把空闲或请求头等待设成几天。
@@ -183,6 +184,9 @@ func LimitsFromConfig(path string, args []string) (proxyLimits, error) {
 		var cfg proxyFile
 		if err := dec.Decode(&cfg); err != nil {
 			return proxyLimits{}, err
+		}
+		if dec.More() {
+			return proxyLimits{}, fmt.Errorf("trailing data after JSON object")
 		}
 		if err := cfg.apply(&lim); err != nil {
 			return proxyLimits{}, err
@@ -523,15 +527,18 @@ func handleConnect(clientConn net.Conn, username, password, target string, resol
 		// closeWrite 失败不当成隧道中断，也不关另一端。对端经常已经先关了，
 		// 这时再把两端都 Close，另一方向会读到 net.ErrClosed，把正常半关闭记成中断。
 		// 明文 HTTP 的 pipeUpgrade 同样忽略这个错误。之后的空闲仍由 halfCloseIdle 收掉。
+		// 半关闭一旦开始就停掉整条隧道的计时：tunnelIdle 先到点不再记 idle_timeout。
 		_ = closeWrite(dst)
 		reverse.armHalf(lim.halfCloseIdle)
+		idle.stop()
 	}
 	// 客户端先 FIN：反方向是 upstreamR。上游先 FIN：反方向是 clientR。同一套空闲计时。
 	go func() { relay(upstreamConn, clientPipe, upstreamR, l1metrics.DirUp, &bytesUp) }()
 	go func() { relay(clientConn, br, clientR, l1metrics.DirDown, &bytesDown) }()
 	<-done
 	<-done
-	if errors.Is(kept, errIdleExpired) {
+	// 任一侧已经半关闭时，空闲到点是拆除，不是隧道中断。
+	if errors.Is(kept, errIdleExpired) && !clientR.halfClosed.Load() && !upstreamR.halfClosed.Load() {
 		l1metrics.AddTunnelAbort(nodeID, l1metrics.ReasonAbortIdleTimeout)
 	}
 	return kept
@@ -576,11 +583,12 @@ func (c *idleConn) Read(p []byte) (int, error) {
 	if err == nil {
 		return n, nil
 	}
+	// 半关闭优先于整条隧道的空闲：计时器先关掉连接时也不记 idle_timeout。
+	if c.halfClosed.Load() && (isTimeout(err) || (c.expired != nil && c.expired.Load())) {
+		return n, errHalfCloseIdle
+	}
 	if c.expired != nil && c.expired.Load() {
 		return n, errIdleExpired
-	}
-	if c.halfClosed.Load() && isTimeout(err) {
-		return n, errHalfCloseIdle
 	}
 	return n, err
 }
