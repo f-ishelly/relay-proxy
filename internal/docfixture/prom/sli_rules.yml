@@ -1,0 +1,98 @@
+# §7.3. S(x) is sum(increase(x[5m])) or vector(0).
+# A missing series must not turn the whole expression into an empty vector.
+# The denominator must be > 0 so a quiet process does not page on 0/0.
+groups:
+  - name: proxy-sli
+    rules:
+      - alert: ProxyConnectFailureRate
+        expr: |
+          (
+            (sum(increase(proxy_upstream_fail_total[5m])) or vector(0))
+            /
+            (
+              (sum(increase(proxy_upstream_fail_total[5m])) or vector(0))
+              +
+              (sum(increase(proxy_connect_latency_ms_count{result="ok"}[5m])) or vector(0))
+            )
+          ) > 0.02
+          and
+          (
+            (sum(increase(proxy_upstream_fail_total[5m])) or vector(0))
+            +
+            (sum(increase(proxy_connect_latency_ms_count{result="ok"}[5m])) or vector(0))
+          ) > 0
+        for: 0m
+        labels:
+          severity: page
+        annotations:
+          summary: CONNECT failure rate above 2%
+      - alert: ProxyHTTPFailureRate
+        expr: |
+          (
+            (sum(increase(proxy_http_upstream_fail_total[5m])) or vector(0))
+            /
+            (
+              (sum(increase(proxy_http_upstream_fail_total[5m])) or vector(0))
+              +
+              (sum(increase(proxy_http_request_latency_ms_count{result="ok"}[5m])) or vector(0))
+            )
+          ) > 0.02
+          and
+          (
+            (sum(increase(proxy_http_upstream_fail_total[5m])) or vector(0))
+            +
+            (sum(increase(proxy_http_request_latency_ms_count{result="ok"}[5m])) or vector(0))
+          ) > 0
+        for: 0m
+        labels:
+          severity: page
+        annotations:
+          summary: plain HTTP failure rate above 2%
+      - alert: ProxyCombinedFailureRate
+        expr: |
+          (
+            (
+              (sum(increase(proxy_upstream_fail_total[5m])) or vector(0))
+              +
+              (sum(increase(proxy_http_upstream_fail_total[5m])) or vector(0))
+            )
+            /
+            (
+              (sum(increase(proxy_upstream_fail_total[5m])) or vector(0))
+              +
+              (sum(increase(proxy_http_upstream_fail_total[5m])) or vector(0))
+              +
+              (sum(increase(proxy_connect_latency_ms_count{result="ok"}[5m])) or vector(0))
+              +
+              (sum(increase(proxy_http_request_latency_ms_count{result="ok"}[5m])) or vector(0))
+            )
+          ) > 0.02
+          and
+          (
+            (sum(increase(proxy_upstream_fail_total[5m])) or vector(0))
+            +
+            (sum(increase(proxy_http_upstream_fail_total[5m])) or vector(0))
+            +
+            (sum(increase(proxy_connect_latency_ms_count{result="ok"}[5m])) or vector(0))
+            +
+            (sum(increase(proxy_http_request_latency_ms_count{result="ok"}[5m])) or vector(0))
+          ) > 0
+        for: 0m
+        labels:
+          severity: page
+        annotations:
+          summary: combined failure rate above 2%
+      - alert: ProxyConnectLatencyP95
+        expr: histogram_quantile(0.95, sum by (le) (rate(proxy_connect_latency_ms_bucket{result="ok"}[5m]))) > 200
+        for: 0m
+        labels:
+          severity: page
+        annotations:
+          summary: CONNECT P95 above 200ms
+      - alert: ProxyHTTPTunnelSetupP95
+        expr: histogram_quantile(0.95, sum by (le) (rate(proxy_http_tunnel_setup_ms_bucket{result="ok"}[5m]))) > 200
+        for: 0m
+        labels:
+          severity: page
+        annotations:
+          summary: plain HTTP tunnel setup P95 above 200ms
