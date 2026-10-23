@@ -47,6 +47,8 @@ const (
 	ReasonRejectNoNode        = "no_node"
 	ReasonRejectBadTarget     = "bad_target"
 	ReasonRejectBadCredential = "bad_credential"
+	// ReasonRejectHeaderTimeout 是已经读到一部分请求头之后的读超时。零字节空闲不记。
+	ReasonRejectHeaderTimeout = "header_timeout"
 
 	// DirUp 是客户端到 L2 的隧道字节。DirDown 是 L2 到客户端。
 	DirUp   = "up"
@@ -151,7 +153,7 @@ var (
 
 	proxyHTTPClientReject = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "proxy_http_client_reject_total",
-		Help: "明文请求在拨 L2 之前，L1 本地返回 400 或 407 的次数。没有 node_id。",
+		Help: "明文请求在拨 L2 之前，L1 本地返回 400 或 407 的次数。没有 node_id。header_timeout 是读到一部分请求头后的超时。",
 	}, []string{"reason"})
 
 	proxyHTTPClientAbort = prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -166,7 +168,7 @@ var (
 
 	proxyHTTPBodyAbort = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "proxy_http_body_abort_total",
-		Help: "最终状态行已经写出之后的正文或 101 隧道失败。reason 是 client_cancel、origin_reset、idle_timeout、request_body。正常 EOF 和干净的 101 拆除不记。结果仍是 ok。不进失败率。",
+		Help: "最终状态行已经写出之后的正文或 101 隧道失败。reason 是 client_cancel、origin_reset、idle_timeout、request_body。正常 EOF、干净的 101 拆除，以及半关闭之后的空闲超时不记。结果仍是 ok。不进失败率。",
 	}, []string{"node_id", "reason"})
 
 	meterEvents = make(chan MeterEvent, MeterQueue)
@@ -296,7 +298,7 @@ func knownHTTPResult(result string) bool {
 
 func knownHTTPReject(reason string) bool {
 	switch reason {
-	case ReasonRejectAuth, ReasonRejectNoNode, ReasonRejectBadTarget, ReasonRejectBadCredential:
+	case ReasonRejectAuth, ReasonRejectNoNode, ReasonRejectBadTarget, ReasonRejectBadCredential, ReasonRejectHeaderTimeout:
 		return true
 	default:
 		return false
@@ -314,7 +316,7 @@ func FailHTTP(nodeID, reason string) {
 }
 
 // RejectHTTP 记录明文请求在拨 L2 之前的本地 400 或 407。
-// reason 只取四个本地拒绝。没有 node_id 标签。
+// reason 只取五个本地拒绝：auth、no_node、bad_target、bad_credential、header_timeout。没有 node_id 标签。
 func RejectHTTP(reason string) {
 	if !knownHTTPReject(reason) {
 		return

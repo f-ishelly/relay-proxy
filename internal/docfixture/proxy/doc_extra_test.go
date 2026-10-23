@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -169,10 +170,9 @@ func (netTimeout) Error() string   { return "i/o timeout" }
 func (netTimeout) Timeout() bool   { return true }
 func (netTimeout) Temporary() bool { return true }
 
-func dialWrapped(t *testing.T, addr string, wrap func(net.Conn) net.Conn) {
+func dialWrapped(t *testing.T, addr string, wrap func(net.Conn) net.Conn) func(string) (net.Conn, error) {
 	t.Helper()
-	orig := dialUpstream
-	dialUpstream = func(string) (net.Conn, error) {
+	return func(string) (net.Conn, error) {
 		c, err := net.Dial("tcp", addr)
 		if err != nil {
 			return nil, err
@@ -182,10 +182,6 @@ func dialWrapped(t *testing.T, addr string, wrap func(net.Conn) net.Conn) {
 		}
 		return c, nil
 	}
-	t.Cleanup(func() {
-		handlers.Wait()
-		dialUpstream = orig
-	})
 }
 
 func serveConnectThen(t *testing.T, fn func(net.Conn, *bufio.Reader)) string {
@@ -213,7 +209,8 @@ func TestPartialHeaderWriteDoesNotRetry(t *testing.T) {
 		_, _ = io.WriteString(c, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
 		_, _ = io.Copy(io.Discard, c)
 	})
-	dialWrapped(t, up, func(c net.Conn) net.Conn {
+	lim := defaultLimits()
+	lim.dial = dialWrapped(t, up, func(c net.Conn) net.Conn {
 		var httpWrites int
 		return &scriptConn{Conn: c, write: func(p []byte) (int, error) {
 			if bytes.HasPrefix(p, []byte("CONNECT ")) {
@@ -229,7 +226,7 @@ func TestPartialHeaderWriteDoesNotRetry(t *testing.T) {
 			return c.Write(p)
 		}}
 	})
-	l1 := startL1(t, staticResolver{addr: "127.0.0.1:9"})
+	l1 := startL1Limited(t, staticResolver{addr: "127.0.0.1:9"}, lim)
 	c, err := net.Dial("tcp", l1)
 	if err != nil {
 		t.Fatal(err)
@@ -278,7 +275,8 @@ func TestReusedReadTimeoutDoesNotRetry(t *testing.T) {
 		_, _ = io.WriteString(c, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
 		_, _ = io.Copy(io.Discard, c)
 	})
-	dialWrapped(t, up, func(c net.Conn) net.Conn {
+	lim := defaultLimits()
+	lim.dial = dialWrapped(t, up, func(c net.Conn) net.Conn {
 		var httpWrites int
 		return &scriptConn{
 			Conn: c,
@@ -296,7 +294,7 @@ func TestReusedReadTimeoutDoesNotRetry(t *testing.T) {
 			},
 		}
 	})
-	l1 := startL1(t, staticResolver{addr: "127.0.0.1:9"})
+	l1 := startL1Limited(t, staticResolver{addr: "127.0.0.1:9"}, lim)
 	c, err := net.Dial("tcp", l1)
 	if err != nil {
 		t.Fatal(err)
@@ -337,20 +335,39 @@ func TestReusedReadTimeoutDoesNotRetry(t *testing.T) {
 
 func TestPutRetryIsOptIn(t *testing.T) {
 	t.Run("default", func(t *testing.T) {
-		assertPutRetry(t, false)
+		assertPutRetry(t, defaultLimits(), false)
 	})
 	t.Run("enabled", func(t *testing.T) {
-		old := retryPutDelete
-		retryPutDelete = true
-		t.Cleanup(func() {
-			handlers.Wait()
-			retryPutDelete = old
-		})
-		assertPutRetry(t, true)
+		lim := defaultLimits()
+		lim.retryPutDelete = true
+		assertPutRetry(t, lim, true)
+	})
+	t.Run("config-file", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "proxy.json")
+		body := []byte(`{"retry_put_delete":true,"tunnel_idle":"5m","half_close_idle":"30s","l2_response_timeout":"10s"}`)
+		if err := os.WriteFile(path, body, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		lim, err := LimitsFromConfig(path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !lim.retryPutDelete || lim.tunnelIdle != 5*time.Minute || lim.l2Response != 10*time.Second {
+			t.Fatalf("config: %+v", lim)
+		}
+		over, err := LimitsFromConfig(path, []string{"-retry-put-delete=false", "-l2-response-timeout=2s"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if over.retryPutDelete || over.l2Response != 2*time.Second {
+			t.Fatalf("flag override: %+v", over)
+		}
+		assertPutRetry(t, lim, true)
 	})
 }
 
-func assertPutRetry(t *testing.T, wantRetry bool) {
+func assertPutRetry(t *testing.T, lim proxyLimits, wantRetry bool) {
 	t.Helper()
 	resetMetrics()
 	up := serveConnectThen(t, func(c net.Conn, br *bufio.Reader) {
@@ -360,7 +377,7 @@ func assertPutRetry(t *testing.T, wantRetry bool) {
 		_, _ = io.WriteString(c, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
 		_, _ = io.Copy(io.Discard, c)
 	})
-	dialWrapped(t, up, func(c net.Conn) net.Conn {
+	lim.dial = dialWrapped(t, up, func(c net.Conn) net.Conn {
 		var httpWrites int
 		return &scriptConn{
 			Conn: c,
@@ -382,7 +399,7 @@ func assertPutRetry(t *testing.T, wantRetry bool) {
 			},
 		}
 	})
-	l1 := startL1(t, staticResolver{addr: "127.0.0.1:9"})
+	l1 := startL1Limited(t, staticResolver{addr: "127.0.0.1:9"}, lim)
 	c, err := net.Dial("tcp", l1)
 	if err != nil {
 		t.Fatal(err)
@@ -432,5 +449,299 @@ func assertPutRetry(t *testing.T, wantRetry bool) {
 	}
 	if len(snap.HTTPFails) != 1 || snap.HTTPFails[0][1] != l1metrics.ReasonStaleTunnel {
 		t.Fatalf("fails %#v", snap.HTTPFails)
+	}
+}
+
+func TestReadSideReset(t *testing.T) {
+	t.Run("get", func(t *testing.T) {
+		assertReadReset(t, "GET", true)
+	})
+	t.Run("put", func(t *testing.T) {
+		assertReadReset(t, "PUT", false)
+	})
+}
+
+func assertReadReset(t *testing.T, method string, wantRetry bool) {
+	t.Helper()
+	resetMetrics()
+	up := serveConnectThen(t, func(c net.Conn, br *bufio.Reader) {
+		if _, err := readOriginRequest(br); err != nil {
+			return
+		}
+		_, _ = io.WriteString(c, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+		_, _ = io.Copy(io.Discard, c)
+	})
+	lim := defaultLimits()
+	lim.dial = dialWrapped(t, up, func(c net.Conn) net.Conn {
+		var httpWrites int
+		return &scriptConn{
+			Conn: c,
+			write: func(p []byte) (int, error) {
+				if !bytes.HasPrefix(p, []byte("CONNECT ")) {
+					httpWrites++
+				}
+				return c.Write(p)
+			},
+			read: func(p []byte) (int, error) {
+				if httpWrites >= 2 {
+					return 0, fmt.Errorf("origin read: %w", syscall.ECONNRESET)
+				}
+				return c.Read(p)
+			},
+		}
+	})
+	l1 := startL1Limited(t, staticResolver{addr: "127.0.0.1:9"}, lim)
+	c, err := net.Dial("tcp", l1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(4 * time.Second))
+	br := bufio.NewReader(c)
+	token := basicToken("app@node-a", "s3cret")
+	first := fmt.Sprintf("GET http://example/a HTTP/1.1\r\nHost: h\r\nProxy-Authorization: Basic %s\r\n\r\n", token)
+	if _, err := io.WriteString(c, first); err != nil {
+		t.Fatal(err)
+	}
+	head, err := readHTTPHead(br)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustStatus(t, head, 200)
+	second := fmt.Sprintf("%s http://example/a HTTP/1.1\r\nHost: h\r\nContent-Length: 0\r\nProxy-Authorization: Basic %s\r\n\r\n", method, token)
+	if _, err := io.WriteString(c, second); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := readHTTPHead(br)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = c.Close()
+	handlers.Wait()
+	snap := snapMetrics()
+	if wantRetry {
+		mustStatus(t, resp, 200)
+		if snap.HTTPRetries != 1 || len(snap.HTTPFails) != 0 {
+			t.Fatalf("retries %d fails %#v", snap.HTTPRetries, snap.HTTPFails)
+		}
+		return
+	}
+	mustStatus(t, resp, 502)
+	if snap.HTTPRetries != 0 {
+		t.Fatalf("%s retried on read reset: %d", method, snap.HTTPRetries)
+	}
+	if len(snap.HTTPFails) != 1 || snap.HTTPFails[0][1] != l1metrics.ReasonStaleTunnel {
+		t.Fatalf("fails %#v", snap.HTTPFails)
+	}
+}
+
+func TestBodyIdleIsIdleTimeout(t *testing.T) {
+	resetMetrics()
+	done := make(chan struct{})
+	t.Cleanup(func() { close(done) })
+	up := serveConnectThen(t, func(c net.Conn, br *bufio.Reader) {
+		if _, err := readOriginRequest(br); err != nil {
+			return
+		}
+		_, _ = io.WriteString(c, "HTTP/1.1 200 OK\r\nContent-Length: 20\r\nConnection: close\r\n\r\n")
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+		}
+	})
+	lim := defaultLimits()
+	lim.tunnelIdle = 80 * time.Millisecond
+	lim.dial = dialWrapped(t, up, nil)
+	l1 := startL1Limited(t, staticResolver{addr: "127.0.0.1:9"}, lim)
+	c, err := net.Dial("tcp", l1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(3 * time.Second))
+	req := fmt.Sprintf("GET http://example/a HTTP/1.1\r\nHost: h\r\nProxy-Authorization: Basic %s\r\n\r\n",
+		basicToken("app@node-a", "s3cret"))
+	if _, err := io.WriteString(c, req); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 256)
+	_, _ = c.Read(buf)
+	handlers.Wait()
+	snap := snapMetrics()
+	if snap.BodyByReason[l1metrics.ReasonAbortIdleTimeout] != 1 {
+		t.Fatalf("body abort %#v", snap.BodyByReason)
+	}
+	if snap.BodyByReason[l1metrics.ReasonAbortOriginReset] != 0 || snap.BodyByReason[l1metrics.ReasonAbortClientCancel] != 0 {
+		t.Fatalf("idle close mislabeled %#v", snap.BodyByReason)
+	}
+	if len(snap.HTTPObserves) != 1 || snap.HTTPObserves[0] != l1metrics.ResultOK {
+		t.Fatalf("observes %#v", snap.HTTPObserves)
+	}
+}
+
+func TestHalfCloseIdleIsNotAbort(t *testing.T) {
+	resetMetrics()
+	up := serveConnectThen(t, func(c net.Conn, br *bufio.Reader) {
+		if _, err := readOriginRequest(br); err != nil {
+			return
+		}
+		if _, err := io.WriteString(c, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"); err != nil {
+			return
+		}
+		if cw, ok := c.(interface{ CloseWrite() error }); ok {
+			_ = cw.CloseWrite()
+		}
+		_, _ = io.Copy(io.Discard, c)
+	})
+	lim := defaultLimits()
+	lim.halfCloseIdle = 80 * time.Millisecond
+	lim.tunnelIdle = 5 * time.Second
+	lim.dial = dialWrapped(t, up, nil)
+	l1 := startL1Limited(t, staticResolver{addr: "127.0.0.1:9"}, lim)
+	c, err := net.Dial("tcp", l1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(3 * time.Second))
+	req := fmt.Sprintf("GET http://example/ws HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nProxy-Authorization: Basic %s\r\n\r\n",
+		basicToken("app@node-a", "s3cret"))
+	if _, err := io.WriteString(c, req); err != nil {
+		t.Fatal(err)
+	}
+	br := bufio.NewReader(c)
+	head, err := readHTTPHead(br)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustStatus(t, head, 101)
+	handlers.Wait()
+	snap := snapMetrics()
+	if snap.HTTPBodyAborts != 0 {
+		t.Fatalf("half-close idle counted as abort: %#v", snap.BodyByReason)
+	}
+	if len(snap.HTTPObserves) != 1 || snap.HTTPObserves[0] != l1metrics.ResultOK {
+		t.Fatalf("observes %#v", snap.HTTPObserves)
+	}
+}
+
+func TestUpgradeRSTReason(t *testing.T) {
+	resetMetrics()
+	release := make(chan struct{})
+	up := serveConnectThen(t, func(c net.Conn, br *bufio.Reader) {
+		if _, err := readOriginRequest(br); err != nil {
+			return
+		}
+		if _, err := io.WriteString(c, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"); err != nil {
+			return
+		}
+		<-release
+		if tcp, ok := c.(*net.TCPConn); ok {
+			_ = tcp.SetLinger(0)
+		}
+		_ = c.Close()
+	})
+	lim := defaultLimits()
+	lim.dial = dialWrapped(t, up, nil)
+	l1 := startL1Limited(t, staticResolver{addr: "127.0.0.1:9"}, lim)
+	c, err := net.Dial("tcp", l1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(3 * time.Second))
+	req := fmt.Sprintf("GET http://example/ws HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nProxy-Authorization: Basic %s\r\n\r\n",
+		basicToken("app@node-a", "s3cret"))
+	if _, err := io.WriteString(c, req); err != nil {
+		t.Fatal(err)
+	}
+	br := bufio.NewReader(c)
+	head, err := readHTTPHead(br)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustStatus(t, head, 101)
+	close(release)
+	handlers.Wait()
+	snap := snapMetrics()
+	if snap.BodyByReason[l1metrics.ReasonAbortOriginReset] != 1 {
+		t.Fatalf("RST reason %#v", snap.BodyByReason)
+	}
+	if snap.BodyByReason[l1metrics.ReasonAbortClientCancel] != 0 || snap.BodyByReason[l1metrics.ReasonAbortRequestBody] != 0 {
+		t.Fatalf("collateral reason %#v", snap.BodyByReason)
+	}
+}
+
+func TestPartialHeaderTimeout(t *testing.T) {
+	resetMetrics()
+	lim := defaultLimits()
+	lim.tunnelIdle = 120 * time.Millisecond
+	l1 := startL1Limited(t, staticResolver{}, lim)
+	c, err := net.Dial("tcp", l1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.WriteString(c, "GET http://127.0.0.1/a HTTP/1.1\r\nHost: ex"); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 512)
+	n, _ := c.Read(buf)
+	handlers.Wait()
+	snap := snapMetrics()
+	if n > 0 && !bytes.Contains(buf[:n], []byte("400")) {
+		t.Fatalf("status %s", strconv.Quote(string(buf[:n])))
+	}
+	if len(snap.HTTPRejects) != 1 || snap.HTTPRejects[0] != l1metrics.ReasonRejectHeaderTimeout {
+		t.Fatalf("http rejects %#v", snap.HTTPRejects)
+	}
+	if len(snap.Rejects) != 0 || len(snap.HTTPObserves) != 0 || len(snap.HTTPFails) != 0 {
+		t.Fatalf("partial header timeout counted elsewhere: %+v", snap)
+	}
+
+	resetMetrics()
+	c2, err := net.Dial("tcp", l1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+	_ = c2.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.WriteString(c2, "CONNECT example.com:443 HTTP/1.1\r\nHost: "); err != nil {
+		t.Fatal(err)
+	}
+	n, _ = c2.Read(buf)
+	handlers.Wait()
+	snap = snapMetrics()
+	if n > 0 && !bytes.Contains(buf[:n], []byte("400")) {
+		t.Fatalf("connect status %s", strconv.Quote(string(buf[:n])))
+	}
+	if len(snap.Rejects) != 1 || snap.Rejects[0] != l1metrics.ReasonRejectHeaderTimeout {
+		t.Fatalf("connect rejects %#v body %s", snap.Rejects, strconv.Quote(string(buf[:n])))
+	}
+	if len(snap.HTTPRejects) != 0 {
+		t.Fatalf("connect header timeout counted as http %#v", snap.HTTPRejects)
+	}
+}
+
+func TestCachedGostRejectsBadHash(t *testing.T) {
+	asset, ok := gostAssets[runtime.GOOS+"/"+runtime.GOARCH]
+	if !ok {
+		t.Fatalf("no pinned gost asset for %s/%s", runtime.GOOS, runtime.GOARCH)
+	}
+	dir := t.TempDir()
+	t.Setenv("XDG_CACHE_HOME", dir)
+	path, err := gostCachePath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("truncated"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if reusableGost(path, asset.binarySHA) {
+		t.Fatal("truncated cache file was accepted")
 	}
 }

@@ -1,0 +1,23 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      GOST_REQUIRED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: race tests
+        run: go test -tags docfixture -race ./...
+      - name: promtool
+        run: |
+          curl -fsSL -o /tmp/prometheus.tar.gz https://github.com/prometheus/prometheus/releases/download/v2.55.1/prometheus-2.55.1.linux-amd64.tar.gz
+          tar -C /tmp -xzf /tmp/prometheus.tar.gz
+          /tmp/prometheus-2.55.1.linux-amd64/promtool test rules internal/docfixture/prom/sli_test.yml

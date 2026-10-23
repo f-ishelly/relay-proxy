@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -72,38 +73,167 @@ func TestMain(m *testing.M) {
 
 func requireGost(t *testing.T) {
 	t.Helper()
-	if gostSkip != "" {
-		t.Skip(gostSkip)
+	if gostSkip == "" {
+		return
 	}
+	if os.Getenv("GOST_REQUIRED") == "1" {
+		t.Fatal(gostSkip)
+	}
+	t.Skip(gostSkip)
+}
+
+// gost v3.3.1 release assets. Archive hashes are the upstream checksums.txt.
+// Binary hashes are the extracted `gost` file. A truncated cache file fails the binary hash and is not reused.
+var gostAssets = map[string]gostAsset{
+	"linux/amd64": {
+		archive:    "gost_3.3.1_linux_amd64.tar.gz",
+		archiveSHA: "e0e3a2c9116e2f025e962bba340749f80696bda318613d45e5ae96dd0bcae37c",
+		binarySHA:  "327720a6dba0e816dbd761f2211140108f579e886bf88075f73da2d5fba5dfc1",
+	},
+	"linux/arm64": {
+		archive:    "gost_3.3.1_linux_arm64.tar.gz",
+		archiveSHA: "c58af4a74362a95caa7f580817ad624497d192dfeb60468dc8a4c70c293c6b01",
+		binarySHA:  "37da362d2870c3f4e83aab848b6dcf4508f44e4334e6f0675e571e926f3c666f",
+	},
+	"darwin/amd64": {
+		archive:    "gost_3.3.1_darwin_amd64.tar.gz",
+		archiveSHA: "857f44606177db09505a8871800142c352010b74093532a1b74554779dd9358a",
+		binarySHA:  "0192ffe5f4e789d5ac8dd7806a8732ed121bb543bbdbdf3ad9f8f8589d084742",
+	},
+	"darwin/arm64": {
+		archive:    "gost_3.3.1_darwin_arm64.tar.gz",
+		archiveSHA: "6b87b8c5fd728536d1b208382fc6b93a7bb04111d633a9f1e4651cd1ce62886d",
+		binarySHA:  "d58192888fb516e2eedf0a1787088db8e10b3ed9c127fdba34ff6258f5621a3a",
+	},
+}
+
+type gostAsset struct {
+	archive    string
+	archiveSHA string
+	binarySHA  string
 }
 
 func prepareGost() (string, error) {
 	if env := os.Getenv("GOST_BIN"); env != "" {
 		st, err := os.Stat(env)
 		if err != nil || st.IsDir() {
-			return "", fmt.Errorf("GOST_BIN %q is not a gost v3.3.1 binary (%v); set GOST_BIN or allow the test to download gost v3.3.1", env, err)
+			return "", fmt.Errorf("GOST_BIN %q is not a gost v3.3.1 binary (%v)", env, err)
+		}
+		if err := gostVersionOK(env); err != nil {
+			return "", err
 		}
 		return env, nil
 	}
-	cache := filepath.Join(os.TempDir(), "gost-v3.3.1", "gost")
-	if st, err := os.Stat(cache); err == nil && !st.IsDir() && st.Mode()&0o111 != 0 {
+	key := runtime.GOOS + "/" + runtime.GOARCH
+	asset, ok := gostAssets[key]
+	if !ok {
+		return "", fmt.Errorf("gost v3.3.1 has no pinned release asset for %s/%s; set GOST_BIN to a gost v3.3.1 binary", runtime.GOOS, runtime.GOARCH)
+	}
+	cache, err := gostCachePath()
+	if err != nil {
+		return "", err
+	}
+	if reusableGost(cache, asset.binarySHA) {
+		if err := gostVersionOK(cache); err != nil {
+			return "", err
+		}
 		return cache, nil
 	}
-	const url = "https://github.com/go-gost/gost/releases/download/v3.3.1/gost_3.3.1_linux_amd64.tar.gz"
-	resp, err := http.Get(url)
+	_ = os.Remove(cache)
+	if err := downloadGost(asset, cache); err != nil {
+		return "", err
+	}
+	if !reusableGost(cache, asset.binarySHA) {
+		_ = os.Remove(cache)
+		return "", fmt.Errorf("gost v3.3.1 cached binary sha256 mismatch for %s/%s", runtime.GOOS, runtime.GOARCH)
+	}
+	if err := gostVersionOK(cache); err != nil {
+		return "", err
+	}
+	return cache, nil
+}
+
+func gostCachePath() (string, error) {
+	base, err := os.UserCacheDir()
 	if err != nil {
-		return "", fmt.Errorf("gost v3.3.1 download failed: %v; set GOST_BIN to a gost v3.3.1 binary", err)
+		return "", fmt.Errorf("gost cache dir: %w", err)
+	}
+	return filepath.Join(base, "relay-proxy", "gost-v3.3.1", runtime.GOOS+"-"+runtime.GOARCH, "gost"), nil
+}
+
+func reusableGost(path, want string) bool {
+	got, err := fileSHA256(path)
+	return err == nil && got == want
+}
+
+func fileSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func gostVersionOK(bin string) error {
+	cmd := exec.Command(bin, "-V")
+	out, err := cmd.CombinedOutput()
+	text := strings.TrimSpace(string(out))
+	if !strings.Contains(text, "gost v3.3.1") {
+		if err != nil {
+			return fmt.Errorf("GOST_BIN %q failed -V (%v): %s", bin, err, text)
+		}
+		return fmt.Errorf("GOST_BIN %q is not gost v3.3.1 (got %q)", bin, text)
+	}
+	return nil
+}
+
+func downloadGost(asset gostAsset, dest string) error {
+	dir := filepath.Dir(dest)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	resp, err := http.Get("https://github.com/go-gost/gost/releases/download/v3.3.1/" + asset.archive)
+	if err != nil {
+		return fmt.Errorf("gost v3.3.1 download failed: %v; set GOST_BIN to a gost v3.3.1 binary", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("gost v3.3.1 download returned %s; set GOST_BIN to a gost v3.3.1 binary", resp.Status)
+		return fmt.Errorf("gost v3.3.1 download returned %s; set GOST_BIN to a gost v3.3.1 binary", resp.Status)
 	}
-	if err := os.MkdirAll(filepath.Dir(cache), 0o755); err != nil {
-		return "", err
-	}
-	gz, err := gzip.NewReader(resp.Body)
+	arc, err := os.CreateTemp(dir, ".gost-archive-*")
 	if err != nil {
-		return "", fmt.Errorf("gost v3.3.1 archive: %v; set GOST_BIN to a gost v3.3.1 binary", err)
+		return err
+	}
+	arcName := arc.Name()
+	defer os.Remove(arcName)
+	ah := sha256.New()
+	if _, err := io.Copy(io.MultiWriter(arc, ah), resp.Body); err != nil {
+		arc.Close()
+		return fmt.Errorf("gost v3.3.1 download: %w", err)
+	}
+	if err := arc.Sync(); err != nil {
+		arc.Close()
+		return err
+	}
+	if err := arc.Close(); err != nil {
+		return err
+	}
+	if got := hex.EncodeToString(ah.Sum(nil)); got != asset.archiveSHA {
+		return fmt.Errorf("gost v3.3.1 archive sha256 mismatch for %s: got %s", asset.archive, got)
+	}
+	af, err := os.Open(arcName)
+	if err != nil {
+		return err
+	}
+	defer af.Close()
+	gz, err := gzip.NewReader(af)
+	if err != nil {
+		return fmt.Errorf("gost v3.3.1 archive: %v", err)
 	}
 	defer gz.Close()
 	tr := tar.NewReader(gz)
@@ -113,24 +243,49 @@ func prepareGost() (string, error) {
 			break
 		}
 		if err != nil {
-			return "", fmt.Errorf("gost v3.3.1 archive: %v; set GOST_BIN to a gost v3.3.1 binary", err)
+			return fmt.Errorf("gost v3.3.1 archive: %v", err)
 		}
-		if hdr.Typeflag == tar.TypeReg && filepath.Base(hdr.Name) == "gost" {
-			f, err := os.OpenFile(cache, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
-			if err != nil {
-				return "", err
-			}
-			if _, err := io.Copy(f, tr); err != nil {
-				f.Close()
-				return "", err
-			}
-			if err := f.Close(); err != nil {
-				return "", err
-			}
-			return cache, nil
+		if hdr.Typeflag != tar.TypeReg || filepath.Base(hdr.Name) != "gost" {
+			continue
 		}
+		tmp, err := os.OpenFile(filepath.Join(dir, ".gost-bin-"+strconv.FormatInt(time.Now().UnixNano(), 10)), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o755)
+		if err != nil {
+			return err
+		}
+		tmpName := tmp.Name()
+		bh := sha256.New()
+		if _, err := io.Copy(io.MultiWriter(tmp, bh), tr); err != nil {
+			tmp.Close()
+			os.Remove(tmpName)
+			return err
+		}
+		if got := hex.EncodeToString(bh.Sum(nil)); got != asset.binarySHA {
+			tmp.Close()
+			os.Remove(tmpName)
+			return fmt.Errorf("gost v3.3.1 binary sha256 mismatch: got %s", got)
+		}
+		if err := tmp.Sync(); err != nil {
+			tmp.Close()
+			os.Remove(tmpName)
+			return err
+		}
+		if err := tmp.Close(); err != nil {
+			os.Remove(tmpName)
+			return err
+		}
+		if err := os.Rename(tmpName, dest); err != nil {
+			os.Remove(tmpName)
+			return err
+		}
+		df, err := os.Open(dir)
+		if err != nil {
+			return err
+		}
+		err = df.Sync()
+		df.Close()
+		return err
 	}
-	return "", fmt.Errorf("gost v3.3.1 archive had no gost binary; set GOST_BIN to a gost v3.3.1 binary")
+	return fmt.Errorf("gost v3.3.1 archive had no gost binary")
 }
 
 func startGost(user, pass string) (string, *exec.Cmd, error) {
@@ -207,10 +362,49 @@ func (s staticResolver) Resolve(string) (string, error) {
 	return s.addr, nil
 }
 
-var handlers sync.WaitGroup
+// handlerGate 代替 sync.WaitGroup。Accept 里的 Add 和测试里的 Wait 会同时发生，
+// WaitGroup 在计数回到 0 时这样用会让 race detector 报错。
+type handlerGate struct {
+	mu sync.Mutex
+	n  int
+	cv *sync.Cond
+}
+
+func newHandlerGate() *handlerGate {
+	g := &handlerGate{}
+	g.cv = sync.NewCond(&g.mu)
+	return g
+}
+
+func (g *handlerGate) Add(delta int) {
+	g.mu.Lock()
+	g.n += delta
+	if g.n == 0 {
+		g.cv.Broadcast()
+	}
+	g.mu.Unlock()
+}
+
+func (g *handlerGate) Done() { g.Add(-1) }
+
+func (g *handlerGate) Wait() {
+	g.mu.Lock()
+	for g.n > 0 {
+		g.cv.Wait()
+	}
+	g.mu.Unlock()
+}
+
+var handlers = newHandlerGate()
 
 func startL1(t *testing.T, r Resolver) string {
 	t.Helper()
+	return startL1Limited(t, r, defaultLimits())
+}
+
+func startL1Limited(t *testing.T, r Resolver, lim proxyLimits) string {
+	t.Helper()
+	lim = fillLimits(lim)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -224,7 +418,7 @@ func startL1(t *testing.T, r Resolver) string {
 			handlers.Add(1)
 			go func() {
 				defer handlers.Done()
-				_ = serveProxyConn(c, r)
+				_ = serveProxyConnLimited(c, r, lim)
 			}()
 		}
 	}()
@@ -284,15 +478,11 @@ func assertBalanced(t *testing.T, snap metricSnap) {
 
 func waitCalls(t *testing.T, pred func(metricSnap) bool) metricSnap {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	var snap metricSnap
-	for {
-		snap = snapMetrics()
-		if pred(snap) || !time.Now().Before(deadline) {
-			return snap
-		}
-		time.Sleep(5 * time.Millisecond)
+	snap := snapMetrics()
+	if !pred(snap) {
+		t.Logf("snapshot did not match yet: %+v", snap)
 	}
+	return snap
 }
 
 type scriptConn struct {
@@ -323,7 +513,7 @@ func (s scriptConn) SetReadDeadline(deadline time.Time) error {
 	return s.Conn.SetReadDeadline(deadline)
 }
 
-func scriptedDial(t *testing.T, wrap func(net.Conn) net.Conn) {
+func scriptedDial(t *testing.T, wrap func(net.Conn) net.Conn) func(string) (net.Conn, error) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -342,8 +532,7 @@ func scriptedDial(t *testing.T, wrap func(net.Conn) net.Conn) {
 			}()
 		}
 	}()
-	orig := dialUpstream
-	dialUpstream = func(string) (net.Conn, error) {
+	return func(string) (net.Conn, error) {
 		c, err := net.Dial("tcp", ln.Addr().String())
 		if err != nil {
 			return nil, err
@@ -353,25 +542,13 @@ func scriptedDial(t *testing.T, wrap func(net.Conn) net.Conn) {
 		}
 		return c, nil
 	}
-	t.Cleanup(func() {
-		handlers.Wait()
-		dialUpstream = orig
-	})
 }
 
-func countDials(t *testing.T) *atomic.Int32 {
-	t.Helper()
-	var n atomic.Int32
-	orig := dialUpstream
-	dialUpstream = func(addr string) (net.Conn, error) {
+func countingDial(n *atomic.Int32) func(string) (net.Conn, error) {
+	return func(addr string) (net.Conn, error) {
 		n.Add(1)
-		return orig(addr)
+		return dialUpstream(addr)
 	}
-	t.Cleanup(func() {
-		handlers.Wait()
-		dialUpstream = orig
-	})
-	return &n
 }
 
 func doRequest(t *testing.T, addr, raw string) []byte {
@@ -833,6 +1010,7 @@ func TestWebSocketUpgrade(t *testing.T) {
 	}
 	assertNoConnectMetrics(t, snap)
 	_ = c.Close()
+	handlers.Wait()
 	snap = waitCalls(t, func(c metricSnap) bool {
 		return c.HTTPLeft == 1 && c.HTTPTunnels == 1
 	})
@@ -994,17 +1172,20 @@ func TestLocalRejectsDoNotDial(t *testing.T) {
 		{"origin-form", "app@node-a", "s3cret", "/a", 400, l1metrics.ReasonRejectBadTarget},
 		{"https", "app@node-a", "s3cret", "https://example.com/a", 400, l1metrics.ReasonRejectBadTarget},
 	}
-	l1 := startL1(t, mapResolver{m: map[string]string{"node-a": "127.0.0.1:9"}})
+	var dials atomic.Int32
+	lim := defaultLimits()
+	lim.dial = countingDial(&dials)
+	l1 := startL1Limited(t, mapResolver{m: map[string]string{"node-a": "127.0.0.1:9"}}, lim)
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			resetMetrics()
-			dials := countDials(t)
+			before := dials.Load()
 			req := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: h\r\nProxy-Authorization: Basic %s\r\n\r\n",
 				tc.target, basicToken(tc.user, tc.pass))
 			resp := doRequest(t, l1, req)
 			mustStatus(t, resp, tc.status)
-			if dials.Load() != 0 {
-				t.Fatalf("dialed %d", dials.Load())
+			if dials.Load() != before {
+				t.Fatalf("dialed %d", dials.Load()-before)
 			}
 			handlers.Wait()
 			snap := snapMetrics()
@@ -1034,8 +1215,10 @@ func TestLocalRejectsDoNotDial(t *testing.T) {
 
 func TestBadCredentialDoesNotDial(t *testing.T) {
 	resetMetrics()
-	dials := countDials(t)
-	l1 := startL1(t, mapResolver{m: map[string]string{"node-a": "127.0.0.1:9"}})
+	var dials atomic.Int32
+	lim := defaultLimits()
+	lim.dial = countingDial(&dials)
+	l1 := startL1Limited(t, mapResolver{m: map[string]string{"node-a": "127.0.0.1:9"}}, lim)
 	token := base64.StdEncoding.EncodeToString([]byte("app@node-a:bad\nsecret"))
 	req := fmt.Sprintf("GET http://127.0.0.1/a HTTP/1.1\r\nHost: h\r\nProxy-Authorization: Basic %s\r\n\r\n", token)
 	resp := doRequest(t, l1, req)
@@ -1190,18 +1373,25 @@ func TestDialAndResolve502(t *testing.T) {
 }
 
 func TestL2ResponseTimeout(t *testing.T) {
-	old := l2ResponseTimeout
-	l2ResponseTimeout = 300 * time.Millisecond
+	hold := make(chan struct{})
 	t.Cleanup(func() {
-		handlers.Wait()
-		l2ResponseTimeout = old
+		select {
+		case <-hold:
+		default:
+			close(hold)
+		}
 	})
 	blackhole := serveRaw(t, func(c net.Conn) {
-		time.Sleep(5 * time.Second)
-		c.Close()
+		defer c.Close()
+		select {
+		case <-hold:
+		case <-time.After(5 * time.Second):
+		}
 	})
 	resetMetrics()
-	l1 := startL1(t, mapResolver{m: map[string]string{"node-a": blackhole}})
+	lim := defaultLimits()
+	lim.l2Response = 300 * time.Millisecond
+	l1 := startL1Limited(t, mapResolver{m: map[string]string{"node-a": blackhole}}, lim)
 	start := time.Now()
 	resp := doRequest(t, l1, fmt.Sprintf("GET http://127.0.0.1/a HTTP/1.1\r\nHost: h\r\nProxy-Authorization: Basic %s\r\n\r\n",
 		basicToken("app@node-a", "s3cret")))
@@ -1224,13 +1414,9 @@ func TestL2ResponseTimeout(t *testing.T) {
 
 func TestClientIdleTimeout(t *testing.T) {
 	resetMetrics()
-	old := tunnelIdleTimeout
-	tunnelIdleTimeout = 200 * time.Millisecond
-	t.Cleanup(func() {
-		handlers.Wait()
-		tunnelIdleTimeout = old
-	})
-	l1 := startL1(t, staticResolver{})
+	lim := defaultLimits()
+	lim.tunnelIdle = 200 * time.Millisecond
+	l1 := startL1Limited(t, staticResolver{}, lim)
 	c, err := net.Dial("tcp", l1)
 	if err != nil {
 		t.Fatal(err)
@@ -1492,6 +1678,7 @@ func TestClientHelloBytesJA3JA4(t *testing.T) {
 		t.Fatalf("empty fingerprint ja3=%s ja4=%s", ja3(dh), ja4(dh))
 	}
 	t.Logf("ja3=%s ja4=%s", ja3(dh), ja4(dh))
+	handlers.Wait()
 }
 
 func captureHello(t *testing.T, write func(origin string)) []byte {
@@ -1873,10 +2060,11 @@ func TestHTTPL2WriteAndDeadline(t *testing.T) {
 		basicToken("app@node-a", "s3cret"))
 	t.Run("write-error", func(t *testing.T) {
 		resetMetrics()
-		scriptedDial(t, func(c net.Conn) net.Conn {
+		lim := defaultLimits()
+		lim.dial = scriptedDial(t, func(c net.Conn) net.Conn {
 			return &scriptConn{Conn: c, write: func([]byte) (int, error) { return 0, io.ErrClosedPipe }}
 		})
-		l1 := startL1(t, mapResolver{m: map[string]string{"node-a": "192.0.2.1:1"}})
+		l1 := startL1Limited(t, mapResolver{m: map[string]string{"node-a": "192.0.2.1:1"}}, lim)
 		resp := doRequest(t, l1, req)
 		mustStatus(t, resp, 502)
 		handlers.Wait()
@@ -1914,9 +2102,9 @@ func TestHTTPL2WriteAndDeadline(t *testing.T) {
 			_, _ = io.WriteString(c, "HTTP/1.1 200 Connection Established\r\n\r\n")
 			_, _ = io.Copy(io.Discard, c)
 		}()
-		orig := dialUpstream
 		var connectWrite atomic.Bool
-		dialUpstream = func(string) (net.Conn, error) {
+		lim := defaultLimits()
+		lim.dial = func(string) (net.Conn, error) {
 			c, err := net.Dial("tcp", ln.Addr().String())
 			if err != nil {
 				return nil, err
@@ -1931,11 +2119,7 @@ func TestHTTPL2WriteAndDeadline(t *testing.T) {
 				return 1, nil
 			}}, nil
 		}
-		t.Cleanup(func() {
-			handlers.Wait()
-			dialUpstream = orig
-		})
-		l1 := startL1(t, mapResolver{m: map[string]string{"node-a": ln.Addr().String()}})
+		l1 := startL1Limited(t, mapResolver{m: map[string]string{"node-a": ln.Addr().String()}}, lim)
 		resp := doRequest(t, l1, req)
 		mustStatus(t, resp, 502)
 		handlers.Wait()
@@ -1952,10 +2136,11 @@ func TestHTTPL2WriteAndDeadline(t *testing.T) {
 	})
 	t.Run("deadline", func(t *testing.T) {
 		resetMetrics()
-		scriptedDial(t, func(c net.Conn) net.Conn {
+		lim := defaultLimits()
+		lim.dial = scriptedDial(t, func(c net.Conn) net.Conn {
 			return &scriptConn{Conn: c, readDead: func(time.Time) error { return io.ErrClosedPipe }}
 		})
-		l1 := startL1(t, mapResolver{m: map[string]string{"node-a": "192.0.2.1:1"}})
+		l1 := startL1Limited(t, mapResolver{m: map[string]string{"node-a": "192.0.2.1:1"}}, lim)
 		resp := doRequest(t, l1, req)
 		mustStatus(t, resp, 502)
 		handlers.Wait()
@@ -2151,6 +2336,7 @@ func TestKeepAliveSameHostGauge(t *testing.T) {
 		t.Fatalf("origin accepts=%d want 1", accepts.Load())
 	}
 	_ = c.Close()
+	handlers.Wait()
 	snap := waitCalls(t, func(s metricSnap) bool {
 		return s.HTTPLeft == 1 && s.HTTPTunnels == 1
 	})
@@ -2165,6 +2351,7 @@ func TestStaleKeepAliveRetry(t *testing.T) {
 	requireGost(t)
 	resetMetrics()
 	var accepts atomic.Int32
+	idleClosed := make(chan struct{}, 1)
 	origin := serveRaw(t, func(c net.Conn) {
 		accepts.Add(1)
 		defer c.Close()
@@ -2179,6 +2366,10 @@ func TestStaleKeepAliveRetry(t *testing.T) {
 		// Node's default keep-alive idle is 5s: read until that deadline, then close.
 		_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
 		_, _ = c.Read(make([]byte, 1))
+		select {
+		case idleClosed <- struct{}{}:
+		default:
+		}
 	})
 	l1 := startL1(t, mapResolver{m: map[string]string{"node-a": gostA}})
 	c, err := net.Dial("tcp", l1)
@@ -2207,7 +2398,11 @@ func TestStaleKeepAliveRetry(t *testing.T) {
 	}
 	first := send()
 	mustStatus(t, first, 200)
-	time.Sleep(5*time.Second + 300*time.Millisecond)
+	select {
+	case <-idleClosed:
+	case <-time.After(8 * time.Second):
+		t.Fatal("origin idle close did not happen")
+	}
 	second := send()
 	mustStatus(t, second, 200)
 	if accepts.Load() != 2 {
@@ -2228,6 +2423,7 @@ func TestStaleKeepAliveRetry(t *testing.T) {
 	}
 	assertNoConnectMetrics(t, snap)
 	_ = c.Close()
+	handlers.Wait()
 	snap = waitCalls(t, func(s metricSnap) bool {
 		return s.HTTPLeft == 2 && s.HTTPTunnels == 2
 	})

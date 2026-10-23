@@ -29,24 +29,28 @@ const maxHTTPHead = 64 << 10
 // 否则按明文 HTTP 处理，并在这条连接上串行读取后续请求。
 // 不支持把后续请求并发转发。bufio 里已经读到的下一个请求，要等当前响应写完再处理。
 func serveProxyConn(conn net.Conn, resolver Resolver) error {
+	return serveProxyConnLimited(conn, resolver, defaultLimits())
+}
+
+// serveProxyConnLimited 与 serveProxyConn 相同，超时和重试开关来自这一次的 lim。
+// 测试和 LimitsFromConfig 的结果走这里，不改包级变量。
+func serveProxyConnLimited(conn net.Conn, resolver Resolver, lim proxyLimits) error {
+	lim = fillLimits(lim)
 	defer conn.Close()
-	session := newHTTPSession(conn)
+	session := newHTTPSession(conn, lim)
 	defer session.stop()
 	mc := &modeConn{Conn: conn, session: session}
 	br := bufio.NewReaderSize(mc, maxHTTPHead)
 	head, err := readHTTPHead(br)
 	if err != nil {
-		// 一个字节都没有，或空闲超时且没有读到字节：不计数。
-		// 请求行已经是 CONNECT 时，不完整的头仍算 CONNECT 的 bad_target。
-		// 方法还看不出来，或已经是别的方法，记明文 HTTP 的 bad_target，避免把普通 HTTP 算进 CONNECT。
-		if len(head) == 0 || isTimeout(err) {
+		// 一个字节都没有：不计数。零字节的空闲超时也在这里，不记拒绝。
+		// 已经读到一部分才超时：slowloris，记 header_timeout。
+		// 已经读到一部分但不是超时：头不完整，记 bad_target。
+		// 请求行已经是 CONNECT 时，这两项走 CONNECT 的拒绝计数。
+		if len(head) == 0 {
 			return err
 		}
-		if requestMethod(head) == "CONNECT" {
-			l1metrics.RejectClient(l1metrics.ReasonRejectBadTarget)
-		} else {
-			l1metrics.RejectHTTP(l1metrics.ReasonRejectBadTarget)
-		}
+		notePartialHead(head, err)
 		writeHTTPError(conn, http.StatusBadRequest, "Bad Request", "")
 		return err
 	}
@@ -79,24 +83,25 @@ func finishConnect(mc *modeConn, br *bufio.Reader, head []byte, resolver Resolve
 	user, pass := basicFrom(headers)
 	prefix := takeBuffered(br)
 	pc := &prefixConn{Conn: mc, r: io.MultiReader(bytes.NewReader(prefix), mc)}
-	return handleConnect(pc, user, pass, parts[1], resolver)
+	return handleConnect(pc, user, pass, parts[1], resolver, mc.session.lim)
 }
 
 // httpTry 是一条明文 HTTP 请求的计数，不是一条 L2 隧道。
 // keep-alive 上的下一条请求是新的 httpTry。认证失败不发计量事件。
 type httpTry struct {
-	meter    l1metrics.MeterEvent
-	meterOn  bool
-	nodeID   string
-	started  time.Time
-	up, down atomic.Int64
-	observed bool
-	emitted  bool
-	retried  bool
+	meter          l1metrics.MeterEvent
+	meterOn        bool
+	nodeID         string
+	started        time.Time
+	up, down       atomic.Int64
+	observed       bool
+	emitted        bool
+	retried        bool
+	retryPutDelete bool
 }
 
-func newHTTPTry(client net.Conn) *httpTry {
-	t := &httpTry{}
+func newHTTPTry(client net.Conn, lim proxyLimits) *httpTry {
+	t := &httpTry{retryPutDelete: lim.retryPutDelete}
 	t.meter.Protocol = l1metrics.ProtocolHTTP
 	if ra := client.RemoteAddr(); ra != nil {
 		t.meter.ClientIP = ra.String()
@@ -206,10 +211,10 @@ func serveAbsolute(client net.Conn, session *httpSession, mc *modeConn, br *bufi
 			var err error
 			head, err = readHTTPHead(br)
 			if err != nil {
-				if len(head) == 0 || isTimeout(err) {
+				if len(head) == 0 {
 					return err
 				}
-				l1metrics.RejectHTTP(l1metrics.ReasonRejectBadTarget)
+				notePartialHead(head, err)
 				writeHTTPError(client, http.StatusBadRequest, "Bad Request", "")
 				return err
 			}
@@ -226,7 +231,7 @@ func serveAbsolute(client net.Conn, session *httpSession, mc *modeConn, br *bufi
 			writeHTTPError(client, rej.status, rej.reason, rej.header)
 			return rej.err
 		}
-		try = newHTTPTry(client)
+		try = newHTTPTry(client, session.lim)
 		if strings.ContainsAny(req.username, "\r\n") || strings.ContainsAny(req.password, "\r\n") {
 			l1metrics.RejectHTTP(l1metrics.ReasonRejectBadCredential)
 			writeHTTPError(client, http.StatusBadRequest, "Bad Request", "")
@@ -649,7 +654,7 @@ func openUpstream(session *httpSession, username, password, nodeID, target strin
 		try.started = time.Now()
 	}
 	setupStart := time.Now()
-	raw, err := dialUpstream(addr)
+	raw, err := session.lim.dial(addr)
 	if err != nil {
 		try.failOpen(nodeID, l1metrics.ReasonDial, setupStart)
 		writeHTTPError(client, http.StatusBadGateway, "Bad Gateway", "")
@@ -677,7 +682,7 @@ func openUpstream(session *httpSession, username, password, nodeID, target strin
 		writeHTTPError(client, http.StatusBadGateway, "Bad Gateway", "")
 		return nil, err
 	}
-	if err := raw.SetReadDeadline(time.Now().Add(l2ResponseTimeout)); err != nil {
+	if err := raw.SetReadDeadline(time.Now().Add(session.lim.l2Response)); err != nil {
 		try.failOpen(nodeID, l1metrics.ReasonL2Deadline, setupStart)
 		writeHTTPError(client, http.StatusBadGateway, "Bad Gateway", "")
 		return nil, err
@@ -736,17 +741,18 @@ func openUpstream(session *httpSession, username, password, nodeID, target strin
 	}, nil
 }
 
-// retryPutDelete 默认关闭。RFC 9110 把 PUT 和 DELETE 标成幂等，
-// 但第一次请求可能已经到达源站，很多源站并不是真的幂等。
+// retryPutDelete 是进程默认值，默认关闭。一条连接用的是 proxyLimits.retryPutDelete，
+// 来自 LimitsFromConfig（JSON 的 retry_put_delete，或命令行 -retry-put-delete）。
+// RFC 9110 把 PUT 和 DELETE 标成幂等，但第一次请求可能已经到达源站，很多源站并不是真的幂等。
 // 打开之后也只在零个源站字节、且请求头没有写出一部分时重试。
 var retryPutDelete = false
 
-func retryableMethod(method string) bool {
+func retryableMethod(method string, putDelete bool) bool {
 	switch method {
 	case "GET", "HEAD", "OPTIONS", "TRACE":
 		return true
 	case "PUT", "DELETE":
-		return retryPutDelete
+		return putDelete
 	default:
 		return false
 	}
@@ -763,12 +769,12 @@ func brokenPipeOrEOF(err error) bool {
 }
 
 // classifyStale 只在复用隧道、这条请求还没有结果、并且调用方确认零个源站字节时使用。
-// 自动重试只接受对端把连接拆掉：EOF、UnexpectedEOF，以及写出时的 ECONNRESET、EPIPE、ECONNABORTED、ErrClosedPipe。
-// 读超时不是死隧道，返回 false, false，由调用方记原来的原因。
+// 自动重试只接受对端把连接拆掉：EOF、UnexpectedEOF，以及读或写时的 ECONNRESET、EPIPE、ECONNABORTED、ErrClosedPipe。
+// ECONNRESET 在读响应和写请求时都算断管。读超时不是死隧道，返回 false, false，由调用方记原来的原因。
 // partialWrite 表示请求头已经写出一部分，那些字节可能已经到了源站，不重试。
 // 整段头写完之后的读失败不是 partialWrite，Node 空闲关掉连接时仍要重试。
 // 正文已经从客户端读出同样不重试。本版不缓存正文。
-// 方法默认只有 GET、HEAD、OPTIONS、TRACE。PUT 和 DELETE 要打开 retryPutDelete。
+// 方法默认只有 GET、HEAD、OPTIONS、TRACE。PUT 和 DELETE 要这条连接的 retryPutDelete 为真。
 // 错误确实是断管、但不能重试时记 stale_tunnel。其它错误返回 false, false。
 func (t *httpTry) classifyStale(reused, bodyTouched, partialWrite bool, method string, err error) (retry, stale bool) {
 	if t == nil || err == nil || !reused || t.observed || t.retried {
@@ -777,7 +783,7 @@ func (t *httpTry) classifyStale(reused, bodyTouched, partialWrite bool, method s
 	if isTimeout(err) || !brokenPipeOrEOF(err) {
 		return false, false
 	}
-	if partialWrite || bodyTouched || !retryableMethod(method) {
+	if partialWrite || bodyTouched || !retryableMethod(method, t.retryPutDelete) {
 		return false, true
 	}
 	return true, false
@@ -871,10 +877,7 @@ func (u *upstream) relay(client net.Conn, clientMode *modeConn, clientBR *bufio.
 		if meta.code == http.StatusSwitchingProtocols {
 			if req.upgrade {
 				reason, err := pipeUpgrade(client, clientBR, u.conn, u.br, clientMode, u.mode, try)
-				if err != nil {
-					if reason == "" {
-						reason = l1metrics.ReasonAbortOriginReset
-					}
+				if err != nil && reason != "" {
 					l1metrics.AddHTTPBodyAbort(u.nodeID, reason)
 				}
 				return relayOutcome{endClient: true}, err
@@ -894,7 +897,9 @@ func (u *upstream) relay(client net.Conn, clientMode *modeConn, clientBR *bufio.
 		}
 		readFailed, err := relayResponseBody(downW, u.br, meta)
 		if err != nil {
-			l1metrics.AddHTTPBodyAbort(u.nodeID, bodyAbortReason(readFailed, err))
+			if reason := bodyAbortReason(readFailed, err); reason != "" {
+				l1metrics.AddHTTPBodyAbort(u.nodeID, reason)
+			}
 			return relayOutcome{endClient: true}, err
 		}
 		// 最终响应已经发出、但 Expect 的正文还没消费：不能在这条客户端连接上接着读下一个请求。
@@ -1104,7 +1109,10 @@ func copyUntilClose(dst io.Writer, src io.Reader) (bool, error) {
 }
 
 func bodyAbortReason(readFailed bool, err error) string {
-	if isTimeout(err) {
+	if errors.Is(err, errHalfCloseIdle) {
+		return ""
+	}
+	if errors.Is(err, errIdleExpired) || isTimeout(err) {
 		return l1metrics.ReasonAbortIdleTimeout
 	}
 	if readFailed {
@@ -1167,45 +1175,68 @@ func parseChunkSize(line []byte) (int64, error) {
 }
 
 // pipeUpgrade 在 101 之后进入与 CONNECT 相同的双向字节转发。
-// 半关闭后的空闲上限是 halfCloseIdleTimeout，整条隧道的空闲兜底仍是 tunnelIdleTimeout。
+// 半关闭后的空闲上限是这条连接的 halfCloseIdle，整条隧道的空闲兜底仍是 tunnelIdle。
 // io.Copy 在 EOF 上返回 nil。随后的 closeWrite 失败不当成隧道中断，也不去关另一端，
 // 否则另一方向会读到 use of closed network connection，把正常的 101 结束记成 abort。
-// 正常拆除返回的 error 为 nil，调用方不计数。
+// 某一方向先失败时，用 sync.Once 记下第一个真实错误，再关两端。
+// 另一方向因这次 Close 得到的 net.ErrClosed 不再覆盖原因。
+// 半关闭后的空闲超时返回空 reason，调用方不计数。正常拆除的 error 为 nil。
 func pipeUpgrade(client net.Conn, clientR io.Reader, up net.Conn, upR io.Reader, clientMode, upMode *modeConn, try *httpTry) (string, error) {
 	type copyResult struct {
 		reason string
 		err    error
 	}
-	errc := make(chan copyResult, 2)
+	var (
+		once    sync.Once
+		kept    copyResult
+		closing atomic.Bool
+	)
+	done := make(chan struct{}, 2)
+	halfIdle := halfCloseIdleTimeout
+	if clientMode != nil && clientMode.session != nil && clientMode.session.lim.halfCloseIdle > 0 {
+		halfIdle = clientMode.session.lim.halfCloseIdle
+	}
+	record := func(reason string, err error) {
+		if err == nil {
+			return
+		}
+		if closing.Load() && errors.Is(err, net.ErrClosed) {
+			return
+		}
+		// 半关闭空闲的 reason 是空的。仍然先记下，避免另一方向的关闭错误后来居上。
+		// 调用方看到空 reason 不进 body abort。
+		once.Do(func() { kept = copyResult{reason: reason, err: err} })
+		closing.Store(true)
+		client.Close()
+		up.Close()
+	}
 	relay := func(dst net.Conn, src io.Reader, reverse *modeConn, upload bool) {
+		defer func() { done <- struct{}{} }()
 		ew := &errWriter{w: countWriter{w: dst, try: try, up: upload}}
 		er := &errReader{r: src}
 		_, copyErr := io.Copy(ew, er)
 		if copyErr != nil {
-			client.Close()
-			up.Close()
-			errc <- copyResult{reason: upgradeAbortReason(upload, ew.failed, copyErr), err: copyErr}
+			record(upgradeAbortReason(upload, ew.failed, copyErr), copyErr)
 			return
 		}
 		_ = closeWrite(dst)
 		if reverse != nil {
 			reverse.half.Store(true)
-			_ = reverse.SetReadDeadline(time.Now().Add(halfCloseIdleTimeout))
+			_ = reverse.SetReadDeadline(time.Now().Add(halfIdle))
 		}
-		errc <- copyResult{}
 	}
 	go func() { relay(up, clientR, upMode, true) }()
 	go func() { relay(client, upR, clientMode, false) }()
-	first := <-errc
-	second := <-errc
-	if first.err != nil {
-		return first.reason, first.err
-	}
-	return second.reason, second.err
+	<-done
+	<-done
+	return kept.reason, kept.err
 }
 
 func upgradeAbortReason(upload, writeFailed bool, err error) string {
-	if isTimeout(err) {
+	if errors.Is(err, errHalfCloseIdle) {
+		return ""
+	}
+	if errors.Is(err, errIdleExpired) || isTimeout(err) {
 		return l1metrics.ReasonAbortIdleTimeout
 	}
 	if upload && writeFailed {
@@ -1379,8 +1410,9 @@ func isTimeout(err error) bool {
 	return errors.As(err, &ne) && ne.Timeout()
 }
 
-// modeConn 在每次 Read 前刷新空闲截止时间。半关闭后改用 halfCloseIdleTimeout。
+// modeConn 在每次 Read 前刷新空闲截止时间。半关闭后改用这条连接的 halfCloseIdle。
 // disabled 时不再改截止时间，留给 handleConnect 自己的 idleConn。
+// 会话空闲计时到点会先置位再 Close。这时的读错误记成 errIdleExpired，而不是 net.ErrClosed。
 type modeConn struct {
 	net.Conn
 	session  *httpSession
@@ -1389,16 +1421,29 @@ type modeConn struct {
 }
 
 func (m *modeConn) Read(p []byte) (int, error) {
+	lim := defaultLimits()
+	if m.session != nil {
+		lim = m.session.lim
+	}
 	if !m.disabled.Load() {
-		d := tunnelIdleTimeout
+		d := lim.tunnelIdle
 		if m.half.Load() {
-			d = halfCloseIdleTimeout
+			d = lim.halfCloseIdle
 		}
 		_ = m.Conn.SetReadDeadline(time.Now().Add(d))
 	}
 	n, err := m.Conn.Read(p)
 	if n > 0 && m.session != nil {
 		m.session.touch()
+	}
+	if err == nil || m.session == nil {
+		return n, err
+	}
+	if m.session.idleExpired.Load() {
+		return n, errIdleExpired
+	}
+	if m.half.Load() && isTimeout(err) {
+		return n, errHalfCloseIdle
 	}
 	return n, err
 }
@@ -1425,19 +1470,22 @@ func (p *prefixConn) CloseWrite() error {
 	return p.Conn.Close()
 }
 
-// httpSession 是明文 HTTP 连接上的空闲兜底，时长用 tunnelIdleTimeout。
-// 任一方向读到字节就重新计时。到点同时关掉客户端和当前上游。
+// httpSession 是明文 HTTP 连接上的空闲兜底，时长用 lim.tunnelIdle。
+// 任一方向读到字节就重新计时。到点先记下 idleExpired，再关掉客户端和当前上游。
 type httpSession struct {
-	client   net.Conn
-	mu       sync.Mutex
-	upstream net.Conn
-	timer    *time.Timer
-	stopped  bool
+	client      net.Conn
+	lim         proxyLimits
+	mu          sync.Mutex
+	upstream    net.Conn
+	timer       *time.Timer
+	stopped     bool
+	idleExpired atomic.Bool
 }
 
-func newHTTPSession(client net.Conn) *httpSession {
-	s := &httpSession{client: client}
-	s.timer = time.AfterFunc(tunnelIdleTimeout, s.fire)
+func newHTTPSession(client net.Conn, lim proxyLimits) *httpSession {
+	lim = fillLimits(lim)
+	s := &httpSession{client: client, lim: lim}
+	s.timer = time.AfterFunc(s.lim.tunnelIdle, s.fire)
 	return s
 }
 
@@ -1447,7 +1495,7 @@ func (s *httpSession) touch() {
 	if s.stopped || s.timer == nil {
 		return
 	}
-	s.timer.Reset(tunnelIdleTimeout)
+	s.timer.Reset(s.lim.tunnelIdle)
 }
 
 func (s *httpSession) setUpstream(c net.Conn) {
@@ -1475,12 +1523,32 @@ func (s *httpSession) fire() {
 		return
 	}
 	s.stopped = true
+	s.idleExpired.Store(true)
 	up := s.upstream
 	s.mu.Unlock()
 	s.client.Close()
 	if up != nil {
 		up.Close()
 	}
+}
+
+// notePartialHead 给已经读到一部分的请求头记拒绝。
+// 超时是 header_timeout，其它不完整是 bad_target。零字节不调用。
+// 请求行已经是 CONNECT 时走 CONNECT 的计数，避免把 CONNECT 算进明文 HTTP。
+func notePartialHead(head []byte, err error) {
+	if len(head) == 0 || err == nil {
+		return
+	}
+	reason := l1metrics.ReasonRejectBadTarget
+	// 读截止时间，或空闲计时先关掉连接，都是 header_timeout。零字节不走到这里。
+	if isTimeout(err) || errors.Is(err, errIdleExpired) {
+		reason = l1metrics.ReasonRejectHeaderTimeout
+	}
+	if requestMethod(head) == "CONNECT" {
+		l1metrics.RejectClient(reason)
+		return
+	}
+	l1metrics.RejectHTTP(reason)
 }
 
 func (s *httpSession) stop() {

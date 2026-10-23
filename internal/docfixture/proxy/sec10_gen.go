@@ -7,11 +7,14 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -37,7 +40,7 @@ var ErrNoHealthyAddr = errors.New("no healthy address")
 // 经 errors.Join 同时带上 ErrNoHealthyAddr 的错误也会留下原来的 ID，
 // 例如 errors.Join(ErrUnknownNode, ErrNoHealthyAddr)。Resolver 不得把这两个哨兵 Join 在一起。
 type Resolver interface {
-    Resolve(nodeID string) (addr string, err error)
+	Resolve(nodeID string) (addr string, err error)
 }
 
 // sharedSecret 是全系统那一份共享口令，与客户端登录 L1 以及 L2 的 auth.password 相同。
@@ -60,33 +63,171 @@ var tunnelIdleTimeout = 5 * time.Minute
 
 // dialUpstream 拨向选定 L2 的 HTTP 监听地址。默认 TCP，超时 3s。
 var dialUpstream = func(addr string) (net.Conn, error) {
-    return net.DialTimeout("tcp", addr, 3*time.Second)
+	return net.DialTimeout("tcp", addr, 3*time.Second)
+}
+
+// errIdleExpired 是整条隧道的空闲计时到点、并且已经关掉两端之后的读错误。
+// fire 在 Close 之前先置位。读到 net.ErrClosed 时改成这个错误，调用方记 idle_timeout，
+// 不再把这次关闭记成 origin_reset 或 client_cancel。
+var errIdleExpired = errors.New("tunnel idle timeout")
+
+// errHalfCloseIdle 是半关闭之后反方向的空闲读超时。
+// 一侧已经干净结束，这段等待是拆除，不是正文被截断，不进 proxy_http_body_abort_total。
+var errHalfCloseIdle = errors.New("idle after half-close")
+
+// proxyLimits 是一条连接使用的超时、重试开关和拨号函数。
+// 包级变量只作为进程默认值。LimitsFromConfig 从 JSON 配置文件和命令行得到一份，
+// 调用方把它传给 serveProxyConnLimited 或 handleConnect。请求路径不改包级变量。
+// 配置文件示例：
+// {"retry_put_delete":false,"tunnel_idle":"5m","half_close_idle":"30s","l2_response_timeout":"10s"}
+// 命令行：-proxy-config、-retry-put-delete、-tunnel-idle、-half-close-idle、-l2-response-timeout。
+type proxyLimits struct {
+	tunnelIdle     time.Duration
+	halfCloseIdle  time.Duration
+	l2Response     time.Duration
+	retryPutDelete bool
+	dial           func(string) (net.Conn, error)
+}
+
+func defaultLimits() proxyLimits {
+	return proxyLimits{
+		tunnelIdle:     tunnelIdleTimeout,
+		halfCloseIdle:  halfCloseIdleTimeout,
+		l2Response:     l2ResponseTimeout,
+		retryPutDelete: retryPutDelete,
+		dial:           dialUpstream,
+	}
+}
+
+// fillLimits 把没填的时长和拨号补成进程默认。retryPutDelete 以传入的值为准。
+func fillLimits(l proxyLimits) proxyLimits {
+	d := defaultLimits()
+	if l.tunnelIdle <= 0 {
+		l.tunnelIdle = d.tunnelIdle
+	}
+	if l.halfCloseIdle <= 0 {
+		l.halfCloseIdle = d.halfCloseIdle
+	}
+	if l.l2Response <= 0 {
+		l.l2Response = d.l2Response
+	}
+	if l.dial == nil {
+		l.dial = d.dial
+	}
+	return l
+}
+
+// LimitsFromConfig 先读 JSON 文件，再用命令行覆盖，返回一份 proxyLimits。
+// 不写包级变量。path 非空、且 args 里没有 -proxy-config 时，用 path。
+// -retry-put-delete 接受 true 或 false；命令行没写这项时，保留文件或默认值。
+func LimitsFromConfig(path string, args []string) (proxyLimits, error) {
+	lim := defaultLimits()
+	fs := flag.NewFlagSet("proxy", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	cfgPath := fs.String("proxy-config", "", "JSON 配置文件")
+	retryStr := fs.String("retry-put-delete", "", "true 则允许重试 PUT 和 DELETE")
+	tunnelStr := fs.String("tunnel-idle", "", "整条隧道空闲兜底，例如 5m")
+	halfStr := fs.String("half-close-idle", "", "半关闭后的空闲上限，例如 30s")
+	l2Str := fs.String("l2-response-timeout", "", "等待 L2 CONNECT 状态行的上限，例如 10s")
+	if err := fs.Parse(args); err != nil {
+		return proxyLimits{}, err
+	}
+	file := path
+	if *cfgPath != "" {
+		file = *cfgPath
+	}
+	if file != "" {
+		b, err := os.ReadFile(file)
+		if err != nil {
+			return proxyLimits{}, err
+		}
+		var cfg proxyFile
+		if err := json.Unmarshal(b, &cfg); err != nil {
+			return proxyLimits{}, err
+		}
+		if err := cfg.apply(&lim); err != nil {
+			return proxyLimits{}, err
+		}
+	}
+	if *retryStr != "" {
+		v, err := strconv.ParseBool(*retryStr)
+		if err != nil {
+			return proxyLimits{}, fmt.Errorf("retry-put-delete: %w", err)
+		}
+		lim.retryPutDelete = v
+	}
+	if err := applyDuration(&lim.tunnelIdle, *tunnelStr, "tunnel-idle"); err != nil {
+		return proxyLimits{}, err
+	}
+	if err := applyDuration(&lim.halfCloseIdle, *halfStr, "half-close-idle"); err != nil {
+		return proxyLimits{}, err
+	}
+	if err := applyDuration(&lim.l2Response, *l2Str, "l2-response-timeout"); err != nil {
+		return proxyLimits{}, err
+	}
+	return lim, nil
+}
+
+type proxyFile struct {
+	RetryPutDelete *bool  `json:"retry_put_delete"`
+	TunnelIdle     string `json:"tunnel_idle"`
+	HalfCloseIdle  string `json:"half_close_idle"`
+	L2Response     string `json:"l2_response_timeout"`
+}
+
+func (c proxyFile) apply(l *proxyLimits) error {
+	if c.RetryPutDelete != nil {
+		l.retryPutDelete = *c.RetryPutDelete
+	}
+	if err := applyDuration(&l.tunnelIdle, c.TunnelIdle, "tunnel_idle"); err != nil {
+		return err
+	}
+	if err := applyDuration(&l.halfCloseIdle, c.HalfCloseIdle, "half_close_idle"); err != nil {
+		return err
+	}
+	return applyDuration(&l.l2Response, c.L2Response, "l2_response_timeout")
+}
+
+func applyDuration(dst *time.Duration, raw, name string) error {
+	if raw == "" {
+		return nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return fmt.Errorf("%s: %w", name, err)
+	}
+	if d <= 0 {
+		return fmt.Errorf("%s must be > 0", name)
+	}
+	*dst = d
+	return nil
 }
 
 // username 格式示例: appuser@node-az01-003。
 // node_id 取最后一个 '@' 之后的部分，用户名本身可以含 '@'（例如 user@corp@node1 → node1）。
 func parseNodeID(username string) (user string, nodeID string, err error) {
-    i := strings.LastIndex(username, "@")
-    if i <= 0 || i == len(username)-1 {
-        return "", "", fmt.Errorf("invalid username format")
-    }
-    user, nodeID = username[:i], username[i+1:]
-    if strings.ContainsAny(nodeID, " \r\n/") {
-        return "", "", fmt.Errorf("invalid username format")
-    }
-    return user, nodeID, nil
+	i := strings.LastIndex(username, "@")
+	if i <= 0 || i == len(username)-1 {
+		return "", "", fmt.Errorf("invalid username format")
+	}
+	user, nodeID = username[:i], username[i+1:]
+	if strings.ContainsAny(nodeID, " \r\n/") {
+		return "", "", fmt.Errorf("invalid username format")
+	}
+	return user, nodeID, nil
 }
 
 // sharedPasswordOK 先哈希再比较，避免口令长度不同时 ConstantTimeCompare 直接返回。
 func sharedPasswordOK(password string) bool {
-    got := sha256.Sum256([]byte(password))
-    want := sha256.Sum256([]byte(sharedSecret))
-    return subtle.ConstantTimeCompare(got[:], want[:]) == 1
+	got := sha256.Sum256([]byte(password))
+	want := sha256.Sum256([]byte(sharedSecret))
+	return subtle.ConstantTimeCompare(got[:], want[:]) == 1
 }
 
 // target 为客户端 CONNECT 的 authority，形如 host:port；IPv6 字面量保留方括号。
 // password 与客户端登录 L1 的密码是同一份共享口令，不轮换。
-func handleConnect(clientConn net.Conn, username, password, target string, resolver Resolver) error {
+func handleConnect(clientConn net.Conn, username, password, target string, resolver Resolver, lim proxyLimits) error {
+	lim = fillLimits(lim)
 	defer clientConn.Close()
 
 	// 认证通过之后才发计量事件。握手耗时在结果确定时写入，不含后面的隧道时间。
@@ -186,7 +327,7 @@ func handleConnect(clientConn net.Conn, username, password, target string, resol
 	}
 
 	handshakeStart = time.Now()
-	upstreamConn, err := dialUpstream(upstreamAddr)
+	upstreamConn, err := lim.dial(upstreamAddr)
 	if err != nil {
 		l1metrics.Fail502(nodeID, l1metrics.ReasonDial)
 		finish(l1metrics.ReasonDial)
@@ -208,10 +349,10 @@ func handleConnect(clientConn net.Conn, username, password, target string, resol
 	// 等待 L2 时客户端读结束（EOF 或读错误），则关掉 upstream，让状态行读取立刻返回。
 	// io.Copy 遇到干净 EOF 时返回的 err 是 nil，clientGone 仍然关闭。
 	// 半关闭之后 idleConn 每次 Read 都重新拨空闲截止时间；读到字节则拨回整条隧道的兜底计时。
-	idle := &tunnelIdle{client: clientConn, upstream: upstreamConn}
+	idle := &tunnelIdle{client: clientConn, upstream: upstreamConn, timeout: lim.tunnelIdle}
 	defer idle.stop()
-	clientR := &idleConn{Conn: clientConn, onBytes: idle.touch}
-	upstreamR := &idleConn{Conn: upstreamConn, onBytes: idle.touch}
+	clientR := &idleConn{Conn: clientConn, onBytes: idle.touch, expired: &idle.expired, halfIdle: lim.halfCloseIdle}
+	upstreamR := &idleConn{Conn: upstreamConn, onBytes: idle.touch, expired: &idle.expired, halfIdle: lim.halfCloseIdle}
 	clientPipe, clientPumpW := io.Pipe()
 	defer clientPipe.Close()
 	clientGone := make(chan struct{})
@@ -231,7 +372,7 @@ func handleConnect(clientConn net.Conn, username, password, target string, resol
 	statusc := make(chan l2Status, 1)
 	go func() {
 		var st l2Status
-		if st.err = upstreamConn.SetReadDeadline(time.Now().Add(l2ResponseTimeout)); st.err != nil {
+		if st.err = upstreamConn.SetReadDeadline(time.Now().Add(lim.l2Response)); st.err != nil {
 			st.deadline = true
 			statusc <- st
 			return
@@ -296,145 +437,184 @@ func handleConnect(clientConn net.Conn, username, password, target string, resol
 
 	// br 可能已经缓冲了与 200 粘在一起的后续字节，转发必须从 br 读，不能另起一次 net.Conn 读。
 	// 从这里开始不再解析 HTTP，也不建立 TLS。io.Copy 会保持字节内容；是否换成 splice 不影响 JA3/JA4。
-	// 读或写出错：完全关闭两端，另一方向的 io.Copy 会立刻返回。
+	// 读或写出错：先记下第一个真实错误，再完全关闭两端。另一方向因此读到 net.ErrClosed，
+	// 那个错误是我们自己关出来的，不再覆盖已经记下的原因。
 	// 干净 EOF：只 CloseWrite。反方向若已经堵在 Read 里，先拨一次空闲截止时间把它唤醒；
-	// 之后每次 Read 再拨（见 idleConn）。连续 halfCloseIdleTimeout 没有字节才算超时。
+	// 之后每次 Read 再拨（见 idleConn）。连续 halfCloseIdle 没有字节才算超时。
 	// n 是 io.Copy 已经写到对端的字节，含写到一半才出错的那一部分。不含 CONNECT 头和 200 行。
 	idle.start()
-	errc := make(chan error, 2)
+	var (
+		once    sync.Once
+		kept    error
+		closing atomic.Bool
+	)
+	done := make(chan struct{}, 2)
+	record := func(err error) {
+		if err == nil {
+			return
+		}
+		if closing.Load() && errors.Is(err, net.ErrClosed) {
+			return
+		}
+		once.Do(func() { kept = err })
+		closing.Store(true)
+		clientConn.Close()
+		upstreamConn.Close()
+	}
 	relay := func(dst net.Conn, src io.Reader, reverse *idleConn, direction string, sink *atomic.Int64) {
+		defer func() { done <- struct{}{} }()
 		n, copyErr := io.Copy(dst, src)
 		if n > 0 {
 			sink.Add(n)
 			l1metrics.AddTunnelBytes(nodeID, direction, n)
 		}
 		if copyErr != nil {
-			clientConn.Close()
-			upstreamConn.Close()
-			errc <- copyErr
+			record(copyErr)
 			return
 		}
 		if werr := closeWrite(dst); werr != nil {
-			clientConn.Close()
-			upstreamConn.Close()
-			errc <- werr
+			record(werr)
 			return
 		}
 		reverse.halfClosed.Store(true)
-		_ = reverse.SetReadDeadline(time.Now().Add(halfCloseIdleTimeout))
-		errc <- nil
+		_ = reverse.SetReadDeadline(time.Now().Add(lim.halfCloseIdle))
 	}
 	// 客户端先 FIN：反方向是 upstreamR。上游先 FIN：反方向是 clientR。同一套空闲计时。
 	go func() { relay(upstreamConn, clientPipe, upstreamR, l1metrics.DirUp, &bytesUp) }()
 	go func() { relay(clientConn, br, clientR, l1metrics.DirDown, &bytesDown) }()
-	err1 := <-errc
-	err2 := <-errc
-	if err1 != nil {
-		return err1
-	}
-	return err2
+	<-done
+	<-done
+	return kept
 }
-// idleConn 在半关闭之后把读变成空闲超时：每次 Read 都先把截止时间拨到现在 + halfCloseIdleTimeout。
+
+// idleConn 在半关闭之后把读变成空闲超时：每次 Read 都先把截止时间拨到现在 + halfIdle。
 // 读到字节时触碰整条隧道的兜底计时。半关闭之前不改截止时间，握手阶段的读超时仍然有效。
+// expired 在 tunnelIdle.fire 关掉连接之前置位。这时的读错误是空闲到点，不是对端 RST。
 type idleConn struct {
-    net.Conn
-    halfClosed atomic.Bool
-    onBytes    func()
+	net.Conn
+	halfClosed atomic.Bool
+	onBytes    func()
+	expired    *atomic.Bool
+	halfIdle   time.Duration
 }
 
 func (c *idleConn) Read(p []byte) (int, error) {
-    if c.halfClosed.Load() {
-        _ = c.Conn.SetReadDeadline(time.Now().Add(halfCloseIdleTimeout))
-    }
-    n, err := c.Conn.Read(p)
-    if n > 0 && c.onBytes != nil {
-        c.onBytes()
-    }
-    return n, err
+	if c.halfClosed.Load() {
+		d := c.halfIdle
+		if d <= 0 {
+			d = halfCloseIdleTimeout
+		}
+		_ = c.Conn.SetReadDeadline(time.Now().Add(d))
+	}
+	n, err := c.Conn.Read(p)
+	if n > 0 && c.onBytes != nil {
+		c.onBytes()
+	}
+	if err == nil {
+		return n, nil
+	}
+	if c.expired != nil && c.expired.Load() {
+		return n, errIdleExpired
+	}
+	if c.halfClosed.Load() && isTimeout(err) {
+		return n, errHalfCloseIdle
+	}
+	return n, err
 }
 
-// tunnelIdle 在任一方向读到字节时把关闭时刻推后 tunnelIdleTimeout。
-// 到点仍没有新字节，就同时关掉客户端和上游。
+// tunnelIdle 在任一方向读到字节时把关闭时刻推后 timeout。
+// 到点仍没有新字节，先记下 expired，再同时关掉客户端和上游。
 type tunnelIdle struct {
-    client, upstream net.Conn
-    mu               sync.Mutex
-    timer            *time.Timer
-    stopped          bool
+	client, upstream net.Conn
+	mu               sync.Mutex
+	timer            *time.Timer
+	stopped          bool
+	expired          atomic.Bool
+	timeout          time.Duration
 }
 
 func (t *tunnelIdle) start() {
-    t.mu.Lock()
-    defer t.mu.Unlock()
-    if t.stopped {
-        return
-    }
-    t.timer = time.AfterFunc(tunnelIdleTimeout, t.fire)
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.stopped {
+		return
+	}
+	d := t.timeout
+	if d <= 0 {
+		d = tunnelIdleTimeout
+	}
+	t.timer = time.AfterFunc(d, t.fire)
 }
 
 func (t *tunnelIdle) touch() {
-    t.mu.Lock()
-    defer t.mu.Unlock()
-    if t.timer == nil || t.stopped {
-        return
-    }
-    t.timer.Reset(tunnelIdleTimeout)
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.timer == nil || t.stopped {
+		return
+	}
+	d := t.timeout
+	if d <= 0 {
+		d = tunnelIdleTimeout
+	}
+	t.timer.Reset(d)
 }
 
 func (t *tunnelIdle) fire() {
-    t.mu.Lock()
-    if t.stopped {
-        t.mu.Unlock()
-        return
-    }
-    t.stopped = true
-    t.mu.Unlock()
-    t.client.Close()
-    t.upstream.Close()
+	t.mu.Lock()
+	if t.stopped {
+		t.mu.Unlock()
+		return
+	}
+	t.stopped = true
+	t.expired.Store(true)
+	t.mu.Unlock()
+	t.client.Close()
+	t.upstream.Close()
 }
 
 func (t *tunnelIdle) stop() {
-    t.mu.Lock()
-    defer t.mu.Unlock()
-    t.stopped = true
-    if t.timer != nil {
-        t.timer.Stop()
-    }
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.stopped = true
+	if t.timer != nil {
+		t.timer.Stop()
+	}
 }
 
 // closeWrite 关闭写端，使对端读到 EOF，同时保留本端读端。不是 TCP 连接时退化为完全关闭。
 func closeWrite(conn net.Conn) error {
-    if cw, ok := conn.(interface{ CloseWrite() error }); ok {
-        return cw.CloseWrite()
-    }
-    return conn.Close()
+	if cw, ok := conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return conn.Close()
 }
 
 func readConnectStatus(r *bufio.Reader) (int, string, error) {
-    line, err := r.ReadString('\n')
-    if err != nil {
-        return 0, "", err
-    }
-    parts := strings.SplitN(strings.TrimSpace(line), " ", 3)
-    if len(parts) < 2 {
-        return 0, "", fmt.Errorf("bad status line")
-    }
-    code, err := strconv.Atoi(parts[1])
-    if err != nil {
-        return 0, "", err
-    }
-    var proxyAuthenticate string
-    for i := 0; i < 64; i++ {
-        line, err = r.ReadString('\n')
-        if err != nil {
-            return 0, "", err
-        }
-        if line == "\r\n" || line == "\n" {
-            return code, proxyAuthenticate, nil
-        }
-        key, val, ok := strings.Cut(strings.TrimRight(line, "\r\n"), ":")
-        if ok && proxyAuthenticate == "" && strings.EqualFold(strings.TrimSpace(key), "Proxy-Authenticate") {
-            proxyAuthenticate = strings.TrimSpace(val)
-        }
-    }
-    return 0, "", fmt.Errorf("l2 response headers too long")
+	line, err := r.ReadString('\n')
+	if err != nil {
+		return 0, "", err
+	}
+	parts := strings.SplitN(strings.TrimSpace(line), " ", 3)
+	if len(parts) < 2 {
+		return 0, "", fmt.Errorf("bad status line")
+	}
+	code, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return 0, "", err
+	}
+	var proxyAuthenticate string
+	for i := 0; i < 64; i++ {
+		line, err = r.ReadString('\n')
+		if err != nil {
+			return 0, "", err
+		}
+		if line == "\r\n" || line == "\n" {
+			return code, proxyAuthenticate, nil
+		}
+		key, val, ok := strings.Cut(strings.TrimRight(line, "\r\n"), ":")
+		if ok && proxyAuthenticate == "" && strings.EqualFold(strings.TrimSpace(key), "Proxy-Authenticate") {
+			proxyAuthenticate = strings.TrimSpace(val)
+		}
+	}
+	return 0, "", fmt.Errorf("l2 response headers too long")
 }

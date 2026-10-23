@@ -7,7 +7,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
@@ -49,35 +48,48 @@ type labKey struct {
 
 var (
 	evMu       sync.Mutex
+	evCond     = sync.NewCond(&evMu)
+	evBusy     bool
 	evLog      []l1metrics.MeterEvent
 	evBase     int
 	baseSeries map[labKey]float64
 )
 
 func consumeMeters() {
-	for ev := range l1metrics.MeterEvents() {
+	ch := l1metrics.MeterEvents()
+	for {
+		evMu.Lock()
+		if len(ch) > 0 {
+			evBusy = true
+		}
+		evMu.Unlock()
+		ev, ok := <-ch
+		if !ok {
+			evMu.Lock()
+			evBusy = false
+			evCond.Broadcast()
+			evMu.Unlock()
+			return
+		}
 		evMu.Lock()
 		evLog = append(evLog, ev)
+		evBusy = len(ch) > 0
+		evCond.Broadcast()
 		evMu.Unlock()
 	}
 }
 
 func waitMeterIdle() {
 	ch := l1metrics.MeterEvents()
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		if len(ch) == 0 {
-			time.Sleep(2 * time.Millisecond)
-			if len(ch) == 0 {
-				return
-			}
-			continue
-		}
-		time.Sleep(time.Millisecond)
+	evMu.Lock()
+	for len(ch) > 0 || evBusy {
+		evCond.Wait()
 	}
+	evMu.Unlock()
 }
 
 func resetMetrics() {
+	handlers.Wait()
 	waitMeterIdle()
 	evMu.Lock()
 	evBase = len(evLog)
@@ -124,7 +136,7 @@ func snapMetrics() metricSnap {
 }
 
 var (
-	rejectOrder        = []string{"auth", "no_node", "bad_target", "bad_credential"}
+	rejectOrder        = []string{"auth", "no_node", "bad_target", "bad_credential", "header_timeout"}
 	connectResultOrder = []string{
 		"ok", "dial", "l2_write", "l2_deadline", "l2_response", "l2_status", "l2_auth", "client_gone",
 	}
