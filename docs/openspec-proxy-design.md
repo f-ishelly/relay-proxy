@@ -1,9 +1,10 @@
 # OpenSpec 设计文档：多级高性能隧道代理（Pro 模式）
 
-- **文档版本**：v0.5（预研阶段）
+- **文档版本**：v0.6（HTTP 流程与链路安全）
 - **日期**：2026-10-22
 - **状态**：Draft / 可进入 PoC
 - **目标**：参考商业隧道代理 Pro 模式，设计“一级代理 + 二级代理”多级转发系统，支持通过 `username` 指定二级节点、TLS 指纹透传、应用层与 eBPF 监控、etcd 自动服务发现。
+- **v0.6 变更**：补上明文 HTTP（非 CONNECT）和 L1→L2 链路。明文 HTTP 由 L1 鉴权、按最后一个 `@` 切出 `node_id`，再向 gost 发一次 `CONNECT`，把 absolute-form 改成 origin-form 并删掉逐跳头，其余头行按原字节转发。不把 absolute-form 交给 gost 的 HTTP 转发：gost v3.3.1 会重排头、改大小写并注入 `User-Agent`。L1→L2 走内网，不加密、不做 mTLS；两端都不终结客户端 TLS。共享口令在内网明文传输写进 §12，作为已接受项，前提是内网隔离且 L2 只监听内网地址。§1.2、§2.1 与 §3 的 gost 示例与此对齐。§7、§8 未改。
 - **v0.5 变更**：建连时延增加闭合的 `result` 标签，拨号之后的成功和失败都观察，§7.3 的 P95 与成功样本只取 `result="ok"`。补回隧道时长 `proxy_tunnel_duration_seconds`，并增加两个方向的字节计数 `proxy_tunnel_bytes_total`。等待 L2 状态行时客户端读泵先结束记 `proxy_client_abort_total{reason="client_gone"}`，不记 `l2_response`，不进上游失败率。用户名和目标域名走计量事件，不进 Prometheus 标签。商业统计对照见附录 B，开源管理面结论见附录 C。
 - **v0.4 变更**：落地 L2 向 etcd 的注册（issue #5），并吸收 v0.3.1 的文档勘误，不另立版本号。节点是虚拟机，admin 是 Go，进程内调用 `registrar`；`nodeId` 来自环境变量 `RELAY_NODE_ID`。key 为 `/relay/l2/{nodeId}`，`value.addr` 是内网地址。每台虚拟机一个 lease（TTL 10s，每 3s 续租）。一次拨号加出口校验约 5s、失败率低于 1%；计划内重拨后出口 IP 必须变化，否则不注册。巡检每 1 分钟，外网或 CPU/内存异常都 Delete key。同一宿主机异常时一批 key 一起过期。详见 §8。勘误（原 v0.3.1）：§10 示例对空口令显式回 `407`；§10 与 §12 写明整条隧道空闲兜底（默认 5 分钟）会关掉长时间静默的 WebSocket、长轮询等长连接，应用需自带心跳，TCP keepalive 不算数据；§4.2 TunnelForwarder 补上 L2 `407` 透传和两级空闲计时；附录 A.5 写明缺端口回 `400`；§4.1 架构图删去 L2 到 Prometheus 的指标连线，gost 自带指标不在 M1；§7.3 注明等待 L2 应答时客户端先断开也计入 `l2_response`。v0.2.1 变更说明补全了当时引入的 400/407 规则。
 - **v0.3 变更**：M1 PoC 的可观测改为 L1 应用层 Prometheus 指标。L1 用 `prometheus/client_golang` 暴露 `proxy_conn_active`、`proxy_connect_latency_ms`、`proxy_upstream_fail_total`，以及本地拒绝计数 `proxy_client_reject_total`。eBPF 只采集内核指标，移到 M2。两类来源和告警在 §7 分开。与 v0.2.1 的半关闭和 10s 应答等待合在同一份数据面上打点。`node_id` 失败关闭：只有 `Resolve` 返回 `ErrNoHealthyAddr` 时保留原来的 ID，其余解析错误记 `unknown`。
@@ -31,7 +32,9 @@
 - 不做 HTTPS MITM 解密与内容审计。
 - 不做复杂计费系统（仅预留指标）。
 - 不做跨地域智能调度（初版可基于静态策略 + etcd 健康状态）。
-- 不在本文件决定明文 HTTP（非 CONNECT）的头部处理，以及 L1↔L2 传输加密方式。etcd 注册的实现形态已在 §8 定下来：admin 进程内嵌 `registrar`，不再使用独立的 HAProxy / Envoy 注册 sidecar。
+- etcd 注册的实现形态已在 §8 定下来：admin 进程内嵌 `registrar`，不再使用独立的 HAProxy / Envoy 注册 sidecar。
+
+本文件已经决定明文 HTTP（非 CONNECT）的处理方式：方案 B，见 §5.3–§5.6。L1↔L2 走内网明文，不加密、不做 mTLS，见 §6 和 §12 第 6 条。
 
 ---
 
@@ -42,7 +45,7 @@
 - 认证：支持 `BasicAuth`/`Proxy-Authorization`。全系统一份共享口令，不轮换。客户端用它登录 L1；L1 校验后把同一组用户名和密码写进发往 L2 的 `Proxy-Authorization`。用户名仍是 `user@node_id`，供 L1 选路。v1 接受由此带来的暴露面：任一 L2 都能看到这把钥匙，泄露后它对 L1 和全部 L2 继续有效，也不能按调用方吊销。
 - 路由：从 `username` 解析二级节点 ID（如：`user@node-az01-003`），再从本地路由表得到该节点的 L2 监听地址。
 - 转发：L1 向选中的 L2 发送 HTTP `CONNECT host:port`，L2 返回 `200` 后，双向原样转发隧道字节。
-- 协议：支持 HTTP 请求代理 + HTTPS CONNECT 隧道。本版把 CONNECT 隧道的目标传递定下来；明文 HTTP 仍是独立数据面。
+- 协议：支持 HTTP 请求代理 + HTTPS CONNECT 隧道。明文 HTTP（非 CONNECT）的处理方式已在本文件决定，采用方案 B：L1 鉴权并按最后一个 `@` 切出 `node_id` 后向 L2 发 `CONNECT`，把 absolute-form 改成 origin-form，其余头行按原字节转发，见 §5.3–§5.6。L1↔L2 走内网明文，不加密、不做 mTLS，见 §6 和 §12 第 6 条。
 - 透传：TLS 握手报文、ALPN、SNI、JA3/JA4 特征在链路上不被篡改。`200` 之后只有 TCP 字节转发，没有 TLS 终结或重新握手。
 
 ### 2.2 非功能需求
@@ -89,7 +92,7 @@ gost 的配置形态：
 ```yaml
 services:
   - name: l2
-    addr: ":8080"
+    addr: "10.x.x.x:8080"
     bypass: egress-deny
     handler:
       type: http
@@ -109,7 +112,7 @@ bypasses:
       - fe80::/10
 ```
 
-`listener` 保持 `tcp`。`http+tls` / `https` 监听会终结的是 L1↔L2 这一跳的外层 TLS，不是客户端到源站的 TLS；外层加密不在本文件决定。`mitm.certFile` / `mitm.keyFile` 不应出现。上面的 `bypass` 是黑名单，只比请求里的主机字符串；域名解析进这些网段时不会命中。拨号前还要对解析结果做一次同样的网段判断，见附录 A.5。
+`addr` 里的 `10.x.x.x` 是内网地址占位，部署时换成该 L2 的内网地址。只绑定内网，不用 `:8080` 这种全接口监听，也不把 `0.0.0.0` 暴露在公网接口上。`listener` 保持 `tcp`。L1↔L2 走内网明文，不加密、不做 mTLS，见 §6 和 §12 第 6 条。`http+tls` / `https` 监听会终结这一跳的外层 TLS，不是客户端到源站的 TLS，本版不用。`mitm.certFile` / `mitm.keyFile` 不应出现。上面的 `bypass` 是黑名单，只比请求里的主机字符串；域名解析进这些网段时不会命中。拨号前还要对解析结果做一次同样的网段判断，见附录 A.5。
 
 ### 3.3 选择理由
 
@@ -184,7 +187,7 @@ sequenceDiagram
     T-->>U: TLS ServerHello 及后续记录（经 L2、L1 原样返回）
 ```
 
-L1 必须先收到 L2 的 `200`（L2 已经与目标完成 TCP 握手），再向客户端回 `200`。在此之前客户端不应发出 ClientHello。客户端口令为空或不匹配时，L1 直接回 `407`，不拨 L2，计入 `proxy_client_reject_total{reason="auth"}`。目标不是 `host:port`（缺少端口）回 `400`，`reason="bad_target"`；用户名里没有 `node_id` 回 `400`，`reason="no_node"`。用户名或口令含 CR/LF 也是本地 `400`，`reason="bad_credential"`。这些本地 400/407 都不拨 L2。L2 返回 `407` 时，L1 把 `407` 和 `Proxy-Authenticate` 交给客户端，不改写成 `502`，计入 `proxy_upstream_fail_total{reason="l2_auth"}`。L2 的其他非 2xx、应答超时或拨号失败才转为 `502`，按 §7.1 的 `reason` 计入 `proxy_upstream_fail_total`。等待状态行时的读超时，且客户端读泵尚未结束，是 `reason="l2_response"`。客户端读泵先结束、状态行还没解析出来时记 `client_gone`，不记 `l2_response`。这些失败路径上都不会开始传输隧道字节。建连时延、连接时长和上下行字节的打点见 §7.1。
+L1 必须先收到 L2 的 `200`（L2 已经与目标完成 TCP 握手），再向客户端回 `200`。在此之前客户端不应发出 ClientHello。客户端口令为空或不匹配时，L1 直接回 `407`，不拨 L2，计入 `proxy_client_reject_total{reason="auth"}`。目标不是 `host:port`（缺少端口）回 `400`，`reason="bad_target"`；用户名里没有 `node_id` 回 `400`，`reason="no_node"`。用户名或口令含 CR/LF 也是本地 `400`，`reason="bad_credential"`。这些本地 400/407 都不拨 L2。L2 返回 `407` 时，L1 把 `407` 和 `Proxy-Authenticate` 交给客户端，不改写成 `502`，计入 `proxy_upstream_fail_total{reason="l2_auth"}`。L2 的其他非 2xx、应答超时或拨号失败才转为 `502`，按 §7.1 的 `reason` 计入 `proxy_upstream_fail_total`。等待状态行时的读超时，且客户端读泵尚未结束，是 `reason="l2_response"`。客户端读泵先结束、状态行还没解析出来时记 `client_gone`，不记 `l2_response`。这些失败路径上都不会开始传输隧道字节。建连时延、连接时长和上下行字节的打点见 §7.1。L1→L2 这一跳按 §6 走内网，不加密。明文 HTTP 不向客户端回 `200 Connection Established`，见 §5.3。
 
 ### 5.2 流程图（路由决策）
 
@@ -210,9 +213,136 @@ flowchart TD
     K --> I[双向原样转发并记录指标]
 ```
 
-图中的 `X`、`Y`、`Z`、`H`、`J`、`K` 与 §7.1 对应。`X`（本地 407）和 `Y`（本地 400）计入 `proxy_client_reject_total`，不拨 L2。进入 `Z` 的 `502` 计入 `proxy_upstream_fail_total`，`reason` 按路径分开。`J -- 407` 不进入 `Z`，单独记 `reason="l2_auth"`。`proxy_connect_latency_ms` 从 `H` 拨号起计时，拨号及之后的每个结束结果都观察，并带闭合的 `result` 标签；`result="ok"` 仍是 L2 返回 `200`。等待状态行时客户端读泵先结束且状态行未解析，不进入 `Z`，也不记 `l2_response`。`proxy_conn_active` 在 `K` 向客户端写出 `200` 之后随隧道增减；客户端断开后，这个 gauge 最长还会多停半关闭空闲（默认 30s）或隧道空闲（默认 5 分钟）。连接时长、上下行字节、`client_gone` 的判定，以及和 §10 每一处回写的对应，见 §7.1。
+图中的 `X`、`Y`、`Z`、`H`、`J`、`K` 与 §7.1 对应。`X`（本地 407）和 `Y`（本地 400）计入 `proxy_client_reject_total`，不拨 L2。进入 `Z` 的 `502` 计入 `proxy_upstream_fail_total`，`reason` 按路径分开。`J -- 407` 不进入 `Z`，单独记 `reason="l2_auth"`。`proxy_connect_latency_ms` 从 `H` 拨号起计时，拨号及之后的每个结束结果都观察，并带闭合的 `result` 标签；`result="ok"` 仍是 L2 返回 `200`。等待状态行时客户端读泵先结束且状态行未解析，不进入 `Z`，也不记 `l2_response`。`proxy_conn_active` 在 `K` 向客户端写出 `200` 之后随隧道增减；客户端断开后，这个 gauge 最长还会多停半关闭空闲（默认 30s）或隧道空闲（默认 5 分钟）。连接时长、上下行字节、`client_gone` 的判定，以及和 §10 每一处回写的对应，见 §7.1。这张图描述 CONNECT：L2 返回 200 之后向客户端写 `200`，再双向拷贝。明文 HTTP 在认证、选路和向 L2 发 CONNECT 之前与图相同；L2 返回 200 之后改为 §5.3，把源站响应原样交回，不写 L1 自己的 `200`。
 
 ---
+
+### 5.3 明文 HTTP（非 CONNECT）
+
+客户端把普通 HTTP 写成 absolute-form，例如 `GET http://host/path HTTP/1.1`。L1 先用与 CONNECT 相同的共享口令做鉴权，再按用户名最后一个 `@` 切出 `node_id`，向选中的 L2 发第二次 `CONNECT host:port`。L2 返回 `200` 之后，L1 把改写过的请求字节写进隧道。gost 在这条隧道里只转发字节，不再解析 HTTP。
+
+另一条路是 L1 自己当 HTTP 代理，把 absolute-form 交给 gost，由 gost 向源站重新发请求。不采用。比较和实测见 §5.4。推荐 CONNECT 之后写字节，是为了保住业务层要的 HTTP/1.1 头顺序和大小写。
+
+```mermaid
+sequenceDiagram
+    participant U as User Client
+    participant L1 as L1 Proxy
+    participant L2 as L2 gost
+    participant T as Origin
+
+    U->>L1: GET http://host/path HTTP/1.1 + Proxy-Authorization
+    L1->>L1: 校验共享口令，按最后一个 @ 切 node_id
+    L1->>L2: CONNECT host:port + 同一份 Proxy-Authorization
+    L2->>T: TCP 握手
+    L2-->>L1: 200 Connection Established
+    Note over L1: 不向客户端写 200 Connection Established
+    L1->>L2: origin-form 请求，其余头行保持原字节
+    L2->>T: 原样转发
+    T-->>U: 源站状态行、头和正文，经 L2、L1 原样返回
+```
+
+L1 在收到 L2 的 `200` 之前，不向源站写这份请求。成功时也不向客户端写 `200 Connection Established`：客户端等的是源站自己的状态行。本地失败和 L2 这条 CONNECT 的失败，仍用 §5.1 的 400 / 407 / 502，见 §5.6。
+
+`Expect: 100-continue` 时，上面「写入请求」分成两段：先写头部，把源站的 `100` 原样交回，再写正文。`101 Switching Protocols` 之后，两侧改成和 CONNECT 一样的双向字节拷贝。
+
+### 5.4 两种转发方式
+
+方案 A：L1 把客户端的 absolute-form 请求转给 gost 的 HTTP handler，由 `http.Transport` 访问源站。
+
+方案 B：L1 先对 L2 `CONNECT host:port`。隧道起来之后只写入改写过的原始字节。gost 不解析隧道里的 HTTP。
+
+| | 方案 A：absolute-form 交给 gost | 方案 B：CONNECT 之后写字节 |
+| --- | --- | --- |
+| 头顺序和大小写 | gost v3.3.1 走 `net/http` 的 Transport。头名收成规范形式，写出时按名字排序。`x-custom` 变成 `X-Custom`，并和另一条 `X-Custom` 合成同一个名字 | L1 只重写请求行，并按行删掉逐跳头。留下的头行是客户端原来的字节 |
+| Host | 客户端写的 Host 换成 absolute-URI 的 host:port。`hOsT: KeepMe.Example` 到不了源站 | 拨号目标取 absolute-URI 的 authority。Host 头原样保留，即使它和 URI 不一致 |
+| 多出来的头 | 没有 User-Agent 时补 `User-Agent: Go-http-client/1.1`。`keepalive` 默认关闭，于是补 `Connection: close`。Content-Length 为 0 的 GET 会丢掉这一行 | 不补 User-Agent、Via、X-Forwarded-For、Forwarded、X-Real-IP |
+| 逐跳头 | gost 会删 Proxy-Authorization 和 Proxy-Connection，但整份请求被重新序列化 | 控制面的 Proxy-Authorization 只放在 L1→L2 的 CONNECT 上。隧道里的那一份删掉，源站看不到 |
+| 100-continue 和 Upgrade | Transport 自己处理 Expect；101 能做，请求和响应都经过重新序列化 | 先写头，把源站的 100 或最终响应原样交回，收到 100 才写正文。101 之后是字节隧道 |
+| 超时 | 响应头默认最多等 15s（`readTimeout`），和本文的 10s、5 分钟不是同一套 | L2 的 CONNECT 用拨号 3s 和 `l2ResponseTimeout` 10s。隧道建立后用 `tunnelIdleTimeout` 5 分钟、`halfCloseIdleTimeout` 30s |
+| 失败语义 | 和 CONNECT 的 400 / 407 / 502 混在 gost 自己的状态里 | CONNECT 控制面的失败与 §5.1 相同。成功之后源站状态码原样返回 |
+
+gost v3.3.1 上方案 A 的一次实测：客户端发送 `hOsT: KeepMe.Example`、`X-Zz-Trace`、`x-custom`，没有 User-Agent。源站收到：
+
+```
+GET /PaTh?q=1 HTTP/1.1
+Host: 127.0.0.1:port
+User-Agent: Go-http-client/1.1
+X-Custom: MiXeD
+X-Zz-Trace: one
+Connection: close
+```
+
+路径和 query 还在，也没有 Via 或 X-Forwarded-For。头的顺序、大小写和 Host 都变了，还多了 User-Agent。这不满足业务层对 HTTP/1.1 指纹的要求。
+
+采用方案 B。L2 仍然是 gost 的 HTTP 正向代理。明文 HTTP 复用它已经在用的 CONNECT 字节隧道，不走它的 HTTP 重新序列化。
+
+### 5.5 改写、逐跳头、复用和正文
+
+请求行从 `METHOD SP absolute-URI SP HTTP/1.1` 改成 `METHOD SP origin-form SP HTTP/1.1`。方法、路径和 query 的字节保留，百分号不解码。没有路径时 origin-form 是 `/`。fragment 和 userinfo 丢掉，既不进入 CONNECT 目标，也不进入 origin-form。scheme 只接受 `http`（大小写不敏感）。`https://` 的明文请求回 400，应当改走 CONNECT。origin-form、`*` 以及没有 host 的请求也是 400。缺端口时 CONNECT 目标用 80。IPv6 保留方括号，例如 `[::1]:80`。
+
+拨号用的 host:port 来自 absolute-URI，不来自 Host 头。Host 头有就原样保留，没有也不补。两者不一致时不改 Host。
+
+按整行删除的逐跳头（名字大小写不敏感）：
+
+- `Proxy-Authorization`、`Proxy-Connection`、`Keep-Alive`、`TE`、`Trailer`、`Proxy-Authenticate`
+- `Connection` 里点名的头。`close`、`keep-alive`、`upgrade`、`transfer-encoding` 这四个是指令，不按头名删除
+
+`Transfer-Encoding` 保留。正文按客户端的 chunked 帧原样拷贝，不解码再编码。同时带有 `Transfer-Encoding: chunked` 和 `Content-Length` 时删掉 `Content-Length`，避免请求走私。
+
+`Connection` 是唯一可能改值的头：去掉那些指向已删除头的 token。token 集合没有变化时，这一行连空格都保持原样；变成空的就整行删除。Upgrade 时保留 `Upgrade` 和 `Connection`。
+
+`Proxy-Connection` 只决定 L1 和客户端之间还要不要保持这条连接。它不转给源站，也不翻译成 `Connection`。
+
+不添加 `Via`、`X-Forwarded-For`、`Forwarded`、`X-Real-IP`、`User-Agent`。客户端自己带了 `X-Forwarded-For` 就原样留下，不追加第二份。
+
+同一条客户端连接上的请求串行处理。上一个响应写完才读下一个，不把管道请求并发打到源站。bufio 里已经读进来的下一个请求留到当前响应结束。
+
+Keep-alive：
+
+- 客户端一侧：HTTP/1.1 默认保持，除非 `Connection: close` 或 `Proxy-Connection: close`。HTTP/1.0 默认关闭，除非其中一个写了 `keep-alive`。
+- 源站一侧：HTTP/1.1 默认保持，除非 `Connection: close`，或者响应既没有 Content-Length 也没有 chunked（只能读到对端关闭）。HTTP/1.0 只有 `Connection: keep-alive` 才保持。
+- 一条客户端连接至多留一条 L2 隧道。下一条请求的 `node_id` 和 `host:port` 都相同，而且两边都还要保持，就把下一条请求写进同一条隧道，源站看到连接复用。主机或 node 变了，或者任一边要求关闭，就关掉隧道，下一条再发 CONNECT。
+- 每条请求都重新校验口令并切 `node_id`。同一条连接上可以换 node。
+
+正文按 `Content-Length` 或 chunked 原样转发。两个都没有，则正文为空，不把连接读到关闭。chunk 的 size 行、扩展和 trailer 原样拷贝；trailer 里不做逐跳头删除。HEAD 的响应不读正文。1xx、204、304 没有正文。
+
+`Expect: 100-continue` 而且确实有正文时，L1 先只把头部写入隧道，不自己回 100。源站的 1xx（含 100）原样交给客户端。看到 100 之后才写正文，然后再读最终响应。源站直接给了最终响应（例如 417）就不写正文，并关掉这条客户端连接，避免还没消费的正文被当成下一个请求。已经向客户端写出过源站的任何字节（包括 100）之后，后续失败只关连接，不再补 502。
+
+Upgrade（含 WebSocket）要同时满足：有非空的 `Upgrade`，并且 `Connection` 含 `upgrade`。这两个头都保留，`Proxy-Authorization` 仍然删除。响应是 101 时，之后双向拷贝原始字节，半关闭和空闲计时与 CONNECT 相同。101 结束这条客户端连接，不再当 HTTP 复用。不是 101 就按普通响应处理。
+
+### 5.6 状态码、失败语义和超时
+
+鉴权和选路的顺序与 CONNECT 相同，都在拨 L2 之前完成：
+
+| 条件 | 客户端 | 是否拨 L2 | reason |
+| --- | --- | --- | --- |
+| 用户名或口令含 CR/LF | 400 | 否 | `bad_credential` |
+| 口令为空、无法解析，或与共享口令不一致 | 407，带 `Proxy-Authenticate` | 否 | `auth` |
+| 用户名切不出 `node_id` | 400 | 否 | `no_node` |
+| 不是 `http` absolute-form，主机或端口非法，头部超过 64KiB，或头部语法不成立 | 400 | 否 | `bad_target` |
+| 解析不到 L2 | 502 | 否 | `no_upstream`。只有 `ErrNoHealthyAddr` 保留原来的 `node_id` |
+| 拨号失败 | 502 | 已尝试 | `dial` |
+| 写出 CONNECT 失败；或隧道建立后、客户端还没收到源站字节时，请求字节写失败 | 502 | 是 | `l2_write` |
+| 设置或清除读截止时间失败 | 502 | 是 | `l2_deadline` |
+| 读不到 L2 的 CONNECT 状态行；或隧道建立后、客户端还没收到源站字节时，读不到源站状态行 | 502 | 是 | `l2_response` |
+| L2 返回 407 | 407，原样带上 `Proxy-Authenticate` | 是 | `l2_auth` |
+| L2 的其他非 200 | 502 | 是 | `l2_status` |
+
+这些 reason 复用 §7.1 已有的标签，参考代码调用同一组 `l1metrics` 函数。L2 的 CONNECT 返回 200 时 `ObserveConnect`，`result` 取 `ok`，隧道还活着就保持 `EnterTunnel`。明文 HTTP 没有「向客户端写 200」这一步，和 §7.1 里 gauge 帮助文本并不完全一致。§7 仍写着明文 HTTP 的计数不在本文件决定，本节不改 §7。
+
+失败响应带 `Content-Length: 0` 和 `Connection: close`，随后关掉客户端连接。CONNECT 路径的失败响应格式不变。
+
+超时不新造数字：
+
+- 拨 L2：3s（`dialUpstream`）。
+- 等 L2 的 CONNECT 状态行：`l2ResponseTimeout`，默认 10s。读完就清掉。
+- 等下一条请求、等源站字节、拷贝正文：`tunnelIdleTimeout`，默认 5 分钟。读到字节就重新计时。客户端一直不发请求，到点关连接，不回 400。
+- 101 或半关闭之后，反方向空闲：`halfCloseIdleTimeout`，默认 30s。每次读到字节重新计时。
+
+等 L2 的 200 时，不再像 CONNECT 那样另开一个读端把客户端字节泵进 pipe。明文请求的正文还要按帧切开，多一个读端会把正文读丢。客户端要是在这 10 秒里断开，要等到这次读或写失败才发现。上限仍是拨号 3 秒加上 `l2ResponseTimeout`。
+
+请求头超过 64KiB，或者头没有读完且不是空闲超时，回 400，`bad_target`。
+
 
 ## 6. TLS 指纹透传设计
 
@@ -223,24 +353,48 @@ flowchart TD
 - L1 与 L2 对这段负载只做字节转发，不重写、不重分段重组后再编码、不插入 PROXY 协议头。
 - L2 到目标是 L2 自己发起的 TCP 连接。目标看到的 TCP/IP 指纹属于 L2；目标看到的 TLS ClientHello 属于客户端。JA3/JA4 只覆盖后者。
 
+v0.6 决定：L1 与 L2 之间走内网，不加密，也不做 mTLS。这一跳上的 CONNECT 和 `Proxy-Authorization` 是明文，Basic 只是 base64。前提和已接受的风险见 §12。
+
+客户端到源站的 TLS 由业务层（客户端）生成，必须作为标准代理隧道里的原始字节，经 L1、L2 到达源站。L1 和 L2 都不终结这段 TLS，不做 MITM，也不为了看 ClientHello 去调用 TLS 栈。CONNECT 建立之后只转发原始字节：ClientHello 的字段、顺序、扩展和 ALPN 不改，TLS 记录层的分片也不改。
+
+两种分片不是一回事：
+
+- **TLS 记录分片**在字节流里面。一个 ClientHello 拆成多条 TLS record，或者一条 record 在记录层被拆开，都是载荷的一部分。字节拷贝保留这些边界。JA3/JA4 以外、会看记录边界的指纹因此也不变。
+- **TCP 分段**不进 JA3/JA4。这两个指纹都是把 ClientHello 按 TLS 重组之后再哈希：JA3 看 legacy version、密码套件、扩展、曲线和点格式的线上顺序；JA4 另看 ALPN 和有没有 SNI，并把密码套件、扩展按自己的规则排序。它们不看 TCP 段长、TTL、窗口、选项或包间隔。L1 的 `io.Copy` 用 32KiB 缓冲，但 `Read` 一返回就 `Write`，不会为了填满缓冲而等，也不会把 TLS 重新编码。它不会把客户端原来的 TCP 段长原样送到下一跳：写到 L1→L2 的套接字上是一次新的发送。L2 再读再写。源站看到的段由 L2 出口内核决定（MSS、TSO/GSO）；L2 接收侧的 GRO 还可能先把 L1 送来的段拼起来。所以 TCP 分段会变，JA3/JA4 不变。源站看到的 TCP/IP 指纹属于 L2 的内核，不属于客户端。
+- **时序**。转发路径不插入人为等待，不重排 TLS 记录，也不为了抹平间隔而囤数据。Go 的 TCP 连接默认 `TCP_NODELAY`，应用层不再用 Nagle 把小段合并。多一跳的传播延迟仍然存在。包与包之间的间隔不是透传保证，也不进入 JA3/JA4。
+
+明文 HTTP 没有客户端 TLS。它要保住的是 HTTP/1.1 头的顺序和大小写，做法是 §5.3 的方案 B，不是在 L1 或 L2 上终结 TLS。
+
 ### 6.2 风险点与规避
 
 - 风险：代理对源站重新发起 TLS（会换成该代理自己的 ClientHello，JA3/JA4 都变）。
-  - 规避：L2 只做 `CONNECT` 终止 + 原始 TCP 转发。gost 不配置 `mitm.*`；不把 Envoy 集群配成 `transport_socket: tls`；3proxy 不启用 `ssl_mitm` / `ssl_cli`。
+  - 规避：L2 只做 `CONNECT` 终止 + 原始 TCP 转发。gost 不配置 `mitm.*`；不把 Envoy 集群配成 `transport_socket: tls`；3proxy 不启用 `ssl_mitm` / `ssl_cli`。L1 也不对目标 `tls.Dial`，不用 `http.Transport` 在隧道里继续握手。
 - 风险：L2 把还没剥掉的 PROXY 协议头、HTTP 头或压缩后的字节写给源站。源站会直接握手失败，而不只是指纹变化。
   - 规避：不使用 PROXY protocol 传递目标；`200` 之后的第一个字节就是客户端写出的第一个字节。
 - 风险：为了“看一眼 SNI”而解析并重新序列化 ClientHello（扩展顺序、GREASE、padding 都会变，JA3 必变）。
-  - 规避：目标已经在 `CONNECT` 的 authority 里，L2 不需要读 ClientHello。sniffing 保持关闭。
-- 风险：透明代理/NAT 设备插入行为导致特征变化。
-  - 规避：在出口链路做抓包校验，对比客户端侧与目标侧的 ClientHello 字节和 JA3/JA4。
+  - 规避：目标已经在 `CONNECT` 的 authority 里，L2 不需要读 ClientHello。`sniffing` 保持关闭。`sniffing: true` 会窥视隧道开头，HTTP 会被送进重新序列化的处理；再配上 mitm 证书就会终结 TLS。`sniffing.websocket` 同样不开。
+- 风险：recorder 或重写插件碰到隧道字节。录制要把正文拷出去，重写会改头或改体。
+  - 规避：不配置 `recorders`，不挂 rewriter。`compression` 保持关闭，避免 Transport 加上 `Accept-Encoding` 或解开压缩。
+- 风险：把 L1→L2 做成 TLS 监听，结果终结的是这一跳，或者被人理解成要解密客户端握手。
+  - 规避：gost 的 `listener.type` 保持 `tcp`，不用 `tls`、`mtls`、`http2`、`http3`。本版明确不加密这一跳，见 §12。
+- 风险：透明代理或 NAT 设备插入行为导致特征变化。
+  - 规避：在源站侧做 §6.3 的比对，而不是只在 L1 出口抓包。
+
+CONNECT 的 `200` 里 gost 会带 `Proxy-Agent`。这行写给 L1，不写进源站连接，不改变 ClientHello。不要为了去掉它去打开 sniffing。
 
 ### 6.3 验证方法
 
-- 使用 `tcpdump` + `ja3`/`ja4` 解析工具，比较客户端发出的 ClientHello 与目标侧收到的 ClientHello。除 TCP 分段位置外，握手字节应一致。
-- 构建回归测试：不同客户端（Chrome/curl/Go TLS）一致性验证。
-- 配置回归：带有 `mitm`、上游 TLS 或 `ssl_bump` 的 L2 配置应无法通过上述比对。
+可以自动化，不依赖公网：
 
----
+1. 准备一份固定的 ClientHello 字节。同一个客户端打两次不能直接比整段载荷，随机数每次不同。固定字节才能比整段。
+2. 源站侧用会抓原始 ClientHello 的服务，也就是 `tls.peet.ws` 的自建等价物：接受 TCP，按 TLS record 头读出完整握手记录。不要用会自己再握手的反向代理当采集点。
+3. 直连：把这份 ClientHello 写给源站。
+4. 经 L1→L2：同一份字节走 CONNECT。L1 只在 `200` 之后拷贝。写入可以故意拆成小块并拉开几毫秒间隔，用来确认 TCP 分段重组不改变载荷。
+5. 两边用同一套实现计算 JA3 和 JA4。与 tls.peet.ws / FoxIO 一样忽略 GREASE（`id & 0x0f0f == 0x0a0a`）。JA3 是 ClientHello 的 legacy version、密码套件、扩展、支持的组和点格式按线上顺序拼出来的 MD5。JA4 取 `supported_versions` 里最高的非 GREASE 版本；密码套件和扩展（去掉 SNI 与 ALPN 之后）按十六进制排序再取 SHA-256 的前 12 个十六进制字符；签名算法保持原序。直连和经 L1→L2 的 JA3 必须相同，JA4 必须相同。固定字节时，整段 ClientHello 也必须相同。
+6. 反例：打开 `mitm.*` 或 `sniffing: true` 之后再比，指纹必须对不上。发布配置时跑第 5 步。
+
+夹具（不进仓库）按第 3 到第 5 步，用 gost v3.3.1 跑过：同一份 ClientHello 拆成小块、间隔几毫秒写进 L1→L2，源站收到的字节与直连一致，JA3 与 JA4 一致。不同客户端（Chrome、curl、Go TLS）的回归仍建议在发布前再跑一轮，比对的是各自的 ClientHello，不是要求这三者彼此相同。`tcpdump` 可以辅助看记录边界，结论以源站侧的字节和 JA3/JA4 为准。
+
 
 ## 7. 可观测性
 
@@ -1245,6 +1399,1092 @@ func readConnectStatus(r *bufio.Reader) (int, string, error) {
 
 不要用会自行完成 TLS 的客户端来实现这一跳，例如对目标调用 `tls.Dial`，或让 `http.Transport` 在 `CONNECT` 之后继续做 TLS 握手。那会丢掉客户端的 ClientHello。`http.ReadResponse` 对没有 `Content-Length` 的 `200` 会把连接余下的字节当成响应体，因此这里用手写的状态行读取，把隧道字节留给后面的 `io.Copy`。
 
+### 10.1 明文 HTTP
+
+下面是 §5.4 方案 B 的参考实现，和上面的 `handleConnect`、`parseNodeID`、`sharedPasswordOK`、`dialUpstream`、`readConnectStatus` 放在同一个包。`serveProxyConn` 是入口：第一条请求的方法是 `CONNECT` 时交给 `handleConnect`，否则按 absolute-form 处理。除了 §10 开头列出的包，还用到 `bytes`。失败打点复用 §7.1 已有的函数，不新增指标名。
+
+```go
+// maxHTTPHead 是单条请求或响应头部的上限。超过则本地 400，reason 为 bad_target。
+// 正文不设这个上限，按 Content-Length 或 chunked 原样转发。
+const maxHTTPHead = 64 << 10
+
+// serveProxyConn 是客户端连接的入口。第一条请求的方法是 CONNECT 时交给 handleConnect；
+// 否则按明文 HTTP 处理，并在这条连接上串行读取后续请求。
+// 不支持把后续请求并发转发。bufio 里已经读到的下一个请求，要等当前响应写完再处理。
+func serveProxyConn(conn net.Conn, resolver Resolver) error {
+	defer conn.Close()
+	session := newHTTPSession(conn)
+	defer session.stop()
+	mc := &modeConn{Conn: conn, session: session}
+	br := bufio.NewReaderSize(mc, maxHTTPHead)
+	head, err := readHTTPHead(br)
+	if err != nil {
+		if len(head) == 0 || isTimeout(err) {
+			return err
+		}
+		l1metrics.RejectClient(l1metrics.ReasonRejectBadTarget)
+		writeHTTPError(conn, http.StatusBadRequest, "Bad Request", "")
+		return err
+	}
+	if requestMethod(head) == "CONNECT" {
+		// CONNECT 隧道由 handleConnect 自己计时空闲。这里停掉明文 HTTP 的计时，
+		// 并停止 modeConn 在每次 Read 时覆盖截止时间。
+		session.stop()
+		mc.disabled.Store(true)
+		_ = conn.SetReadDeadline(time.Time{})
+		return finishConnect(mc, br, head, resolver)
+	}
+	return serveAbsolute(conn, session, mc, br, head, resolver)
+}
+
+// finishConnect 把头里已经消费的 CONNECT 控制面交给 handleConnect。
+// bufio 若多读了隧道字节，用 prefixConn 放回去，避免 ClientHello 被吃掉。
+func finishConnect(mc *modeConn, br *bufio.Reader, head []byte, resolver Resolver) error {
+	start, headers, err := splitHead(head)
+	if err != nil {
+		l1metrics.RejectClient(l1metrics.ReasonRejectBadTarget)
+		writeHTTPError(mc, http.StatusBadRequest, "Bad Request", "")
+		return err
+	}
+	parts := strings.Split(start, " ")
+	if len(parts) != 3 || parts[0] != "CONNECT" || parts[1] == "" {
+		l1metrics.RejectClient(l1metrics.ReasonRejectBadTarget)
+		writeHTTPError(mc, http.StatusBadRequest, "Bad Request", "")
+		return fmt.Errorf("bad connect request")
+	}
+	user, pass := basicFrom(headers)
+	prefix := takeBuffered(br)
+	pc := &prefixConn{Conn: mc, r: io.MultiReader(bytes.NewReader(prefix), mc)}
+	return handleConnect(pc, user, pass, parts[1], resolver)
+}
+
+// serveAbsolute 处理 absolute-form 明文 HTTP。同一条客户端连接上：
+// 同一 node_id 且同一 host:port、双方都还想 keep-alive 时，复用已经建立的 L2 隧道；
+// 主机或 node 变了，就关掉隧道再向新的 L2 发 CONNECT。
+func serveAbsolute(client net.Conn, session *httpSession, mc *modeConn, br *bufio.Reader, head []byte, resolver Resolver) error {
+	var held *upstream
+	defer func() {
+		if held != nil {
+			held.close(session)
+		}
+	}()
+	for {
+		if head == nil {
+			var err error
+			head, err = readHTTPHead(br)
+			if err != nil {
+				if len(head) == 0 || isTimeout(err) {
+					return err
+				}
+				l1metrics.RejectClient(l1metrics.ReasonRejectBadTarget)
+				writeHTTPError(client, http.StatusBadRequest, "Bad Request", "")
+				return err
+			}
+		}
+		if requestMethod(head) == "CONNECT" {
+			l1metrics.RejectClient(l1metrics.ReasonRejectBadTarget)
+			writeHTTPError(client, http.StatusBadRequest, "Bad Request", "")
+			return fmt.Errorf("connect on http connection")
+		}
+		req, rej := parseAbsolute(head)
+		head = nil
+		if rej != nil {
+			l1metrics.RejectClient(rej.metric)
+			writeHTTPError(client, rej.status, rej.reason, rej.header)
+			return rej.err
+		}
+		if strings.ContainsAny(req.username, "\r\n") || strings.ContainsAny(req.password, "\r\n") {
+			l1metrics.RejectClient(l1metrics.ReasonRejectBadCredential)
+			writeHTTPError(client, http.StatusBadRequest, "Bad Request", "")
+			return fmt.Errorf("invalid credential")
+		}
+		if !sharedPasswordOK(req.password) {
+			l1metrics.RejectClient(l1metrics.ReasonRejectAuth)
+			writeHTTPError(client, http.StatusProxyAuthRequired, "Proxy Authentication Required",
+				`Proxy-Authenticate: Basic realm="relay"`)
+			return fmt.Errorf("invalid credential")
+		}
+		_, nodeID, err := parseNodeID(req.username)
+		if err != nil {
+			l1metrics.RejectClient(l1metrics.ReasonRejectNoNode)
+			writeHTTPError(client, http.StatusBadRequest, "Bad Request", "")
+			return err
+		}
+		if req.targetErr != nil {
+			l1metrics.RejectClient(l1metrics.ReasonRejectBadTarget)
+			writeHTTPError(client, http.StatusBadRequest, "Bad Request", "")
+			return req.targetErr
+		}
+		if held != nil && (held.nodeID != nodeID || held.target != req.originTarget) {
+			held.close(session)
+			held = nil
+		}
+		if held == nil {
+			held, err = openUpstream(session, req.username, req.password, nodeID, req.originTarget, resolver, client)
+			if err != nil {
+				held = nil
+				return err
+			}
+		}
+		outcome, err := held.relay(client, mc, br, req)
+		if err != nil {
+			held.close(session)
+			held = nil
+			return err
+		}
+		if !outcome.reuse {
+			held.close(session)
+			held = nil
+		}
+		if outcome.endClient {
+			return nil
+		}
+	}
+}
+
+// absReq 是已经决定要转发的明文请求。wireHead 是写给源站的头部字节。
+type absReq struct {
+	method         string
+	username       string
+	password       string
+	originTarget   string
+	wireHead       []byte
+	chunked        bool
+	contentLength  int64
+	expectContinue bool
+	upgrade        bool
+	closeClient    bool
+	targetErr      error
+}
+
+type httpReject struct {
+	status int
+	reason string
+	header string
+	metric string
+	err    error
+}
+
+type relayOutcome struct {
+	reuse     bool
+	endClient bool
+}
+
+// parseAbsolute 只接受 http 的 absolute-form。https 的明文请求、origin-form 都记为坏目标。
+// 口令是否正确不在这里判断，调用方按与 CONNECT 相同的顺序处理。
+func parseAbsolute(head []byte) (*absReq, *httpReject) {
+	start, headers, err := splitHead(head)
+	if err != nil {
+		return nil, &httpReject{
+			status: http.StatusBadRequest, reason: "Bad Request",
+			metric: l1metrics.ReasonRejectBadTarget, err: err,
+		}
+	}
+	parts := strings.Split(start, " ")
+	if len(parts) != 3 || parts[0] == "" || parts[1] == "" || (parts[2] != "HTTP/1.0" && parts[2] != "HTTP/1.1") {
+		return nil, &httpReject{
+			status: http.StatusBadRequest, reason: "Bad Request",
+			metric: l1metrics.ReasonRejectBadTarget, err: fmt.Errorf("bad request line"),
+		}
+	}
+	method, rawTarget, version := parts[0], parts[1], parts[2]
+	user, pass := basicFrom(headers)
+
+	req := &absReq{
+		method: method, username: user, password: pass, contentLength: -1,
+	}
+	originForm, hostport, terr := parseHTTPAbsolute(rawTarget)
+	if terr != nil {
+		req.targetErr = terr
+		return req, nil
+	}
+	req.originTarget = hostport
+
+	connToks, proxyToks, chunked, clValues, expect, hasUpgrade, syntaxErr := scanHeaders(headers)
+	if syntaxErr != nil {
+		return nil, &httpReject{
+			status: http.StatusBadRequest, reason: "Bad Request",
+			metric: l1metrics.ReasonRejectBadTarget, err: syntaxErr,
+		}
+	}
+	if len(clValues) > 0 {
+		n, perr := strconv.ParseInt(clValues[0], 10, 64)
+		if perr != nil || n < 0 {
+			req.targetErr = fmt.Errorf("bad content-length")
+			return req, nil
+		}
+		for _, v := range clValues[1:] {
+			if v != clValues[0] {
+				req.targetErr = fmt.Errorf("conflicting content-length")
+				return req, nil
+			}
+		}
+		req.contentLength = n
+	}
+	req.chunked = chunked
+	req.expectContinue = expect && (chunked || req.contentLength > 0)
+	req.upgrade = hasUpgrade && hasToken(connToks, "upgrade")
+	req.closeClient = wantsClose(version, connToks, proxyToks)
+	req.wireHead = rewriteHead(method, originForm, version, headers, chunked, req.upgrade, connToks)
+	return req, nil
+}
+
+func scanHeaders(headers [][]byte) (connToks, proxyToks []string, chunked bool, clValues []string, expect, hasUpgrade bool, err error) {
+	for _, ln := range headers {
+		name, _, ok := headerName(ln)
+		if !ok {
+			return nil, nil, false, nil, false, false, fmt.Errorf("bad header")
+		}
+		val := headerValue(ln)
+		switch strings.ToLower(string(name)) {
+		case "connection":
+			connToks = append(connToks, splitTokens(val)...)
+		case "proxy-connection":
+			proxyToks = append(proxyToks, splitTokens(val)...)
+		case "transfer-encoding":
+			if hasToken(splitTokens(val), "chunked") {
+				chunked = true
+			}
+		case "content-length":
+			clValues = append(clValues, strings.TrimSpace(val))
+		case "expect":
+			if hasToken(splitTokens(val), "100-continue") {
+				expect = true
+			}
+		case "upgrade":
+			if strings.TrimSpace(val) != "" {
+				hasUpgrade = true
+			}
+		}
+	}
+	return connToks, proxyToks, chunked, clValues, expect, hasUpgrade, nil
+}
+
+// rewriteHead 把请求行改成 origin-form，删掉逐跳头，其余头行按原字节顺序和大小写保留。
+// 不添加 Via、X-Forwarded-For、Forwarded、User-Agent。
+// Connection 是唯一可能改值的头：只删掉那些指向已被删除头的 token。token 集合没变时整行不动。
+func rewriteHead(method, originForm, version string, headers [][]byte, chunked, upgrade bool, connToks []string) []byte {
+	drop := map[string]bool{
+		"proxy-authorization": true,
+		"proxy-connection":    true,
+		"keep-alive":          true,
+		"te":                  true,
+		"trailer":             true,
+		"proxy-authenticate":  true,
+	}
+	if chunked {
+		// 同时带 Content-Length 和 chunked 时删掉 Content-Length，避免请求走私。
+		drop["content-length"] = true
+	}
+	for _, t := range connToks {
+		lt := strings.ToLower(t)
+		switch lt {
+		case "close", "keep-alive", "upgrade", "transfer-encoding":
+			continue
+		default:
+			drop[lt] = true
+		}
+	}
+	delete(drop, "transfer-encoding")
+	if upgrade {
+		delete(drop, "upgrade")
+	}
+
+	var b bytes.Buffer
+	fmt.Fprintf(&b, "%s %s %s\r\n", method, originForm, version)
+	for _, ln := range headers {
+		name, _, ok := headerName(ln)
+		if !ok {
+			continue
+		}
+		lname := strings.ToLower(string(name))
+		if drop[lname] {
+			continue
+		}
+		if lname == "connection" {
+			kept := filterConnTokens(headerValue(ln), drop)
+			if len(kept) == 0 {
+				continue
+			}
+			if sameTokens(headerValue(ln), kept) {
+				b.Write(ln)
+			} else {
+				b.Write(name)
+				b.WriteString(": ")
+				b.WriteString(strings.Join(kept, ", "))
+				b.WriteString("\r\n")
+			}
+			continue
+		}
+		b.Write(ln)
+	}
+	b.WriteString("\r\n")
+	return b.Bytes()
+}
+
+func filterConnTokens(val string, drop map[string]bool) []string {
+	var kept []string
+	for _, t := range splitTokens(val) {
+		lt := strings.ToLower(t)
+		switch lt {
+		case "close", "keep-alive", "upgrade", "transfer-encoding":
+			kept = append(kept, t)
+			continue
+		}
+		if drop[lt] {
+			continue
+		}
+		kept = append(kept, t)
+	}
+	return kept
+}
+
+func sameTokens(val string, kept []string) bool {
+	orig := splitTokens(val)
+	if len(orig) != len(kept) {
+		return false
+	}
+	for i := range orig {
+		if orig[i] != kept[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func wantsClose(version string, connToks, proxyToks []string) bool {
+	if hasToken(connToks, "close") || hasToken(proxyToks, "close") {
+		return true
+	}
+	if version == "HTTP/1.0" {
+		return !(hasToken(connToks, "keep-alive") || hasToken(proxyToks, "keep-alive"))
+	}
+	return false
+}
+
+// parseHTTPAbsolute 手工切 absolute-form，不经过 net/url，避免百分号解码和主机名大小写变化。
+// 缺端口时用 80。userinfo 和 fragment 不进入 CONNECT 目标，也不进入 origin-form。
+func parseHTTPAbsolute(raw string) (originForm, hostport string, err error) {
+	i := strings.Index(raw, "://")
+	if i <= 0 || !strings.EqualFold(raw[:i], "http") {
+		return "", "", fmt.Errorf("not http absolute-form")
+	}
+	rest := raw[i+3:]
+	if hash := strings.IndexByte(rest, '#'); hash >= 0 {
+		rest = rest[:hash]
+	}
+	var authority, pathq string
+	if s := strings.IndexAny(rest, "/?"); s >= 0 {
+		authority = rest[:s]
+		pathq = rest[s:]
+		if pathq[0] == '?' {
+			pathq = "/" + pathq
+		}
+	} else {
+		authority = rest
+		pathq = "/"
+	}
+	if authority == "" {
+		return "", "", fmt.Errorf("missing host")
+	}
+	if at := strings.LastIndex(authority, "@"); at >= 0 {
+		authority = authority[at+1:]
+	}
+	hostport, err = splitHostPortDefault(authority, "80")
+	if err != nil {
+		return "", "", err
+	}
+	return pathq, hostport, nil
+}
+
+func splitHostPortDefault(authority, defPort string) (string, error) {
+	var host, port string
+	if strings.HasPrefix(authority, "[") {
+		end := strings.IndexByte(authority, ']')
+		if end <= 1 {
+			return "", fmt.Errorf("bad ipv6 host")
+		}
+		host = authority[:end+1]
+		rest := authority[end+1:]
+		switch {
+		case rest == "":
+			port = defPort
+		case strings.HasPrefix(rest, ":"):
+			port = rest[1:]
+		default:
+			return "", fmt.Errorf("bad ipv6 host")
+		}
+	} else {
+		h, p, e := net.SplitHostPort(authority)
+		if e != nil {
+			if strings.Contains(authority, ":") {
+				return "", fmt.Errorf("bad host")
+			}
+			host = authority
+			port = defPort
+		} else {
+			host = h
+			port = p
+		}
+	}
+	if host == "" || host == "[]" || strings.ContainsAny(host, " \r\n/") {
+		return "", fmt.Errorf("bad host")
+	}
+	pn, err := strconv.Atoi(port)
+	if err != nil || pn < 1 || pn > 65535 {
+		return "", fmt.Errorf("bad port")
+	}
+	if strings.HasPrefix(host, "[") {
+		return host + ":" + port, nil
+	}
+	return net.JoinHostPort(host, port), nil
+}
+
+// upstream 是一条已经拿到 L2 CONNECT 200 的隧道，后面只搬运 HTTP 字节。
+type upstream struct {
+	nodeID string
+	target string
+	conn   net.Conn
+	br     *bufio.Reader
+	mode   *modeConn
+	leave  func()
+}
+
+func (u *upstream) close(session *httpSession) {
+	if u == nil {
+		return
+	}
+	if u.leave != nil {
+		u.leave()
+		u.leave = nil
+	}
+	u.conn.Close()
+	if session != nil {
+		session.clearUpstream(u.conn)
+	}
+}
+
+// openUpstream 向选定 L2 发与 CONNECT 数据面相同的第二次 CONNECT。
+// 失败时的状态码和 l1metrics reason 与 handleConnect 一致。
+// L2 返回 200 后按 §7.1 的签名调用 ObserveConnect，result 为 ok。
+// 隧道关闭前保持 EnterTunnel。拨号之后的失败只 Fail502，不把明文 HTTP 写进这张直方图。
+func openUpstream(session *httpSession, username, password, nodeID, target string, resolver Resolver, client net.Conn) (*upstream, error) {
+	addr, err := resolver.Resolve(nodeID)
+	if err != nil || addr == "" {
+		inTable := errors.Is(err, ErrNoHealthyAddr)
+		l1metrics.Fail502(l1metrics.NodeLabel(inTable, nodeID), l1metrics.ReasonNoUpstream)
+		if err == nil {
+			err = errors.New("empty address")
+		}
+		writeHTTPError(client, http.StatusBadGateway, "Bad Gateway", "")
+		return nil, fmt.Errorf("resolve node %s failed: %w", nodeID, err)
+	}
+	started := time.Now()
+	raw, err := dialUpstream(addr)
+	if err != nil {
+		l1metrics.Fail502(nodeID, l1metrics.ReasonDial)
+		writeHTTPError(client, http.StatusBadGateway, "Bad Gateway", "")
+		return nil, err
+	}
+	session.setUpstream(raw)
+	ok := false
+	defer func() {
+		if !ok {
+			raw.Close()
+			session.clearUpstream(raw)
+		}
+	}()
+
+	token := base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
+	creq := "CONNECT " + target + " HTTP/1.1\r\n" +
+		"Host: " + target + "\r\n" +
+		"Proxy-Authorization: Basic " + token + "\r\n\r\n"
+	if _, err := raw.Write([]byte(creq)); err != nil {
+		l1metrics.Fail502(nodeID, l1metrics.ReasonL2Write)
+		writeHTTPError(client, http.StatusBadGateway, "Bad Gateway", "")
+		return nil, err
+	}
+	if err := raw.SetReadDeadline(time.Now().Add(l2ResponseTimeout)); err != nil {
+		l1metrics.Fail502(nodeID, l1metrics.ReasonL2Deadline)
+		writeHTTPError(client, http.StatusBadGateway, "Bad Gateway", "")
+		return nil, err
+	}
+	br := bufio.NewReader(raw)
+	code, pa, err := readConnectStatus(br)
+	if clearErr := raw.SetReadDeadline(time.Time{}); clearErr != nil && err == nil {
+		l1metrics.Fail502(nodeID, l1metrics.ReasonL2Deadline)
+		writeHTTPError(client, http.StatusBadGateway, "Bad Gateway", "")
+		return nil, clearErr
+	}
+	if err != nil {
+		l1metrics.Fail502(nodeID, l1metrics.ReasonL2Response)
+		writeHTTPError(client, http.StatusBadGateway, "Bad Gateway", "")
+		return nil, err
+	}
+	if code == http.StatusProxyAuthRequired {
+		challenge := pa
+		if challenge == "" || strings.ContainsAny(challenge, "\r\n") {
+			challenge = `Basic realm="relay"`
+		}
+		l1metrics.Fail502(nodeID, l1metrics.ReasonL2Auth)
+		writeHTTPError(client, http.StatusProxyAuthRequired, "Proxy Authentication Required",
+			"Proxy-Authenticate: "+challenge)
+		return nil, fmt.Errorf("l2 connect status 407")
+	}
+	if code != http.StatusOK {
+		l1metrics.Fail502(nodeID, l1metrics.ReasonL2Status)
+		writeHTTPError(client, http.StatusBadGateway, "Bad Gateway", "")
+		return nil, fmt.Errorf("l2 connect status %d", code)
+	}
+	l1metrics.ObserveConnect(nodeID, l1metrics.ResultOK, started)
+
+	var prefix []byte
+	if n := br.Buffered(); n > 0 {
+		prefix = make([]byte, n)
+		if _, err := io.ReadFull(br, prefix); err != nil {
+			writeHTTPError(client, http.StatusBadGateway, "Bad Gateway", "")
+			return nil, err
+		}
+	}
+	mc := &modeConn{Conn: raw, session: session}
+	ubr := bufio.NewReaderSize(io.MultiReader(bytes.NewReader(prefix), mc), maxHTTPHead)
+	ok = true
+	return &upstream{
+		nodeID: nodeID,
+		target: target,
+		conn:   raw,
+		br:     ubr,
+		mode:   mc,
+		leave:  l1metrics.EnterTunnel(nodeID),
+	}, nil
+}
+
+// relay 把改写后的请求写入隧道，再把源站响应原样写回客户端。
+// Expect: 100-continue 时先只写头，等源站的 100 之后才写正文；源站直接给最终响应则不写正文。
+// 已经向客户端写出过源站字节之后，后续失败只关连接，不再补 502。
+func (u *upstream) relay(client net.Conn, clientMode *modeConn, clientBR *bufio.Reader, req *absReq) (relayOutcome, error) {
+	if _, err := u.conn.Write(req.wireHead); err != nil {
+		l1metrics.Fail502(u.nodeID, l1metrics.ReasonL2Write)
+		writeHTTPError(client, http.StatusBadGateway, "Bad Gateway", "")
+		return relayOutcome{}, err
+	}
+	if !req.expectContinue {
+		if err := writeRequestBody(u.conn, clientBR, req); err != nil {
+			l1metrics.Fail502(u.nodeID, l1metrics.ReasonL2Write)
+			writeHTTPError(client, http.StatusBadGateway, "Bad Gateway", "")
+			return relayOutcome{}, err
+		}
+	}
+	sent := false
+	wroteBody := !req.expectContinue
+	for {
+		head, err := readHTTPHead(u.br)
+		if err != nil {
+			if !sent {
+				l1metrics.Fail502(u.nodeID, l1metrics.ReasonL2Response)
+				writeHTTPError(client, http.StatusBadGateway, "Bad Gateway", "")
+			}
+			return relayOutcome{}, err
+		}
+		meta, err := inspectResponse(head, req)
+		if err != nil {
+			if !sent {
+				l1metrics.Fail502(u.nodeID, l1metrics.ReasonL2Status)
+				writeHTTPError(client, http.StatusBadGateway, "Bad Gateway", "")
+			}
+			return relayOutcome{}, err
+		}
+		if _, err := client.Write(head); err != nil {
+			return relayOutcome{}, err
+		}
+		sent = true
+		if meta.code == http.StatusSwitchingProtocols {
+			if req.upgrade {
+				err := pipeUpgrade(client, clientBR, u.conn, u.br, clientMode, u.mode)
+				return relayOutcome{endClient: true}, err
+			}
+			return relayOutcome{endClient: true}, nil
+		}
+		if meta.code < 200 {
+			if meta.code == http.StatusContinue && req.expectContinue && !wroteBody {
+				if err := writeRequestBody(u.conn, clientBR, req); err != nil {
+					return relayOutcome{}, err
+				}
+				wroteBody = true
+			}
+			continue
+		}
+		if err := relayResponseBody(client, u.br, meta); err != nil {
+			return relayOutcome{endClient: true}, err
+		}
+		// 最终响应已经发出、但 Expect 的正文还没消费：不能在这条客户端连接上接着读下一个请求。
+		abandonedBody := req.expectContinue && !wroteBody
+		reuse := meta.keep && !req.closeClient && !meta.untilEOF && !abandonedBody
+		end := req.closeClient || meta.untilEOF || abandonedBody
+		return relayOutcome{reuse: reuse, endClient: end}, nil
+	}
+}
+
+type respMeta struct {
+	code          int
+	keep          bool
+	chunked       bool
+	contentLength int64
+	noBody        bool
+	untilEOF      bool
+}
+
+func inspectResponse(head []byte, req *absReq) (respMeta, error) {
+	start, headers, err := splitHead(head)
+	if err != nil {
+		return respMeta{}, err
+	}
+	fields := strings.Split(start, " ")
+	if len(fields) < 2 {
+		return respMeta{}, fmt.Errorf("bad status line")
+	}
+	code, err := strconv.Atoi(fields[1])
+	if err != nil {
+		return respMeta{}, err
+	}
+	version := fields[0]
+	var connToks []string
+	chunked := false
+	cl := int64(-1)
+	sawCL := false
+	for _, ln := range headers {
+		name, _, ok := headerName(ln)
+		if !ok {
+			return respMeta{}, fmt.Errorf("bad response header")
+		}
+		val := headerValue(ln)
+		switch strings.ToLower(string(name)) {
+		case "connection":
+			connToks = append(connToks, splitTokens(val)...)
+		case "transfer-encoding":
+			if hasToken(splitTokens(val), "chunked") {
+				chunked = true
+			}
+		case "content-length":
+			n, perr := strconv.ParseInt(strings.TrimSpace(val), 10, 64)
+			if perr != nil || n < 0 {
+				return respMeta{}, fmt.Errorf("bad content-length")
+			}
+			if sawCL && n != cl {
+				return respMeta{}, fmt.Errorf("conflicting content-length")
+			}
+			sawCL = true
+			cl = n
+		}
+	}
+	meta := respMeta{code: code, contentLength: cl, chunked: chunked}
+	if chunked {
+		meta.contentLength = -1
+	}
+	meta.noBody = code < 200 || code == http.StatusNoContent || code == http.StatusNotModified || strings.EqualFold(req.method, "HEAD") || code == http.StatusSwitchingProtocols
+	if !meta.noBody && !chunked && !sawCL {
+		meta.untilEOF = true
+	}
+	if version == "HTTP/1.0" {
+		meta.keep = hasToken(connToks, "keep-alive") && !meta.untilEOF
+	} else {
+		meta.keep = !hasToken(connToks, "close") && !meta.untilEOF
+	}
+	if code == http.StatusSwitchingProtocols {
+		meta.keep = false
+	}
+	return meta, nil
+}
+
+func writeRequestBody(dst io.Writer, src *bufio.Reader, req *absReq) error {
+	if req.chunked {
+		return copyChunked(dst, src)
+	}
+	if req.contentLength > 0 {
+		_, err := io.CopyN(dst, src, req.contentLength)
+		return err
+	}
+	return nil
+}
+
+func relayResponseBody(dst io.Writer, src *bufio.Reader, meta respMeta) error {
+	if meta.noBody {
+		return nil
+	}
+	if meta.chunked {
+		return copyChunked(dst, src)
+	}
+	if meta.contentLength >= 0 {
+		_, err := io.CopyN(dst, src, meta.contentLength)
+		return err
+	}
+	_, err := io.Copy(dst, src)
+	if err == nil || errors.Is(err, io.EOF) {
+		return nil
+	}
+	return err
+}
+
+// copyChunked 按 chunk 帧拷贝，不解码、不重编码。size 行、扩展、正文和 trailer 都原样写出。
+func copyChunked(dst io.Writer, src *bufio.Reader) error {
+	for {
+		line, err := src.ReadBytes('\n')
+		if err != nil {
+			return err
+		}
+		if _, err := dst.Write(line); err != nil {
+			return err
+		}
+		size, err := parseChunkSize(line)
+		if err != nil {
+			return err
+		}
+		if size == 0 {
+			for {
+				trailer, err := src.ReadBytes('\n')
+				if err != nil {
+					return err
+				}
+				if _, err := dst.Write(trailer); err != nil {
+					return err
+				}
+				if isBlankLine(trailer) {
+					return nil
+				}
+			}
+		}
+		if _, err := io.CopyN(dst, src, size); err != nil {
+			return err
+		}
+		crlf := make([]byte, 2)
+		if _, err := io.ReadFull(src, crlf); err != nil {
+			return err
+		}
+		if _, err := dst.Write(crlf); err != nil {
+			return err
+		}
+	}
+}
+
+func parseChunkSize(line []byte) (int64, error) {
+	line = bytes.TrimRight(line, "\r\n")
+	if i := bytes.IndexAny(line, "; \t"); i >= 0 {
+		line = line[:i]
+	}
+	if len(line) == 0 {
+		return 0, fmt.Errorf("empty chunk size")
+	}
+	return strconv.ParseInt(string(line), 16, 64)
+}
+
+// pipeUpgrade 在 101 之后进入与 CONNECT 相同的双向字节转发。
+// 半关闭后的空闲上限是 halfCloseIdleTimeout，整条隧道的空闲兜底仍是 tunnelIdleTimeout。
+func pipeUpgrade(client net.Conn, clientR io.Reader, up net.Conn, upR io.Reader, clientMode, upMode *modeConn) error {
+	errc := make(chan error, 2)
+	relay := func(dst net.Conn, src io.Reader, reverse *modeConn) {
+		_, copyErr := io.Copy(dst, src)
+		if copyErr != nil {
+			client.Close()
+			up.Close()
+			errc <- copyErr
+			return
+		}
+		if werr := closeWrite(dst); werr != nil {
+			client.Close()
+			up.Close()
+			errc <- werr
+			return
+		}
+		if reverse != nil {
+			reverse.half.Store(true)
+			_ = reverse.SetReadDeadline(time.Now().Add(halfCloseIdleTimeout))
+		}
+		errc <- nil
+	}
+	go func() { relay(up, clientR, upMode) }()
+	go func() { relay(client, upR, clientMode) }()
+	err1 := <-errc
+	err2 := <-errc
+	if err1 != nil {
+		return err1
+	}
+	return err2
+}
+
+func writeHTTPError(w io.Writer, status int, reason, header string) {
+	var b strings.Builder
+	fmt.Fprintf(&b, "HTTP/1.1 %d %s\r\n", status, reason)
+	if header != "" {
+		b.WriteString(header)
+		if !strings.HasSuffix(header, "\r\n") {
+			b.WriteString("\r\n")
+		}
+	}
+	b.WriteString("Content-Length: 0\r\nConnection: close\r\n\r\n")
+	_, _ = io.WriteString(w, b.String())
+}
+
+func readHTTPHead(r *bufio.Reader) ([]byte, error) {
+	var buf bytes.Buffer
+	for {
+		line, err := r.ReadSlice('\n')
+		if len(line) > 0 {
+			if buf.Len()+len(line) > maxHTTPHead {
+				return buf.Bytes(), fmt.Errorf("head too large")
+			}
+			buf.Write(line)
+		}
+		if err == bufio.ErrBufferFull {
+			return buf.Bytes(), fmt.Errorf("head too large")
+		}
+		if err != nil {
+			return buf.Bytes(), err
+		}
+		if isBlankLine(line) {
+			if buf.Len() == len(line) {
+				return buf.Bytes(), fmt.Errorf("empty message")
+			}
+			return buf.Bytes(), nil
+		}
+	}
+}
+
+func splitHead(head []byte) (string, [][]byte, error) {
+	parts := bytes.SplitAfter(head, []byte("\n"))
+	var lines [][]byte
+	for _, ln := range parts {
+		if len(ln) == 0 {
+			continue
+		}
+		lines = append(lines, ln)
+	}
+	if len(lines) == 0 {
+		return "", nil, fmt.Errorf("empty message")
+	}
+	start := string(bytes.TrimRight(lines[0], "\r\n"))
+	var headers [][]byte
+	for _, ln := range lines[1:] {
+		if isBlankLine(ln) {
+			continue
+		}
+		headers = append(headers, ln)
+	}
+	return start, headers, nil
+}
+
+func headerName(line []byte) (name, rest []byte, ok bool) {
+	if len(line) == 0 || line[0] == ' ' || line[0] == '\t' {
+		return nil, nil, false
+	}
+	i := bytes.IndexByte(line, ':')
+	if i <= 0 {
+		return nil, nil, false
+	}
+	return line[:i], line[i+1:], true
+}
+
+func headerValue(line []byte) string {
+	_, rest, ok := headerName(line)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(string(bytes.TrimRight(rest, "\r\n")))
+}
+
+func isBlankLine(line []byte) bool {
+	return bytes.Equal(line, []byte("\n")) || bytes.Equal(line, []byte("\r\n"))
+}
+
+func requestMethod(head []byte) string {
+	line, _, _ := bytes.Cut(head, []byte("\n"))
+	line = bytes.TrimRight(line, "\r")
+	method, _, _ := bytes.Cut(line, []byte(" "))
+	return string(method)
+}
+
+func basicFrom(headers [][]byte) (user, pass string) {
+	for _, ln := range headers {
+		name, _, ok := headerName(ln)
+		if !ok || !strings.EqualFold(string(name), "Proxy-Authorization") {
+			continue
+		}
+		u, p, good := parseBasic(headerValue(ln))
+		if good {
+			return u, p
+		}
+	}
+	return "", ""
+}
+
+func parseBasic(v string) (user, pass string, ok bool) {
+	if len(v) < 6 || !strings.EqualFold(v[:6], "basic ") {
+		return "", "", false
+	}
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(v[6:]))
+	if err != nil {
+		return "", "", false
+	}
+	s := string(raw)
+	i := strings.IndexByte(s, ':')
+	if i < 0 {
+		return "", "", false
+	}
+	return s[:i], s[i+1:], true
+}
+
+func splitTokens(v string) []string {
+	parts := strings.Split(v, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func hasToken(toks []string, want string) bool {
+	for _, t := range toks {
+		if strings.EqualFold(t, want) {
+			return true
+		}
+	}
+	return false
+}
+
+func takeBuffered(br *bufio.Reader) []byte {
+	n := br.Buffered()
+	if n == 0 {
+		return nil
+	}
+	b := make([]byte, n)
+	_, _ = io.ReadFull(br, b)
+	return b
+}
+
+func isTimeout(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
+}
+
+// modeConn 在每次 Read 前刷新空闲截止时间。半关闭后改用 halfCloseIdleTimeout。
+// disabled 时不再改截止时间，留给 handleConnect 自己的 idleConn。
+type modeConn struct {
+	net.Conn
+	session  *httpSession
+	half     atomic.Bool
+	disabled atomic.Bool
+}
+
+func (m *modeConn) Read(p []byte) (int, error) {
+	if !m.disabled.Load() {
+		d := tunnelIdleTimeout
+		if m.half.Load() {
+			d = halfCloseIdleTimeout
+		}
+		_ = m.Conn.SetReadDeadline(time.Now().Add(d))
+	}
+	n, err := m.Conn.Read(p)
+	if n > 0 && m.session != nil {
+		m.session.touch()
+	}
+	return n, err
+}
+
+func (m *modeConn) CloseWrite() error {
+	if cw, ok := m.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return m.Conn.Close()
+}
+
+// prefixConn 先读完已经从 bufio 取出的字节，再读底层连接。
+type prefixConn struct {
+	net.Conn
+	r io.Reader
+}
+
+func (p *prefixConn) Read(b []byte) (int, error) { return p.r.Read(b) }
+
+func (p *prefixConn) CloseWrite() error {
+	if cw, ok := p.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return p.Conn.Close()
+}
+
+// httpSession 是明文 HTTP 连接上的空闲兜底，时长用 tunnelIdleTimeout。
+// 任一方向读到字节就重新计时。到点同时关掉客户端和当前上游。
+type httpSession struct {
+	client   net.Conn
+	mu       sync.Mutex
+	upstream net.Conn
+	timer    *time.Timer
+	stopped  bool
+}
+
+func newHTTPSession(client net.Conn) *httpSession {
+	s := &httpSession{client: client}
+	s.timer = time.AfterFunc(tunnelIdleTimeout, s.fire)
+	return s
+}
+
+func (s *httpSession) touch() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stopped || s.timer == nil {
+		return
+	}
+	s.timer.Reset(tunnelIdleTimeout)
+}
+
+func (s *httpSession) setUpstream(c net.Conn) {
+	s.mu.Lock()
+	s.upstream = c
+	stopped := s.stopped
+	s.mu.Unlock()
+	if stopped && c != nil {
+		c.Close()
+	}
+}
+
+func (s *httpSession) clearUpstream(c net.Conn) {
+	s.mu.Lock()
+	if s.upstream == c {
+		s.upstream = nil
+	}
+	s.mu.Unlock()
+}
+
+func (s *httpSession) fire() {
+	s.mu.Lock()
+	if s.stopped {
+		s.mu.Unlock()
+		return
+	}
+	s.stopped = true
+	up := s.upstream
+	s.mu.Unlock()
+	s.client.Close()
+	if up != nil {
+		up.Close()
+	}
+}
+
+func (s *httpSession) stop() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stopped = true
+	if s.timer != nil {
+		s.timer.Stop()
+	}
+}
+```
+
+临时夹具（不进仓库）把这一段和上面的 CONNECT 片段抽出来，对 gost v3.3.1 跑了 `go vet` 和 `go test`。源站是原始 TCP，用来核对字节而不是用 `net/http` 再解析一遍。覆盖了头顺序和大小写、逐跳头删除、不注入 Via / X-Forwarded-For / User-Agent、chunked 请求和响应、Content-Length、`Expect: 100-continue`、417 时不把正文写入隧道、WebSocket 的 101、同一条连接上换主机和换 node、同一主机的 keep-alive 复用、用户名最后一个 `@`、400 / 407 / 502、空闲超时，以及方案 A 会改写头。CONNECT 隧道另用一份固定 ClientHello，拆成小块写入；源站收到的字节与直连相同，JA3 与 JA4 相同。夹具里的 gost 没有挂 §3 的环回黑名单，否则连不到本机源站；生产配置仍按附录 A.5 拒绝环回和链路本地。
+
+
 ---
 
 ## 11. 里程碑建议
@@ -1267,7 +2507,12 @@ func readConnectStatus(r *bufio.Reader) (int, string, error) {
    - 对策：L2 在拨号前拒绝 `127.0.0.0/8`、`::1`、`169.254.0.0/16`（含 `169.254.169.254`）和 `fe80::/10`。RFC1918 等私网本版放行，以后可以再收紧。比对的是解析后的地址，见附录 A.5。
 5. **风险：共享口令从任一 L2 泄露后，可以用来登录 L1 和全部 L2**
    - 已接受：v1 就用这一份口令，不轮换，也不另设跳级口令。更换口令会同时更换客户端、L1 和全部 L2。
-6. **风险：长时间静默的长连接会被 L1 的隧道空闲兜底关闭**
+6. **风险：L1→L2 不加密，共享口令在内网上以 Basic（只是 base64）出现**
+   - 已接受（v0.6）：这一跳不做 mTLS，也不做 TLS。决定人是仓库负责人 h。
+   - 前提：L1 与 L2 在隔离内网（独立 VPC 或 VLAN），不可信网络没有到 L2 监听地址的路由。L2 只绑定内网地址，不监听公网地址，也不用 `0.0.0.0` 暴露在公网接口上。安全组只放行 L1 所在网段访问 L2 端口。
+   - 能在这条内网上抓包的人可以得到共享口令，并看到 CONNECT 里的目标域名。口令泄露之后的影响与第 5 条相同：它对 L1 和全部 L2 继续有效，也不能按调用方吊销。
+   - 这一跳不加密，是为了避免把外层 TLS 做成对客户端握手的终结。客户端到源站的 TLS 记录仍按 §6 原样转发。以后如果要保护 L1↔L2，只能加密这一跳的外层，隧道里的字节不能变。本版明确不做。
+7. **风险：长时间静默的长连接会被 L1 的隧道空闲兜底关闭**
    - 对策：`tunnelIdleTimeout` 默认 5 分钟，可按部署调大。接入方对 WebSocket、长轮询等长连接做应用层心跳，间隔短于该值；TCP keepalive 不算数据，不能代替。见 §10。
 
 ---
@@ -1314,7 +2559,7 @@ JA3 是 ClientHello 里版本、密码套件、扩展、曲线和点格式按**�
 - 源站看到的 TCP 握手是 L2 发起的。客户端的 TCP 指纹不会出现在源站。这不影响 JA3/JA4。
 - QUIC / HTTP/3 不在 TCP `CONNECT` 里。本版不承诺 UDP 上的 JA4。
 
-L1↔L2 若以后另加外层加密，加密的是这一跳的隧道，源站仍应收到原来的客户端 TLS 记录。外层加密的选型不在本文件。
+v0.6 决定 L1↔L2 不加密、不做 mTLS，走隔离内网（§6、§12）。外层加密会改变这一跳的报文；只要隧道里的字节不变，源站的 JA3/JA4 仍然是客户端的。本版不用外层加密。以后如果加上，也只能包住这一跳，不能改隧道内的 TLS 记录。
 
 ### A.2 目标传递协议
 
@@ -1361,7 +2606,9 @@ gost（v1）：
 
 - `listener.type` 为 `tcp`，`handler.type` 为 `http`。
 - `auth.username` 等于客户端访问该节点的用户名，`auth.password` 等于那份共享口令。v1 每个节点只有这一个用户名（见 §3.2）。监听保持认证开启。
-- `sniffing` 为 false；不设置 `mitm.certFile`、`mitm.keyFile`、`compression`。
+- `sniffing` 为 false；不设置 `mitm.certFile`、`mitm.keyFile`、`compression`，也不开 `sniffing.websocket`。
+- `addr` 是内网地址。不监听公网地址，不用 `0.0.0.0` 暴露在公网接口上。`listener.type` 保持 `tcp`，不用 `tls`、`mtls`、`http2`、`http3`。
+- 不配置 `recorders`，不挂 rewriter。`idleTimeout` 保持默认 0，由 L1 的 `tunnelIdleTimeout` 收尸。`metadata.header` 不往隧道里加头。
 
 3proxy（替换项，口令与上面相同）：
 
@@ -1396,6 +2643,21 @@ Envoy DFP（替换项）必须同时满足：
 - 单机内存或 GC 先于带宽打满：换成 3proxy，L1 仍发 HTTP `CONNECT`。
 - 单条 L1 源地址到单个 L2 的并发超过临时端口，或需要 Envoy 的热重启与内建指标：换成 A.5 的 Envoy 配置。HTTP/2 `CONNECT` 可以在一条连接上复用多条隧道，从而避开源端口上限。
 - 两种替换都要先重跑 A.1 的 ClientHello 字节比对，再灰度。替换不改变共享口令，也不放宽 A.5 的出口拒绝范围。
+
+### A.7 明文 HTTP 与 L1→L2 不加密
+
+明文 HTTP 用 §5.4 的方案 B：L1 鉴权并切出 `node_id` 之后，向 gost 再发一次 `CONNECT`，然后写入 origin-form 请求。不把 absolute-form 交给 gost 的 HTTP handler。gost v3.3.1 那条路径会用 `http.Transport` 重排头、改大小写、替换 Host，并在缺少 User-Agent 时补上 `Go-http-client/1.1`。
+
+L1→L2 按 §6 走内网明文。gost 这一侧同时满足：
+
+- `addr` 是内网 IP 和端口，不是公网地址，也不是绑在公网接口上的 `0.0.0.0`。
+- `listener.type` 为 `tcp`。不用 `tls`、`mtls`、`http2`、`http3`。
+- `sniffing` 为 false，不设 `sniffing.websocket`、`mitm.certFile`、`mitm.keyFile`、`compression`。
+- 不配置 `recorders`，不挂 rewriter。
+- `idleTimeout` 保持默认 0。隧道由 L1 的 `tunnelIdleTimeout` 收掉，不靠 gost 的空闲计时。
+- `metadata.header` 不用来往隧道里加头。CONNECT 响应上的 `Proxy-Agent` 只回到 L1，不要为了去掉它打开 sniffing。
+
+替换成 3proxy 或 Envoy 时，监听地址同样只在内网，并且先重跑 §6.3 的 JA3/JA4 比对。明文 HTTP 的字节语义也要重跑：头的顺序和大小写要原样到达源站。
 
 ## 附录 B. 商业代理服务的统计对照
 
