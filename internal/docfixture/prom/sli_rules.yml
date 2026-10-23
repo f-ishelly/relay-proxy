@@ -1,6 +1,7 @@
-# §7.3. S(x) is sum(increase(x[5m])) or vector(0).
-# A missing series must not turn the whole expression into an empty vector.
-# The denominator must be > 0 so a quiet process does not page on 0/0.
+# §7.3. Global S(x) is sum(increase(x[5m])) or vector(0).
+# Per-node sums use `or (other * 0)` so a missing side stays labeled with node_id.
+# The denominator must be at least 100 so 1 failure out of 10 does not page.
+# for: 5m keeps a single bad evaluation pending.
 groups:
   - name: proxy-sli
     rules:
@@ -20,12 +21,54 @@ groups:
             (sum(increase(proxy_upstream_fail_total[5m])) or vector(0))
             +
             (sum(increase(proxy_connect_latency_ms_count{result="ok"}[5m])) or vector(0))
-          ) > 0
-        for: 0m
+          ) >= 100
+        for: 5m
         labels:
           severity: page
         annotations:
           summary: CONNECT failure rate above 2%
+      - alert: ProxyConnectFailureRateByNode
+        expr: |
+          (
+            (
+              sum by (node_id) (increase(proxy_upstream_fail_total[5m]))
+              or
+              (sum by (node_id) (increase(proxy_connect_latency_ms_count{result="ok"}[5m])) * 0)
+            )
+            /
+            (
+              (
+                sum by (node_id) (increase(proxy_upstream_fail_total[5m]))
+                or
+                (sum by (node_id) (increase(proxy_connect_latency_ms_count{result="ok"}[5m])) * 0)
+              )
+              +
+              (
+                sum by (node_id) (increase(proxy_connect_latency_ms_count{result="ok"}[5m]))
+                or
+                (sum by (node_id) (increase(proxy_upstream_fail_total[5m])) * 0)
+              )
+            )
+          ) > 0.02
+          and
+          (
+            (
+              sum by (node_id) (increase(proxy_upstream_fail_total[5m]))
+              or
+              (sum by (node_id) (increase(proxy_connect_latency_ms_count{result="ok"}[5m])) * 0)
+            )
+            +
+            (
+              sum by (node_id) (increase(proxy_connect_latency_ms_count{result="ok"}[5m]))
+              or
+              (sum by (node_id) (increase(proxy_upstream_fail_total[5m])) * 0)
+            )
+          ) >= 100
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: CONNECT failure rate above 2% on one node
       - alert: ProxyHTTPFailureRate
         expr: |
           (
@@ -42,12 +85,54 @@ groups:
             (sum(increase(proxy_http_upstream_fail_total[5m])) or vector(0))
             +
             (sum(increase(proxy_http_request_latency_ms_count{result="ok"}[5m])) or vector(0))
-          ) > 0
-        for: 0m
+          ) >= 100
+        for: 5m
         labels:
           severity: page
         annotations:
           summary: plain HTTP failure rate above 2%
+      - alert: ProxyHTTPFailureRateByNode
+        expr: |
+          (
+            (
+              sum by (node_id) (increase(proxy_http_upstream_fail_total[5m]))
+              or
+              (sum by (node_id) (increase(proxy_http_request_latency_ms_count{result="ok"}[5m])) * 0)
+            )
+            /
+            (
+              (
+                sum by (node_id) (increase(proxy_http_upstream_fail_total[5m]))
+                or
+                (sum by (node_id) (increase(proxy_http_request_latency_ms_count{result="ok"}[5m])) * 0)
+              )
+              +
+              (
+                sum by (node_id) (increase(proxy_http_request_latency_ms_count{result="ok"}[5m]))
+                or
+                (sum by (node_id) (increase(proxy_http_upstream_fail_total[5m])) * 0)
+              )
+            )
+          ) > 0.02
+          and
+          (
+            (
+              sum by (node_id) (increase(proxy_http_upstream_fail_total[5m]))
+              or
+              (sum by (node_id) (increase(proxy_http_request_latency_ms_count{result="ok"}[5m])) * 0)
+            )
+            +
+            (
+              sum by (node_id) (increase(proxy_http_request_latency_ms_count{result="ok"}[5m]))
+              or
+              (sum by (node_id) (increase(proxy_http_upstream_fail_total[5m])) * 0)
+            )
+          ) >= 100
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: plain HTTP failure rate above 2% on one node
       - alert: ProxyCombinedFailureRate
         expr: |
           (
@@ -76,23 +161,49 @@ groups:
             (sum(increase(proxy_connect_latency_ms_count{result="ok"}[5m])) or vector(0))
             +
             (sum(increase(proxy_http_request_latency_ms_count{result="ok"}[5m])) or vector(0))
-          ) > 0
-        for: 0m
+          ) >= 100
+        for: 5m
         labels:
           severity: page
         annotations:
           summary: combined failure rate above 2%
       - alert: ProxyConnectLatencyP95
-        expr: histogram_quantile(0.95, sum by (le) (rate(proxy_connect_latency_ms_bucket{result="ok"}[5m]))) > 200
-        for: 0m
+        expr: |
+          histogram_quantile(0.95, sum by (le) (rate(proxy_connect_latency_ms_bucket{result="ok"}[5m]))) > 200
+          and
+          (sum(increase(proxy_connect_latency_ms_count{result="ok"}[5m])) or vector(0)) >= 100
+        for: 5m
         labels:
           severity: page
         annotations:
           summary: CONNECT P95 above 200ms
+      - alert: ProxyConnectLatencyP95ByNode
+        expr: |
+          histogram_quantile(0.95, sum by (le, node_id) (rate(proxy_connect_latency_ms_bucket{result="ok"}[5m]))) > 200
+          and
+          sum by (node_id) (increase(proxy_connect_latency_ms_count{result="ok"}[5m])) >= 100
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: CONNECT P95 above 200ms on one node
       - alert: ProxyHTTPTunnelSetupP95
-        expr: histogram_quantile(0.95, sum by (le) (rate(proxy_http_tunnel_setup_ms_bucket{result="ok"}[5m]))) > 200
-        for: 0m
+        expr: |
+          histogram_quantile(0.95, sum by (le) (rate(proxy_http_tunnel_setup_ms_bucket{result="ok"}[5m]))) > 200
+          and
+          (sum(increase(proxy_http_tunnel_setup_ms_count{result="ok"}[5m])) or vector(0)) >= 100
+        for: 5m
         labels:
           severity: page
         annotations:
           summary: plain HTTP tunnel setup P95 above 200ms
+      - alert: ProxyHTTPTunnelSetupP95ByNode
+        expr: |
+          histogram_quantile(0.95, sum by (le, node_id) (rate(proxy_http_tunnel_setup_ms_bucket{result="ok"}[5m]))) > 200
+          and
+          sum by (node_id) (increase(proxy_http_tunnel_setup_ms_count{result="ok"}[5m])) >= 100
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: plain HTTP tunnel setup P95 above 200ms on one node

@@ -4,30 +4,46 @@ rule_files:
 evaluation_interval: 1m
 
 tests:
-  # Failures exist and the ok series was never created (L1 just restarted).
-  # The ratio is 1 and the page must fire.
+  # Enough failures and no ok series. Volume stays above 100, so the page fires
+  # once `for: 5m` has elapsed. eval_time 15m is past that.
   - interval: 1m
     input_series:
       - series: 'proxy_http_upstream_fail_total{node_id="n1",reason="dial"}'
-        values: '0+10x10'
+        values: '0+30x40'
       - series: 'proxy_upstream_fail_total{node_id="n1",reason="dial"}'
-        values: '0+10x10'
+        values: '0+30x40'
     alert_rule_test:
-      - eval_time: 5m
+      - eval_time: 15m
         alertname: ProxyHTTPFailureRate
         exp_alerts:
           - exp_labels:
               severity: page
             exp_annotations:
               summary: plain HTTP failure rate above 2%
-      - eval_time: 5m
+      - eval_time: 15m
+        alertname: ProxyHTTPFailureRateByNode
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              node_id: n1
+            exp_annotations:
+              summary: plain HTTP failure rate above 2% on one node
+      - eval_time: 15m
         alertname: ProxyConnectFailureRate
         exp_alerts:
           - exp_labels:
               severity: page
             exp_annotations:
               summary: CONNECT failure rate above 2%
-      - eval_time: 5m
+      - eval_time: 15m
+        alertname: ProxyConnectFailureRateByNode
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              node_id: n1
+            exp_annotations:
+              summary: CONNECT failure rate above 2% on one node
+      - eval_time: 15m
         alertname: ProxyCombinedFailureRate
         exp_alerts:
           - exp_labels:
@@ -35,75 +51,249 @@ tests:
             exp_annotations:
               summary: combined failure rate above 2%
     promql_expr_test:
-      - eval_time: 5m
+      - eval_time: 15m
         expr: histogram_quantile(0.95, sum by (le) (rate(proxy_http_tunnel_setup_ms_bucket{result="ok"}[5m])))
         exp_samples: []
 
-  # No series at all. Every sum is replaced by 0, the denominator guard holds, nothing pages.
+  # No series at all. Nothing pages, including the P95 alerts.
   - interval: 1m
     alert_rule_test:
-      - eval_time: 5m
+      - eval_time: 15m
         alertname: ProxyHTTPFailureRate
         exp_alerts: []
-      - eval_time: 5m
+      - eval_time: 15m
         alertname: ProxyConnectFailureRate
         exp_alerts: []
-      - eval_time: 5m
+      - eval_time: 15m
         alertname: ProxyCombinedFailureRate
         exp_alerts: []
-      - eval_time: 5m
+      - eval_time: 15m
+        alertname: ProxyHTTPFailureRateByNode
+        exp_alerts: []
+      - eval_time: 15m
         alertname: ProxyHTTPTunnelSetupP95
         exp_alerts: []
-      - eval_time: 5m
+      - eval_time: 15m
         alertname: ProxyConnectLatencyP95
         exp_alerts: []
 
-  # HTTP has never failed, so that counter series does not exist.
-  # CONNECT is half failures. The combined numerator must still be a number.
+  # HTTP has never failed. CONNECT is half failures at a volume that pages.
+  # The combined numerator must still be a number.
   - interval: 1m
     input_series:
       - series: 'proxy_upstream_fail_total{node_id="n1",reason="l2_response"}'
-        values: '0+10x10'
+        values: '0+30x40'
       - series: 'proxy_connect_latency_ms_count{node_id="n1",result="ok"}'
-        values: '0+10x10'
+        values: '0+30x40'
       - series: 'proxy_http_request_latency_ms_count{node_id="n1",result="ok"}'
-        values: '0+100x10'
+        values: '0+200x40'
     promql_expr_test:
-      - eval_time: 5m
+      - eval_time: 15m
         expr: (sum(increase(proxy_upstream_fail_total[5m])) or vector(0)) + (sum(increase(proxy_http_upstream_fail_total[5m])) or vector(0))
         exp_samples:
           - labels: '{}'
-            value: 50
+            value: 150
     alert_rule_test:
-      - eval_time: 5m
+      - eval_time: 15m
         alertname: ProxyCombinedFailureRate
         exp_alerts:
           - exp_labels:
               severity: page
             exp_annotations:
               summary: combined failure rate above 2%
-      - eval_time: 5m
+      - eval_time: 15m
         alertname: ProxyHTTPFailureRate
         exp_alerts: []
 
-  # Counters exist but did not move. 0/0 must not page.
+  # Counters exist but did not move.
   - interval: 1m
     input_series:
       - series: 'proxy_upstream_fail_total{node_id="n1",reason="dial"}'
-        values: '0+0x10'
+        values: '0+0x40'
       - series: 'proxy_connect_latency_ms_count{node_id="n1",result="ok"}'
-        values: '0+0x10'
+        values: '0+0x40'
       - series: 'proxy_http_upstream_fail_total{node_id="n1",reason="dial"}'
-        values: '0+0x10'
+        values: '0+0x40'
       - series: 'proxy_http_request_latency_ms_count{node_id="n1",result="ok"}'
-        values: '0+0x10'
+        values: '0+0x40'
     alert_rule_test:
-      - eval_time: 5m
+      - eval_time: 15m
         alertname: ProxyConnectFailureRate
         exp_alerts: []
-      - eval_time: 5m
+      - eval_time: 15m
         alertname: ProxyHTTPFailureRate
         exp_alerts: []
-      - eval_time: 5m
+      - eval_time: 15m
         alertname: ProxyCombinedFailureRate
+        exp_alerts: []
+
+  # 1 failure per minute and 9 successes. The ratio is 10% but the 5m volume
+  # stays under 100, so it must not page.
+  - interval: 1m
+    input_series:
+      - series: 'proxy_http_upstream_fail_total{node_id="n1",reason="dial"}'
+        values: '0+1x40'
+      - series: 'proxy_http_request_latency_ms_count{node_id="n1",result="ok"}'
+        values: '0+9x40'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: ProxyHTTPFailureRate
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: ProxyHTTPFailureRateByNode
+        exp_alerts: []
+
+  # One node is entirely failures. Another node is healthy. Only the bad node pages.
+  - interval: 1m
+    input_series:
+      - series: 'proxy_http_upstream_fail_total{node_id="n-bad",reason="stale_tunnel"}'
+        values: '0+30x40'
+      - series: 'proxy_http_request_latency_ms_count{node_id="n-good",result="ok"}'
+        values: '0+200x40'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: ProxyHTTPFailureRateByNode
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              node_id: n-bad
+            exp_annotations:
+              summary: plain HTTP failure rate above 2% on one node
+      - eval_time: 15m
+        alertname: ProxyHTTPFailureRate
+        exp_alerts:
+          - exp_labels:
+              severity: page
+            exp_annotations:
+              summary: plain HTTP failure rate above 2%
+
+  # Setup samples are all above 200ms, and there are at least 100 of them.
+  # Both the global and per-node P95 alerts fire. A single early evaluation does not.
+  - interval: 1m
+    input_series:
+      - series: 'proxy_http_tunnel_setup_ms_bucket{node_id="n1",result="ok",le="5"}'
+        values: '0+0x40'
+      - series: 'proxy_http_tunnel_setup_ms_bucket{node_id="n1",result="ok",le="10"}'
+        values: '0+0x40'
+      - series: 'proxy_http_tunnel_setup_ms_bucket{node_id="n1",result="ok",le="25"}'
+        values: '0+0x40'
+      - series: 'proxy_http_tunnel_setup_ms_bucket{node_id="n1",result="ok",le="50"}'
+        values: '0+0x40'
+      - series: 'proxy_http_tunnel_setup_ms_bucket{node_id="n1",result="ok",le="100"}'
+        values: '0+0x40'
+      - series: 'proxy_http_tunnel_setup_ms_bucket{node_id="n1",result="ok",le="200"}'
+        values: '0+0x40'
+      - series: 'proxy_http_tunnel_setup_ms_bucket{node_id="n1",result="ok",le="500"}'
+        values: '0+30x40'
+      - series: 'proxy_http_tunnel_setup_ms_bucket{node_id="n1",result="ok",le="1000"}'
+        values: '0+30x40'
+      - series: 'proxy_http_tunnel_setup_ms_bucket{node_id="n1",result="ok",le="3000"}'
+        values: '0+30x40'
+      - series: 'proxy_http_tunnel_setup_ms_bucket{node_id="n1",result="ok",le="10000"}'
+        values: '0+30x40'
+      - series: 'proxy_http_tunnel_setup_ms_bucket{node_id="n1",result="ok",le="+Inf"}'
+        values: '0+30x40'
+      - series: 'proxy_http_tunnel_setup_ms_count{node_id="n1",result="ok"}'
+        values: '0+30x40'
+      - series: 'proxy_http_tunnel_setup_ms_sum{node_id="n1",result="ok"}'
+        values: '0+12000x40'
+      - series: 'proxy_connect_latency_ms_bucket{node_id="n1",result="ok",le="5"}'
+        values: '0+0x40'
+      - series: 'proxy_connect_latency_ms_bucket{node_id="n1",result="ok",le="10"}'
+        values: '0+0x40'
+      - series: 'proxy_connect_latency_ms_bucket{node_id="n1",result="ok",le="25"}'
+        values: '0+0x40'
+      - series: 'proxy_connect_latency_ms_bucket{node_id="n1",result="ok",le="50"}'
+        values: '0+0x40'
+      - series: 'proxy_connect_latency_ms_bucket{node_id="n1",result="ok",le="100"}'
+        values: '0+0x40'
+      - series: 'proxy_connect_latency_ms_bucket{node_id="n1",result="ok",le="200"}'
+        values: '0+0x40'
+      - series: 'proxy_connect_latency_ms_bucket{node_id="n1",result="ok",le="500"}'
+        values: '0+30x40'
+      - series: 'proxy_connect_latency_ms_bucket{node_id="n1",result="ok",le="1000"}'
+        values: '0+30x40'
+      - series: 'proxy_connect_latency_ms_bucket{node_id="n1",result="ok",le="3000"}'
+        values: '0+30x40'
+      - series: 'proxy_connect_latency_ms_bucket{node_id="n1",result="ok",le="10000"}'
+        values: '0+30x40'
+      - series: 'proxy_connect_latency_ms_bucket{node_id="n1",result="ok",le="+Inf"}'
+        values: '0+30x40'
+      - series: 'proxy_connect_latency_ms_count{node_id="n1",result="ok"}'
+        values: '0+30x40'
+      - series: 'proxy_connect_latency_ms_sum{node_id="n1",result="ok"}'
+        values: '0+12000x40'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: ProxyHTTPTunnelSetupP95
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: ProxyConnectLatencyP95
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: ProxyHTTPTunnelSetupP95
+        exp_alerts:
+          - exp_labels:
+              severity: page
+            exp_annotations:
+              summary: plain HTTP tunnel setup P95 above 200ms
+      - eval_time: 15m
+        alertname: ProxyHTTPTunnelSetupP95ByNode
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              node_id: n1
+            exp_annotations:
+              summary: plain HTTP tunnel setup P95 above 200ms on one node
+      - eval_time: 15m
+        alertname: ProxyConnectLatencyP95
+        exp_alerts:
+          - exp_labels:
+              severity: page
+            exp_annotations:
+              summary: CONNECT P95 above 200ms
+      - eval_time: 15m
+        alertname: ProxyConnectLatencyP95ByNode
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              node_id: n1
+            exp_annotations:
+              summary: CONNECT P95 above 200ms on one node
+
+  # Same volume, but every sample is under 200ms. P95 must not page.
+  - interval: 1m
+    input_series:
+      - series: 'proxy_http_tunnel_setup_ms_bucket{node_id="n1",result="ok",le="5"}'
+        values: '0+0x40'
+      - series: 'proxy_http_tunnel_setup_ms_bucket{node_id="n1",result="ok",le="10"}'
+        values: '0+0x40'
+      - series: 'proxy_http_tunnel_setup_ms_bucket{node_id="n1",result="ok",le="25"}'
+        values: '0+0x40'
+      - series: 'proxy_http_tunnel_setup_ms_bucket{node_id="n1",result="ok",le="50"}'
+        values: '0+30x40'
+      - series: 'proxy_http_tunnel_setup_ms_bucket{node_id="n1",result="ok",le="100"}'
+        values: '0+30x40'
+      - series: 'proxy_http_tunnel_setup_ms_bucket{node_id="n1",result="ok",le="200"}'
+        values: '0+30x40'
+      - series: 'proxy_http_tunnel_setup_ms_bucket{node_id="n1",result="ok",le="500"}'
+        values: '0+30x40'
+      - series: 'proxy_http_tunnel_setup_ms_bucket{node_id="n1",result="ok",le="1000"}'
+        values: '0+30x40'
+      - series: 'proxy_http_tunnel_setup_ms_bucket{node_id="n1",result="ok",le="3000"}'
+        values: '0+30x40'
+      - series: 'proxy_http_tunnel_setup_ms_bucket{node_id="n1",result="ok",le="10000"}'
+        values: '0+30x40'
+      - series: 'proxy_http_tunnel_setup_ms_bucket{node_id="n1",result="ok",le="+Inf"}'
+        values: '0+30x40'
+      - series: 'proxy_http_tunnel_setup_ms_count{node_id="n1",result="ok"}'
+        values: '0+30x40'
+      - series: 'proxy_http_tunnel_setup_ms_sum{node_id="n1",result="ok"}'
+        values: '0+1200x40'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: ProxyHTTPTunnelSetupP95
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: ProxyHTTPTunnelSetupP95ByNode
         exp_alerts: []

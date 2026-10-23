@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/f-ishelly/relay-proxy/internal/docfixture/l1metrics"
@@ -120,6 +121,7 @@ func (t *httpTry) addDown(n int) {
 }
 
 // observe 在结果确定时调用一次。started 为零说明还没拨号、也还没开始写复用隧道，只记结果，不进直方图。
+// request_ms 从 started 起算。重试不重置 started，所以白写的那一次算在同一次 request_ms 里。
 func (t *httpTry) observe(result string) {
 	if t == nil || t.observed {
 		return
@@ -129,7 +131,7 @@ func (t *httpTry) observe(result string) {
 	if t.started.IsZero() {
 		return
 	}
-	t.meter.HandshakeMs = float64(time.Since(t.started)) / float64(time.Millisecond)
+	t.meter.RequestMs = float64(time.Since(t.started)) / float64(time.Millisecond)
 	l1metrics.ObserveHTTP(t.nodeID, result, t.started)
 }
 
@@ -143,14 +145,26 @@ func (t *httpTry) failUpstream(promNode, reason string) {
 
 // failOpen 记录新隧道这次 CONNECT 的失败。请求记一次，setup 用这一次拨号前的时刻再记一次。
 // 重试时不改请求自己的 started。no_upstream 发生在拨号前，不走这里。
+// 事件里的 setup_ms 只覆盖这一次隧道，和 ObserveHTTPSetup 同一段钟。
 func (t *httpTry) failOpen(promNode, reason string, setupStart time.Time) {
 	if t == nil {
 		return
 	}
+	t.noteSetup(setupStart)
 	t.failUpstream(promNode, reason)
 	if !setupStart.IsZero() {
 		l1metrics.ObserveHTTPSetup(t.nodeID, reason, setupStart)
 	}
+}
+
+// noteSetup 把这一次新隧道的建立耗时写进事件。重试时覆盖，只留下实际送出这条请求的隧道。
+// 死掉的复用隧道不在这里：它的 setup 在它自己建成时已经 ObserveHTTPSetup。
+// setup_ms 不含源站时间，也不含被丢掉的那次尝试。request_ms 才含白写的时间。
+func (t *httpTry) noteSetup(setupStart time.Time) {
+	if t == nil || setupStart.IsZero() {
+		return
+	}
+	t.meter.SetupMs = float64(time.Since(setupStart)) / float64(time.Millisecond)
 }
 
 func (t *httpTry) clientGone() {
@@ -175,7 +189,7 @@ func (t *httpTry) emit() {
 // 同一 node_id 且同一 host:port、双方都还想 keep-alive 时，复用已经建立的 L2 隧道；
 // 主机或 node 变了，就关掉隧道再向新的 L2 发 CONNECT。
 // 每条请求一个 httpTry。复用隧道不再拨号，延迟从写出请求起算。
-// 复用的隧道若在源站字节之前断开，幂等且正文还能重放时重开一次；否则记 stale_tunnel。
+// 复用的隧道若在源站字节之前被对端拆掉，且方法默认可重放、头没有写到一半，就重开一次；否则在断管时记 stale_tunnel。读超时不重开。
 func serveAbsolute(client net.Conn, session *httpSession, mc *modeConn, br *bufio.Reader, head []byte, resolver Resolver) error {
 	var held *upstream
 	defer func() {
@@ -705,6 +719,7 @@ func openUpstream(session *httpSession, username, password, nodeID, target strin
 			return nil, err
 		}
 	}
+	try.noteSetup(setupStart)
 	l1metrics.ObserveHTTPSetup(nodeID, l1metrics.ResultOK, setupStart)
 	mc := &modeConn{Conn: raw, session: session}
 	ubr := bufio.NewReaderSize(io.MultiReader(bytes.NewReader(prefix), mc), maxHTTPHead)
@@ -721,26 +736,51 @@ func openUpstream(session *httpSession, username, password, nodeID, target strin
 	}, nil
 }
 
-func idempotentMethod(method string) bool {
+// retryPutDelete 默认关闭。RFC 9110 把 PUT 和 DELETE 标成幂等，
+// 但第一次请求可能已经到达源站，很多源站并不是真的幂等。
+// 打开之后也只在零个源站字节、且请求头没有写出一部分时重试。
+var retryPutDelete = false
+
+func retryableMethod(method string) bool {
 	switch method {
-	case "GET", "HEAD", "OPTIONS", "TRACE", "PUT", "DELETE":
+	case "GET", "HEAD", "OPTIONS", "TRACE":
 		return true
+	case "PUT", "DELETE":
+		return retryPutDelete
 	default:
 		return false
 	}
 }
 
-// classifyStale 只处理复用隧道、且这条请求还没有结果的情况。
-// 方法幂等且正文还没从客户端读过时，重开一次，不把第一次记成失败。
-// 不能重放时记 stale_tunnel。已经重试过，或这是新开的隧道，交给调用方记原来的原因。
-func (t *httpTry) classifyStale(reused, bodyTouched bool, method string) (retry, stale bool) {
-	if t == nil || !reused || t.observed || t.retried {
+func brokenPipeOrEOF(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.ErrClosedPipe) {
+		return true
+	}
+	return errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNABORTED)
+}
+
+// classifyStale 只在复用隧道、这条请求还没有结果、并且调用方确认零个源站字节时使用。
+// 自动重试只接受对端把连接拆掉：EOF、UnexpectedEOF，以及写出时的 ECONNRESET、EPIPE、ECONNABORTED、ErrClosedPipe。
+// 读超时不是死隧道，返回 false, false，由调用方记原来的原因。
+// partialWrite 表示请求头已经写出一部分，那些字节可能已经到了源站，不重试。
+// 整段头写完之后的读失败不是 partialWrite，Node 空闲关掉连接时仍要重试。
+// 正文已经从客户端读出同样不重试。本版不缓存正文。
+// 方法默认只有 GET、HEAD、OPTIONS、TRACE。PUT 和 DELETE 要打开 retryPutDelete。
+// 错误确实是断管、但不能重试时记 stale_tunnel。其它错误返回 false, false。
+func (t *httpTry) classifyStale(reused, bodyTouched, partialWrite bool, method string, err error) (retry, stale bool) {
+	if t == nil || err == nil || !reused || t.observed || t.retried {
 		return false, false
 	}
-	if idempotentMethod(method) && !bodyTouched {
-		return true, false
+	if isTimeout(err) || !brokenPipeOrEOF(err) {
+		return false, false
 	}
-	return false, true
+	if partialWrite || bodyTouched || !retryableMethod(method) {
+		return false, true
+	}
+	return true, false
 }
 
 // relay 把改写后的请求写入隧道，再把源站响应原样写回客户端。
@@ -762,7 +802,7 @@ func (u *upstream) relay(client net.Conn, clientMode *modeConn, clientBR *bufio.
 		if err == nil {
 			err = io.ErrShortWrite
 		}
-		if retry, stale := try.classifyStale(reused, false, req.method); retry {
+		if retry, stale := try.classifyStale(reused, false, n > 0, req.method, err); retry {
 			return relayOutcome{stale: true}, nil
 		} else if stale {
 			try.failUpstream(u.nodeID, l1metrics.ReasonStaleTunnel)
@@ -788,7 +828,7 @@ func (u *upstream) relay(client net.Conn, clientMode *modeConn, clientBR *bufio.
 		head, err := readHTTPHead(u.br)
 		if err != nil {
 			if !try.observed && len(head) == 0 && !sent {
-				if retry, stale := try.classifyStale(reused, bodyTouched, req.method); retry {
+				if retry, stale := try.classifyStale(reused, bodyTouched, false, req.method, err); retry {
 					return relayOutcome{stale: true}, nil
 				} else if stale {
 					try.failUpstream(u.nodeID, l1metrics.ReasonStaleTunnel)
@@ -830,9 +870,12 @@ func (u *upstream) relay(client net.Conn, clientMode *modeConn, clientBR *bufio.
 		}
 		if meta.code == http.StatusSwitchingProtocols {
 			if req.upgrade {
-				err := pipeUpgrade(client, clientBR, u.conn, u.br, clientMode, u.mode, try)
+				reason, err := pipeUpgrade(client, clientBR, u.conn, u.br, clientMode, u.mode, try)
 				if err != nil {
-					l1metrics.AddHTTPBodyAbort(u.nodeID)
+					if reason == "" {
+						reason = l1metrics.ReasonAbortOriginReset
+					}
+					l1metrics.AddHTTPBodyAbort(u.nodeID, reason)
 				}
 				return relayOutcome{endClient: true}, err
 			}
@@ -849,8 +892,9 @@ func (u *upstream) relay(client net.Conn, clientMode *modeConn, clientBR *bufio.
 			}
 			continue
 		}
-		if err := relayResponseBody(downW, u.br, meta); err != nil {
-			l1metrics.AddHTTPBodyAbort(u.nodeID)
+		readFailed, err := relayResponseBody(downW, u.br, meta)
+		if err != nil {
+			l1metrics.AddHTTPBodyAbort(u.nodeID, bodyAbortReason(readFailed, err))
 			return relayOutcome{endClient: true}, err
 		}
 		// 最终响应已经发出、但 Expect 的正文还没消费：不能在这条客户端连接上接着读下一个请求。
@@ -862,8 +906,9 @@ func (u *upstream) relay(client net.Conn, clientMode *modeConn, clientBR *bufio.
 }
 
 // finishBodyWrite 处理请求正文没写完。读侧失败是 client_gone。
-// 写侧失败且已经向客户端写过源站字节时记 l2_write，不再补 502，也不再重试。
-// 还没写过源站字节时，复用隧道按 classifyStale 决定重试或 stale_tunnel。
+// 写侧失败发生在请求头已经完整写出之后，头可能已经到达源站，所以 partialWrite 为真，不重试。
+// 已经向客户端写过源站字节时记 l2_write，不再补 502。读超时也记 l2_write，不记 stale_tunnel。
+// 还没写过源站字节、且错误是断管时，复用隧道记 stale_tunnel。
 func (u *upstream) finishBodyWrite(client net.Conn, req *absReq, try *httpTry, reused, afterOrigin, readFailed bool, err error) (relayOutcome, error) {
 	if readFailed {
 		try.clientGone()
@@ -874,7 +919,7 @@ func (u *upstream) finishBodyWrite(client net.Conn, req *absReq, try *httpTry, r
 	}
 	touched := req.chunked || req.contentLength > 0
 	if !afterOrigin {
-		if retry, stale := try.classifyStale(reused, touched, req.method); retry {
+		if retry, stale := try.classifyStale(reused, touched, true, req.method, err); retry {
 			return relayOutcome{stale: true}, nil
 		} else if stale {
 			try.failUpstream(u.nodeID, l1metrics.ReasonStaleTunnel)
@@ -991,6 +1036,19 @@ func (c countWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
+type errWriter struct {
+	w      io.Writer
+	failed bool
+}
+
+func (e *errWriter) Write(p []byte) (int, error) {
+	n, err := e.w.Write(p)
+	if err != nil || (len(p) > 0 && n < len(p)) {
+		e.failed = true
+	}
+	return n, err
+}
+
 type errReader struct {
 	r      io.Reader
 	failed bool
@@ -1017,23 +1075,42 @@ func copyNRead(dst io.Writer, src io.Reader, n int64) (bool, error) {
 	return false, err
 }
 
-func relayResponseBody(dst io.Writer, src *bufio.Reader, meta respMeta) error {
+// relayResponseBody 把最终状态行之后的响应正文写给客户端。
+// 返回的 bool 表示失败在读源站这一侧。Content-Length 没给够是读侧，记 origin_reset。
+// 直到连接关闭的正文在 EOF 上成功返回，不记 body abort。
+func relayResponseBody(dst io.Writer, src *bufio.Reader, meta respMeta) (bool, error) {
 	if meta.noBody {
-		return nil
+		return false, nil
 	}
 	if meta.chunked {
-		_, err := copyChunked(dst, src)
-		return err
+		return copyChunked(dst, src)
 	}
 	if meta.contentLength >= 0 {
-		_, err := copyNRead(dst, src, meta.contentLength)
-		return err
+		return copyNRead(dst, src, meta.contentLength)
 	}
-	_, err := io.Copy(dst, src)
+	return copyUntilClose(dst, src)
+}
+
+func copyUntilClose(dst io.Writer, src io.Reader) (bool, error) {
+	mr := &errReader{r: src}
+	_, err := io.Copy(dst, mr)
 	if err == nil || errors.Is(err, io.EOF) {
-		return nil
+		return false, nil
 	}
-	return err
+	if mr.failed || isTimeout(err) {
+		return true, err
+	}
+	return false, err
+}
+
+func bodyAbortReason(readFailed bool, err error) string {
+	if isTimeout(err) {
+		return l1metrics.ReasonAbortIdleTimeout
+	}
+	if readFailed {
+		return l1metrics.ReasonAbortOriginReset
+	}
+	return l1metrics.ReasonAbortClientCancel
 }
 
 // copyChunked 按 chunk 帧拷贝，不解码、不重编码。size 行、扩展、正文和 trailer 都原样写出。
@@ -1091,36 +1168,58 @@ func parseChunkSize(line []byte) (int64, error) {
 
 // pipeUpgrade 在 101 之后进入与 CONNECT 相同的双向字节转发。
 // 半关闭后的空闲上限是 halfCloseIdleTimeout，整条隧道的空闲兜底仍是 tunnelIdleTimeout。
-func pipeUpgrade(client net.Conn, clientR io.Reader, up net.Conn, upR io.Reader, clientMode, upMode *modeConn, try *httpTry) error {
-	errc := make(chan error, 2)
+// io.Copy 在 EOF 上返回 nil。随后的 closeWrite 失败不当成隧道中断，也不去关另一端，
+// 否则另一方向会读到 use of closed network connection，把正常的 101 结束记成 abort。
+// 正常拆除返回的 error 为 nil，调用方不计数。
+func pipeUpgrade(client net.Conn, clientR io.Reader, up net.Conn, upR io.Reader, clientMode, upMode *modeConn, try *httpTry) (string, error) {
+	type copyResult struct {
+		reason string
+		err    error
+	}
+	errc := make(chan copyResult, 2)
 	relay := func(dst net.Conn, src io.Reader, reverse *modeConn, upload bool) {
-		_, copyErr := io.Copy(countWriter{w: dst, try: try, up: upload}, src)
+		ew := &errWriter{w: countWriter{w: dst, try: try, up: upload}}
+		er := &errReader{r: src}
+		_, copyErr := io.Copy(ew, er)
 		if copyErr != nil {
 			client.Close()
 			up.Close()
-			errc <- copyErr
+			errc <- copyResult{reason: upgradeAbortReason(upload, ew.failed, copyErr), err: copyErr}
 			return
 		}
-		if werr := closeWrite(dst); werr != nil {
-			client.Close()
-			up.Close()
-			errc <- werr
-			return
-		}
+		_ = closeWrite(dst)
 		if reverse != nil {
 			reverse.half.Store(true)
 			_ = reverse.SetReadDeadline(time.Now().Add(halfCloseIdleTimeout))
 		}
-		errc <- nil
+		errc <- copyResult{}
 	}
 	go func() { relay(up, clientR, upMode, true) }()
 	go func() { relay(client, upR, clientMode, false) }()
-	err1 := <-errc
-	err2 := <-errc
-	if err1 != nil {
-		return err1
+	first := <-errc
+	second := <-errc
+	if first.err != nil {
+		return first.reason, first.err
 	}
-	return err2
+	return second.reason, second.err
+}
+
+func upgradeAbortReason(upload, writeFailed bool, err error) string {
+	if isTimeout(err) {
+		return l1metrics.ReasonAbortIdleTimeout
+	}
+	if upload && writeFailed {
+		return l1metrics.ReasonAbortRequestBody
+	}
+	if writeFailed || !upload {
+		// 写给客户端失败是 client_cancel。从客户端读失败也是 client_cancel。
+		// 从源站读失败（下行、且不是写失败）是 origin_reset。
+		if !upload && !writeFailed {
+			return l1metrics.ReasonAbortOriginReset
+		}
+		return l1metrics.ReasonAbortClientCancel
+	}
+	return l1metrics.ReasonAbortClientCancel
 }
 
 func writeHTTPError(w io.Writer, status int, reason, header string) {

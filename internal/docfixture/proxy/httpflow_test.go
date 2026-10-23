@@ -3,8 +3,10 @@
 package proxy
 
 import (
+	"archive/tar"
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"crypto/md5"
 	"crypto/sha256"
 	"encoding/base64"
@@ -14,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,30 +32,105 @@ import (
 )
 
 var (
-	gostA   string
-	gostB   string
-	gostBad string
+	gostA    string
+	gostB    string
+	gostBad  string
+	gostBin  string
+	gostSkip string
 )
 
 func TestMain(m *testing.M) {
+	go consumeMeters()
+	bin, err := prepareGost()
 	var cmds []*exec.Cmd
-	start := func(user, pass string) string {
-		addr, cmd, err := startGost(user, pass)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
+	if err != nil {
+		gostSkip = err.Error()
+		fmt.Fprintln(os.Stderr, "gost skipped:", err)
+	} else {
+		gostBin = bin
+		start := func(user, pass string) string {
+			addr, cmd, err := startGost(user, pass)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			cmds = append(cmds, cmd)
+			return addr
 		}
-		cmds = append(cmds, cmd)
-		return addr
+		gostA = start("app@node-a", "s3cret")
+		gostB = start("app@node-b", "s3cret")
+		gostBad = start("app@node-a", "nope")
 	}
-	gostA = start("app@node-a", "s3cret")
-	gostB = start("app@node-b", "s3cret")
-	gostBad = start("app@node-a", "nope")
 	code := m.Run()
 	for _, c := range cmds {
-		_ = c.Process.Kill()
+		if c.Process != nil {
+			_ = c.Process.Kill()
+		}
 	}
 	os.Exit(code)
+}
+
+func requireGost(t *testing.T) {
+	t.Helper()
+	if gostSkip != "" {
+		t.Skip(gostSkip)
+	}
+}
+
+func prepareGost() (string, error) {
+	if env := os.Getenv("GOST_BIN"); env != "" {
+		st, err := os.Stat(env)
+		if err != nil || st.IsDir() {
+			return "", fmt.Errorf("GOST_BIN %q is not a gost v3.3.1 binary (%v); set GOST_BIN or allow the test to download gost v3.3.1", env, err)
+		}
+		return env, nil
+	}
+	cache := filepath.Join(os.TempDir(), "gost-v3.3.1", "gost")
+	if st, err := os.Stat(cache); err == nil && !st.IsDir() && st.Mode()&0o111 != 0 {
+		return cache, nil
+	}
+	const url = "https://github.com/go-gost/gost/releases/download/v3.3.1/gost_3.3.1_linux_amd64.tar.gz"
+	resp, err := http.Get(url)
+	if err != nil {
+		return "", fmt.Errorf("gost v3.3.1 download failed: %v; set GOST_BIN to a gost v3.3.1 binary", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("gost v3.3.1 download returned %s; set GOST_BIN to a gost v3.3.1 binary", resp.Status)
+	}
+	if err := os.MkdirAll(filepath.Dir(cache), 0o755); err != nil {
+		return "", err
+	}
+	gz, err := gzip.NewReader(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("gost v3.3.1 archive: %v; set GOST_BIN to a gost v3.3.1 binary", err)
+	}
+	defer gz.Close()
+	tr := tar.NewReader(gz)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return "", fmt.Errorf("gost v3.3.1 archive: %v; set GOST_BIN to a gost v3.3.1 binary", err)
+		}
+		if hdr.Typeflag == tar.TypeReg && filepath.Base(hdr.Name) == "gost" {
+			f, err := os.OpenFile(cache, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
+			if err != nil {
+				return "", err
+			}
+			if _, err := io.Copy(f, tr); err != nil {
+				f.Close()
+				return "", err
+			}
+			if err := f.Close(); err != nil {
+				return "", err
+			}
+			return cache, nil
+		}
+	}
+	return "", fmt.Errorf("gost v3.3.1 archive had no gost binary; set GOST_BIN to a gost v3.3.1 binary")
 }
 
 func startGost(user, pass string) (string, *exec.Cmd, error) {
@@ -83,7 +161,7 @@ func startGost(user, pass string) (string, *exec.Cmd, error) {
 	if err := os.WriteFile(cfg, []byte(body), 0o644); err != nil {
 		return "", nil, err
 	}
-	cmd := exec.Command("/tmp/gost", "-C", cfg)
+	cmd := exec.Command(gostBin, "-C", cfg)
 	var logs bytes.Buffer
 	cmd.Stdout = &logs
 	cmd.Stderr = &logs
@@ -177,7 +255,7 @@ func basicToken(user, pass string) string {
 	return base64.StdEncoding.EncodeToString([]byte(user + ":" + pass))
 }
 
-func assertNoConnectMetrics(t *testing.T, snap l1metrics.Calls) {
+func assertNoConnectMetrics(t *testing.T, snap metricSnap) {
 	t.Helper()
 	if len(snap.Rejects) != 0 || len(snap.Fails) != 0 || len(snap.Observes) != 0 || snap.Entered != 0 {
 		t.Fatalf("plain HTTP touched CONNECT metrics: rejects=%v fails=%v observes=%v entered=%d",
@@ -185,7 +263,7 @@ func assertNoConnectMetrics(t *testing.T, snap l1metrics.Calls) {
 	}
 }
 
-func assertSetup(t *testing.T, snap l1metrics.Calls, want ...string) {
+func assertSetup(t *testing.T, snap metricSnap, want ...string) {
 	t.Helper()
 	if len(snap.HTTPSetup) != len(want) {
 		t.Fatalf("setup %#v want %#v", snap.HTTPSetup, want)
@@ -197,19 +275,19 @@ func assertSetup(t *testing.T, snap l1metrics.Calls, want ...string) {
 	}
 }
 
-func assertBalanced(t *testing.T, snap l1metrics.Calls) {
+func assertBalanced(t *testing.T, snap metricSnap) {
 	t.Helper()
 	if snap.HTTPLeft != snap.HTTPEntered || snap.HTTPTunnels != snap.HTTPEntered {
 		t.Fatalf("tunnel unbalanced entered=%d left=%d duration=%d", snap.HTTPEntered, snap.HTTPLeft, snap.HTTPTunnels)
 	}
 }
 
-func waitCalls(t *testing.T, pred func(l1metrics.Calls) bool) l1metrics.Calls {
+func waitCalls(t *testing.T, pred func(metricSnap) bool) metricSnap {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
-	var snap l1metrics.Calls
+	var snap metricSnap
 	for {
-		snap = l1metrics.Snapshot()
+		snap = snapMetrics()
 		if pred(snap) || !time.Now().Before(deadline) {
 			return snap
 		}
@@ -220,14 +298,22 @@ func waitCalls(t *testing.T, pred func(l1metrics.Calls) bool) l1metrics.Calls {
 type scriptConn struct {
 	net.Conn
 	write    func([]byte) (int, error)
+	read     func([]byte) (int, error)
 	readDead func(time.Time) error
 }
 
-func (s scriptConn) Write(p []byte) (int, error) {
+func (s *scriptConn) Write(p []byte) (int, error) {
 	if s.write != nil {
 		return s.write(p)
 	}
 	return s.Conn.Write(p)
+}
+
+func (s *scriptConn) Read(p []byte) (int, error) {
+	if s.read != nil {
+		return s.read(p)
+	}
+	return s.Conn.Read(p)
 }
 
 func (s scriptConn) SetReadDeadline(deadline time.Time) error {
@@ -435,6 +521,7 @@ func mustStatus(t *testing.T, resp []byte, code int) {
 }
 
 func TestHeaderOrderAndCaseThroughGost(t *testing.T) {
+	requireGost(t)
 	gotCh := make(chan []byte, 1)
 	origin := serveRaw(t, func(c net.Conn) {
 		defer c.Close()
@@ -488,6 +575,7 @@ func TestHeaderOrderAndCaseThroughGost(t *testing.T) {
 }
 
 func TestChunkedAndContentLength(t *testing.T) {
+	requireGost(t)
 	gotCh := make(chan []byte, 1)
 	respRaw := []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nx-Odd: AbC\r\n\r\n5\r\nworld\r\n0\r\n\r\n")
 	origin := serveRaw(t, func(c net.Conn) {
@@ -527,7 +615,8 @@ func TestChunkedAndContentLength(t *testing.T) {
 }
 
 func TestExpect100Continue(t *testing.T) {
-	l1metrics.Reset()
+	requireGost(t)
+	resetMetrics()
 	startedBody := make(chan struct{})
 	sawBody := make(chan string, 1)
 	origin := serveRaw(t, func(c net.Conn) {
@@ -606,7 +695,7 @@ func TestExpect100Continue(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("origin did not see body")
 	}
-	snap := waitCalls(t, func(c l1metrics.Calls) bool {
+	snap := waitCalls(t, func(c metricSnap) bool {
 		return len(c.HTTPObserves) == 1 && len(c.Events) == 1 && c.HTTPEntered == 1 && c.HTTPLeft == 1 && c.HTTPTunnels == 1
 	})
 	if snap.HTTPObserves[0] != l1metrics.ResultOK || len(snap.HTTPObserves) != 1 {
@@ -624,7 +713,8 @@ func TestExpect100Continue(t *testing.T) {
 }
 
 func TestExpect100RejectedDoesNotForwardBody(t *testing.T) {
-	l1metrics.Reset()
+	requireGost(t)
+	resetMetrics()
 	saw := make(chan string, 1)
 	origin := serveRaw(t, func(c net.Conn) {
 		defer c.Close()
@@ -663,7 +753,7 @@ func TestExpect100RejectedDoesNotForwardBody(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("origin did not finish")
 	}
-	snap := waitCalls(t, func(c l1metrics.Calls) bool {
+	snap := waitCalls(t, func(c metricSnap) bool {
 		return len(c.HTTPObserves) == 1 && c.HTTPObserves[0] == l1metrics.ResultOK && len(c.HTTPSetup) == 1 && c.HTTPEntered == c.HTTPLeft && c.HTTPTunnels == c.HTTPEntered
 	})
 	if len(snap.HTTPFails) != 0 {
@@ -675,7 +765,8 @@ func TestExpect100RejectedDoesNotForwardBody(t *testing.T) {
 }
 
 func TestWebSocketUpgrade(t *testing.T) {
-	l1metrics.Reset()
+	requireGost(t)
+	resetMetrics()
 	gotCh := make(chan []byte, 1)
 	origin := serveRaw(t, func(c net.Conn) {
 		defer c.Close()
@@ -730,7 +821,7 @@ func TestWebSocketUpgrade(t *testing.T) {
 	if string(got) != want {
 		t.Fatalf("upgrade request\n got %s\nwant %s", strconv.Quote(string(got)), strconv.Quote(want))
 	}
-	snap := waitCalls(t, func(c l1metrics.Calls) bool {
+	snap := waitCalls(t, func(c metricSnap) bool {
 		return len(c.HTTPObserves) == 1 && c.HTTPUp >= 4 && c.HTTPDown >= 4 && c.HTTPEntered == 1
 	})
 	if snap.HTTPObserves[0] != l1metrics.ResultOK || len(snap.HTTPObserves) != 1 {
@@ -742,16 +833,20 @@ func TestWebSocketUpgrade(t *testing.T) {
 	}
 	assertNoConnectMetrics(t, snap)
 	_ = c.Close()
-	snap = waitCalls(t, func(c l1metrics.Calls) bool {
+	snap = waitCalls(t, func(c metricSnap) bool {
 		return c.HTTPLeft == 1 && c.HTTPTunnels == 1
 	})
 	if snap.HTTPLeft != 1 || snap.HTTPTunnels != 1 {
 		t.Fatalf("101 tunnel left=%d duration=%d", snap.HTTPLeft, snap.HTTPTunnels)
 	}
+	if snap.HTTPBodyAborts != 0 {
+		t.Fatalf("clean 101 teardown counted as abort: %v", snap.BodyByReason)
+	}
 }
 
 func TestKeepAliveDifferentHostsAndSameHostReuse(t *testing.T) {
-	l1metrics.Reset()
+	requireGost(t)
+	resetMetrics()
 	newOrigin := func() (string, *atomic.Int32, *[][]byte, *sync.Mutex) {
 		var n atomic.Int32
 		var mu sync.Mutex
@@ -808,7 +903,7 @@ func TestKeepAliveDifferentHostsAndSameHostReuse(t *testing.T) {
 	send(bAddr, "app@node-b", "/two")
 	send(aAddr, "app@node-a", "/three")
 	send(aAddr, "app@node-a", "/four")
-	snap := waitCalls(t, func(c l1metrics.Calls) bool {
+	snap := waitCalls(t, func(c metricSnap) bool {
 		return len(c.HTTPObserves) == 4 && len(c.Events) == 4 && c.HTTPEntered == 3 && c.HTTPLeft == 2
 	})
 	for _, result := range snap.HTTPObserves {
@@ -849,13 +944,14 @@ func TestKeepAliveDifferentHostsAndSameHostReuse(t *testing.T) {
 		t.Fatalf("A paths %s", aCopy)
 	}
 	handlers.Wait()
-	snap = l1metrics.Snapshot()
+	snap = snapMetrics()
 	if snap.HTTPLeft != 3 || snap.HTTPTunnels != 3 || snap.HTTPEntered != 3 {
 		t.Fatalf("tunnels after close entered=%d left=%d duration=%d", snap.HTTPEntered, snap.HTTPLeft, snap.HTTPTunnels)
 	}
 }
 
 func TestLastAtNodeID(t *testing.T) {
+	requireGost(t)
 	addr, cmd, err := startGost("user@corp@node-a", "s3cret")
 	if err != nil {
 		t.Fatal(err)
@@ -898,10 +994,10 @@ func TestLocalRejectsDoNotDial(t *testing.T) {
 		{"origin-form", "app@node-a", "s3cret", "/a", 400, l1metrics.ReasonRejectBadTarget},
 		{"https", "app@node-a", "s3cret", "https://example.com/a", 400, l1metrics.ReasonRejectBadTarget},
 	}
-	l1 := startL1(t, mapResolver{m: map[string]string{"node-a": gostA}})
+	l1 := startL1(t, mapResolver{m: map[string]string{"node-a": "127.0.0.1:9"}})
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			l1metrics.Reset()
+			resetMetrics()
 			dials := countDials(t)
 			req := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: h\r\nProxy-Authorization: Basic %s\r\n\r\n",
 				tc.target, basicToken(tc.user, tc.pass))
@@ -911,7 +1007,7 @@ func TestLocalRejectsDoNotDial(t *testing.T) {
 				t.Fatalf("dialed %d", dials.Load())
 			}
 			handlers.Wait()
-			snap := l1metrics.Snapshot()
+			snap := snapMetrics()
 			if len(snap.HTTPRejects) != 1 || snap.HTTPRejects[0] != tc.reason {
 				t.Fatalf("rejects %#v", snap.HTTPRejects)
 			}
@@ -925,7 +1021,7 @@ func TestLocalRejectsDoNotDial(t *testing.T) {
 			if len(snap.Events) != wantEvents {
 				t.Fatalf("events %d want %d (%+v)", len(snap.Events), wantEvents, snap.Events)
 			}
-			if wantEvents == 1 && (snap.Events[0].Protocol != l1metrics.ProtocolHTTP || snap.Events[0].Result != tc.reason || snap.Events[0].HandshakeMs != 0) {
+			if wantEvents == 1 && (snap.Events[0].Protocol != l1metrics.ProtocolHTTP || snap.Events[0].Result != tc.reason || snap.Events[0].RequestMs != 0 || snap.Events[0].SetupMs != 0) {
 				t.Fatalf("event %+v", snap.Events[0])
 			}
 			assertNoConnectMetrics(t, snap)
@@ -937,9 +1033,9 @@ func TestLocalRejectsDoNotDial(t *testing.T) {
 }
 
 func TestBadCredentialDoesNotDial(t *testing.T) {
-	l1metrics.Reset()
+	resetMetrics()
 	dials := countDials(t)
-	l1 := startL1(t, mapResolver{m: map[string]string{"node-a": gostA}})
+	l1 := startL1(t, mapResolver{m: map[string]string{"node-a": "127.0.0.1:9"}})
 	token := base64.StdEncoding.EncodeToString([]byte("app@node-a:bad\nsecret"))
 	req := fmt.Sprintf("GET http://127.0.0.1/a HTTP/1.1\r\nHost: h\r\nProxy-Authorization: Basic %s\r\n\r\n", token)
 	resp := doRequest(t, l1, req)
@@ -948,7 +1044,7 @@ func TestBadCredentialDoesNotDial(t *testing.T) {
 		t.Fatalf("dialed %d", dials.Load())
 	}
 	handlers.Wait()
-	snap := l1metrics.Snapshot()
+	snap := snapMetrics()
 	if len(snap.HTTPRejects) != 1 || snap.HTTPRejects[0] != l1metrics.ReasonRejectBadCredential {
 		t.Fatalf("rejects %#v", snap.HTTPRejects)
 	}
@@ -959,7 +1055,8 @@ func TestBadCredentialDoesNotDial(t *testing.T) {
 }
 
 func TestL2Auth407(t *testing.T) {
-	l1metrics.Reset()
+	requireGost(t)
+	resetMetrics()
 	l1 := startL1(t, mapResolver{m: map[string]string{"node-a": gostBad}})
 	req := fmt.Sprintf("GET http://127.0.0.1/a HTTP/1.1\r\nHost: h\r\nProxy-Authorization: Basic %s\r\n\r\n",
 		basicToken("app@node-a", "s3cret"))
@@ -969,7 +1066,7 @@ func TestL2Auth407(t *testing.T) {
 		t.Fatalf("challenge not passed: %s", strconv.Quote(string(resp)))
 	}
 	handlers.Wait()
-	snap := l1metrics.Snapshot()
+	snap := snapMetrics()
 	if len(snap.HTTPFails) != 1 || snap.HTTPFails[0][1] != l1metrics.ReasonL2Auth {
 		t.Fatalf("fails %#v", snap.HTTPFails)
 	}
@@ -982,7 +1079,7 @@ func TestL2Auth407(t *testing.T) {
 }
 
 func TestL2Status502(t *testing.T) {
-	l1metrics.Reset()
+	resetMetrics()
 	bad := serveRaw(t, func(c net.Conn) {
 		defer c.Close()
 		buf := make([]byte, 2048)
@@ -995,7 +1092,7 @@ func TestL2Status502(t *testing.T) {
 	resp := doRequest(t, l1, req)
 	mustStatus(t, resp, 502)
 	handlers.Wait()
-	snap := l1metrics.Snapshot()
+	snap := snapMetrics()
 	if len(snap.HTTPFails) != 1 || snap.HTTPFails[0][1] != l1metrics.ReasonL2Status || snap.HTTPFails[0][0] != "node-a" {
 		t.Fatalf("fails %#v", snap.HTTPFails)
 	}
@@ -1016,13 +1113,13 @@ func TestDialAndResolve502(t *testing.T) {
 	_ = ln.Close()
 
 	t.Run("dial", func(t *testing.T) {
-		l1metrics.Reset()
+		resetMetrics()
 		l1 := startL1(t, mapResolver{m: map[string]string{"node-a": closed}})
 		resp := doRequest(t, l1, fmt.Sprintf("GET http://127.0.0.1/a HTTP/1.1\r\nHost: h\r\nProxy-Authorization: Basic %s\r\n\r\n",
 			basicToken("app@node-a", "s3cret")))
 		mustStatus(t, resp, 502)
 		handlers.Wait()
-		snap := l1metrics.Snapshot()
+		snap := snapMetrics()
 		if len(snap.HTTPFails) != 1 || snap.HTTPFails[0] != [2]string{"node-a", l1metrics.ReasonDial} {
 			t.Fatalf("fails %#v", snap.HTTPFails)
 		}
@@ -1034,13 +1131,13 @@ func TestDialAndResolve502(t *testing.T) {
 		assertNoConnectMetrics(t, snap)
 	})
 	t.Run("unknown", func(t *testing.T) {
-		l1metrics.Reset()
+		resetMetrics()
 		l1 := startL1(t, staticResolver{err: ErrUnknownNode})
 		resp := doRequest(t, l1, fmt.Sprintf("GET http://127.0.0.1/a HTTP/1.1\r\nHost: h\r\nProxy-Authorization: Basic %s\r\n\r\n",
 			basicToken("app@node-a", "s3cret")))
 		mustStatus(t, resp, 502)
 		handlers.Wait()
-		snap := l1metrics.Snapshot()
+		snap := snapMetrics()
 		if len(snap.HTTPFails) != 1 || snap.HTTPFails[0] != [2]string{l1metrics.NodeUnknown, l1metrics.ReasonNoUpstream} {
 			t.Fatalf("fails %#v", snap.HTTPFails)
 		}
@@ -1055,13 +1152,13 @@ func TestDialAndResolve502(t *testing.T) {
 		assertNoConnectMetrics(t, snap)
 	})
 	t.Run("no-healthy", func(t *testing.T) {
-		l1metrics.Reset()
+		resetMetrics()
 		l1 := startL1(t, staticResolver{err: ErrNoHealthyAddr})
 		resp := doRequest(t, l1, fmt.Sprintf("GET http://127.0.0.1/a HTTP/1.1\r\nHost: h\r\nProxy-Authorization: Basic %s\r\n\r\n",
 			basicToken("app@node-a", "s3cret")))
 		mustStatus(t, resp, 502)
 		handlers.Wait()
-		snap := l1metrics.Snapshot()
+		snap := snapMetrics()
 		if len(snap.HTTPFails) != 1 || snap.HTTPFails[0] != [2]string{"node-a", l1metrics.ReasonNoUpstream} {
 			t.Fatalf("fails %#v", snap.HTTPFails)
 		}
@@ -1073,13 +1170,13 @@ func TestDialAndResolve502(t *testing.T) {
 		assertNoConnectMetrics(t, snap)
 	})
 	t.Run("empty", func(t *testing.T) {
-		l1metrics.Reset()
+		resetMetrics()
 		l1 := startL1(t, staticResolver{})
 		resp := doRequest(t, l1, fmt.Sprintf("GET http://127.0.0.1/a HTTP/1.1\r\nHost: h\r\nProxy-Authorization: Basic %s\r\n\r\n",
 			basicToken("app@node-a", "s3cret")))
 		mustStatus(t, resp, 502)
 		handlers.Wait()
-		snap := l1metrics.Snapshot()
+		snap := snapMetrics()
 		if len(snap.HTTPFails) != 1 || snap.HTTPFails[0] != [2]string{l1metrics.NodeUnknown, l1metrics.ReasonNoUpstream} {
 			t.Fatalf("fails %#v", snap.HTTPFails)
 		}
@@ -1103,7 +1200,7 @@ func TestL2ResponseTimeout(t *testing.T) {
 		time.Sleep(5 * time.Second)
 		c.Close()
 	})
-	l1metrics.Reset()
+	resetMetrics()
 	l1 := startL1(t, mapResolver{m: map[string]string{"node-a": blackhole}})
 	start := time.Now()
 	resp := doRequest(t, l1, fmt.Sprintf("GET http://127.0.0.1/a HTTP/1.1\r\nHost: h\r\nProxy-Authorization: Basic %s\r\n\r\n",
@@ -1113,7 +1210,7 @@ func TestL2ResponseTimeout(t *testing.T) {
 	}
 	mustStatus(t, resp, 502)
 	handlers.Wait()
-	snap := l1metrics.Snapshot()
+	snap := snapMetrics()
 	if len(snap.HTTPFails) != 1 || snap.HTTPFails[0][1] != l1metrics.ReasonL2Response {
 		t.Fatalf("fails %#v", snap.HTTPFails)
 	}
@@ -1126,13 +1223,14 @@ func TestL2ResponseTimeout(t *testing.T) {
 }
 
 func TestClientIdleTimeout(t *testing.T) {
+	resetMetrics()
 	old := tunnelIdleTimeout
 	tunnelIdleTimeout = 200 * time.Millisecond
 	t.Cleanup(func() {
 		handlers.Wait()
 		tunnelIdleTimeout = old
 	})
-	l1 := startL1(t, mapResolver{m: map[string]string{"node-a": gostA}})
+	l1 := startL1(t, staticResolver{})
 	c, err := net.Dial("tcp", l1)
 	if err != nil {
 		t.Fatal(err)
@@ -1143,6 +1241,11 @@ func TestClientIdleTimeout(t *testing.T) {
 	_, err = c.Read(buf)
 	if err == nil {
 		t.Fatal("expected idle close")
+	}
+	handlers.Wait()
+	snap := snapMetrics()
+	if len(snap.HTTPRejects) != 0 || len(snap.Rejects) != 0 || len(snap.HTTPObserves) != 0 || len(snap.HTTPSetup) != 0 || len(snap.HTTPFails) != 0 || len(snap.Events) != 0 || snap.Drops != 0 || snap.HTTPBodyAborts != 0 || snap.HTTPEntered != 0 {
+		t.Fatalf("zero-byte idle timeout was counted: %+v", snap)
 	}
 }
 
@@ -1214,6 +1317,7 @@ func TestAbsoluteFormMutations(t *testing.T) {
 }
 
 func TestHopHeaderStripAndHEAD(t *testing.T) {
+	requireGost(t)
 	gotCh := make(chan []byte, 1)
 	origin := serveRaw(t, func(c net.Conn) {
 		defer c.Close()
@@ -1256,6 +1360,7 @@ func TestHopHeaderStripAndHEAD(t *testing.T) {
 }
 
 func TestApproachAGostRewritesHeaders(t *testing.T) {
+	requireGost(t)
 	gotCh := make(chan []byte, 1)
 	origin := serveRaw(t, func(c net.Conn) {
 		defer c.Close()
@@ -1312,6 +1417,7 @@ func TestApproachAGostRewritesHeaders(t *testing.T) {
 }
 
 func TestClientHelloBytesJA3JA4(t *testing.T) {
+	requireGost(t)
 	hello := buildClientHello("example.com")
 	direct := captureHello(t, func(origin string) {
 		c, err := net.Dial("tcp", origin)
@@ -1766,7 +1872,7 @@ func TestHTTPL2WriteAndDeadline(t *testing.T) {
 	req := fmt.Sprintf("GET http://127.0.0.1/a HTTP/1.1\r\nHost: h\r\nProxy-Authorization: Basic %s\r\n\r\n",
 		basicToken("app@node-a", "s3cret"))
 	t.Run("write-error", func(t *testing.T) {
-		l1metrics.Reset()
+		resetMetrics()
 		scriptedDial(t, func(c net.Conn) net.Conn {
 			return &scriptConn{Conn: c, write: func([]byte) (int, error) { return 0, io.ErrClosedPipe }}
 		})
@@ -1774,7 +1880,7 @@ func TestHTTPL2WriteAndDeadline(t *testing.T) {
 		resp := doRequest(t, l1, req)
 		mustStatus(t, resp, 502)
 		handlers.Wait()
-		snap := l1metrics.Snapshot()
+		snap := snapMetrics()
 		if len(snap.HTTPFails) != 1 || snap.HTTPFails[0] != [2]string{"node-a", l1metrics.ReasonL2Write} {
 			t.Fatalf("fails %#v", snap.HTTPFails)
 		}
@@ -1786,7 +1892,7 @@ func TestHTTPL2WriteAndDeadline(t *testing.T) {
 		assertNoConnectMetrics(t, snap)
 	})
 	t.Run("short-write", func(t *testing.T) {
-		l1metrics.Reset()
+		resetMetrics()
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
@@ -1833,7 +1939,7 @@ func TestHTTPL2WriteAndDeadline(t *testing.T) {
 		resp := doRequest(t, l1, req)
 		mustStatus(t, resp, 502)
 		handlers.Wait()
-		snap := l1metrics.Snapshot()
+		snap := snapMetrics()
 		if len(snap.HTTPFails) != 1 || snap.HTTPFails[0][1] != l1metrics.ReasonL2Write {
 			t.Fatalf("fails %#v", snap.HTTPFails)
 		}
@@ -1845,7 +1951,7 @@ func TestHTTPL2WriteAndDeadline(t *testing.T) {
 		assertNoConnectMetrics(t, snap)
 	})
 	t.Run("deadline", func(t *testing.T) {
-		l1metrics.Reset()
+		resetMetrics()
 		scriptedDial(t, func(c net.Conn) net.Conn {
 			return &scriptConn{Conn: c, readDead: func(time.Time) error { return io.ErrClosedPipe }}
 		})
@@ -1853,7 +1959,7 @@ func TestHTTPL2WriteAndDeadline(t *testing.T) {
 		resp := doRequest(t, l1, req)
 		mustStatus(t, resp, 502)
 		handlers.Wait()
-		snap := l1metrics.Snapshot()
+		snap := snapMetrics()
 		if len(snap.HTTPFails) != 1 || snap.HTTPFails[0][1] != l1metrics.ReasonL2Deadline {
 			t.Fatalf("fails %#v", snap.HTTPFails)
 		}
@@ -1867,7 +1973,8 @@ func TestHTTPL2WriteAndDeadline(t *testing.T) {
 }
 
 func TestHTTPClientGone(t *testing.T) {
-	l1metrics.Reset()
+	requireGost(t)
+	resetMetrics()
 	origin := serveRaw(t, func(c net.Conn) {
 		defer c.Close()
 		_ = c.SetDeadline(time.Now().Add(3 * time.Second))
@@ -1897,7 +2004,7 @@ func TestHTTPClientGone(t *testing.T) {
 	n, _ := c.Read(resp)
 	mustStatus(t, resp[:n], 502)
 	handlers.Wait()
-	snap := l1metrics.Snapshot()
+	snap := snapMetrics()
 	if len(snap.HTTPAborts) != 1 || snap.HTTPAborts[0][1] != l1metrics.ReasonClientGone {
 		t.Fatalf("aborts %#v", snap.HTTPAborts)
 	}
@@ -1916,7 +2023,8 @@ func TestHTTPClientGone(t *testing.T) {
 }
 
 func TestHTTPResponseAfter100IsL2Response(t *testing.T) {
-	l1metrics.Reset()
+	requireGost(t)
+	resetMetrics()
 	origin := serveRaw(t, func(c net.Conn) {
 		defer c.Close()
 		_ = c.SetDeadline(time.Now().Add(3 * time.Second))
@@ -1954,7 +2062,7 @@ func TestHTTPResponseAfter100IsL2Response(t *testing.T) {
 		t.Fatal(err)
 	}
 	handlers.Wait()
-	snap := l1metrics.Snapshot()
+	snap := snapMetrics()
 	if len(snap.HTTPFails) != 1 || snap.HTTPFails[0][1] != l1metrics.ReasonL2Response {
 		t.Fatalf("fails %#v", snap.HTTPFails)
 	}
@@ -1969,7 +2077,7 @@ func TestHTTPResponseAfter100IsL2Response(t *testing.T) {
 }
 
 func TestClosedHTTPLabels(t *testing.T) {
-	l1metrics.Reset()
+	resetMetrics()
 	l1metrics.RejectHTTP("typo")
 	l1metrics.FailHTTP("node-a", "client_gone")
 	l1metrics.FailHTTP("node-a", "nope")
@@ -1981,14 +2089,15 @@ func TestClosedHTTPLabels(t *testing.T) {
 	l1metrics.AddHTTPBytes("node-a", "sideways", 10)
 	l1metrics.AddHTTPBytes("node-a", l1metrics.DirUp, 0)
 	l1metrics.TryEmit(l1metrics.MeterEvent{Protocol: "nope", Result: "ok"})
-	snap := l1metrics.Snapshot()
+	snap := snapMetrics()
 	if len(snap.HTTPRejects) != 0 || len(snap.HTTPFails) != 0 || len(snap.HTTPAborts) != 0 || len(snap.HTTPObserves) != 0 || len(snap.HTTPSetup) != 0 || snap.HTTPUp != 0 || len(snap.Events) != 0 || snap.Drops != 1 {
 		t.Fatalf("closed set created series: %+v", snap)
 	}
 }
 
 func TestKeepAliveSameHostGauge(t *testing.T) {
-	l1metrics.Reset()
+	requireGost(t)
+	resetMetrics()
 	var accepts atomic.Int32
 	origin := serveRaw(t, func(c net.Conn) {
 		accepts.Add(1)
@@ -2027,7 +2136,7 @@ func TestKeepAliveSameHostGauge(t *testing.T) {
 		if string(body) != "ok" {
 			t.Fatalf("body %q", body)
 		}
-		snap := waitCalls(t, func(s l1metrics.Calls) bool {
+		snap := waitCalls(t, func(s metricSnap) bool {
 			return len(s.HTTPObserves) == i && s.HTTPEntered-s.HTTPLeft == 1
 		})
 		if len(snap.HTTPObserves) != i || snap.HTTPEntered-snap.HTTPLeft != 1 {
@@ -2042,7 +2151,7 @@ func TestKeepAliveSameHostGauge(t *testing.T) {
 		t.Fatalf("origin accepts=%d want 1", accepts.Load())
 	}
 	_ = c.Close()
-	snap := waitCalls(t, func(s l1metrics.Calls) bool {
+	snap := waitCalls(t, func(s metricSnap) bool {
 		return s.HTTPLeft == 1 && s.HTTPTunnels == 1
 	})
 	assertBalanced(t, snap)
@@ -2053,7 +2162,8 @@ func TestKeepAliveSameHostGauge(t *testing.T) {
 }
 
 func TestStaleKeepAliveRetry(t *testing.T) {
-	l1metrics.Reset()
+	requireGost(t)
+	resetMetrics()
 	var accepts atomic.Int32
 	origin := serveRaw(t, func(c net.Conn) {
 		accepts.Add(1)
@@ -2103,7 +2213,7 @@ func TestStaleKeepAliveRetry(t *testing.T) {
 	if accepts.Load() != 2 {
 		t.Fatalf("origin accepts=%d want 2", accepts.Load())
 	}
-	snap := waitCalls(t, func(s l1metrics.Calls) bool {
+	snap := waitCalls(t, func(s metricSnap) bool {
 		return len(s.HTTPObserves) == 2 && s.HTTPRetries == 1 && len(s.HTTPSetup) == 2
 	})
 	if snap.HTTPRetries != 1 || len(snap.HTTPFails) != 0 {
@@ -2118,14 +2228,15 @@ func TestStaleKeepAliveRetry(t *testing.T) {
 	}
 	assertNoConnectMetrics(t, snap)
 	_ = c.Close()
-	snap = waitCalls(t, func(s l1metrics.Calls) bool {
+	snap = waitCalls(t, func(s metricSnap) bool {
 		return s.HTTPLeft == 2 && s.HTTPTunnels == 2
 	})
 	assertBalanced(t, snap)
 }
 
 func TestStaleNonIdempotentPOST(t *testing.T) {
-	l1metrics.Reset()
+	requireGost(t)
+	resetMetrics()
 	origin := serveRaw(t, func(c net.Conn) {
 		defer c.Close()
 		br := bufio.NewReader(c)
@@ -2164,7 +2275,7 @@ func TestStaleNonIdempotentPOST(t *testing.T) {
 	}
 	mustStatus(t, resp, 502)
 	handlers.Wait()
-	snap := l1metrics.Snapshot()
+	snap := snapMetrics()
 	if snap.HTTPRetries != 0 {
 		t.Fatalf("retried a non-idempotent POST: %d", snap.HTTPRetries)
 	}
@@ -2180,7 +2291,8 @@ func TestStaleNonIdempotentPOST(t *testing.T) {
 }
 
 func TestBodyAbortAfterStatus(t *testing.T) {
-	l1metrics.Reset()
+	requireGost(t)
+	resetMetrics()
 	origin := serveRaw(t, func(c net.Conn) {
 		defer c.Close()
 		br := bufio.NewReader(c)
@@ -2205,12 +2317,12 @@ func TestBodyAbortAfterStatus(t *testing.T) {
 	buf := make([]byte, 256)
 	_, _ = c.Read(buf)
 	handlers.Wait()
-	snap := l1metrics.Snapshot()
+	snap := snapMetrics()
 	if len(snap.HTTPObserves) != 1 || snap.HTTPObserves[0] != l1metrics.ResultOK {
 		t.Fatalf("observes %#v", snap.HTTPObserves)
 	}
-	if len(snap.HTTPFails) != 0 || snap.HTTPBodyAborts != 1 {
-		t.Fatalf("fails %#v bodyAborts %d", snap.HTTPFails, snap.HTTPBodyAborts)
+	if len(snap.HTTPFails) != 0 || snap.HTTPBodyAborts != 1 || snap.BodyByReason["origin_reset"] != 1 {
+		t.Fatalf("fails %#v bodyAborts %d by %v", snap.HTTPFails, snap.HTTPBodyAborts, snap.BodyByReason)
 	}
 	assertSetup(t, snap, l1metrics.ResultOK)
 	assertBalanced(t, snap)
@@ -2230,7 +2342,7 @@ func TestIncompleteHeadRejectAttribution(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			l1metrics.Reset()
+			resetMetrics()
 			ln, err := net.Listen("tcp", "127.0.0.1:0")
 			if err != nil {
 				t.Fatal(err)
@@ -2243,7 +2355,7 @@ func TestIncompleteHeadRejectAttribution(t *testing.T) {
 				if err != nil {
 					return
 				}
-				_ = serveProxyConn(c, mapResolver{m: map[string]string{"node-a": gostA}})
+				_ = serveProxyConn(c, staticResolver{})
 			}()
 			c, err := net.Dial("tcp", ln.Addr().String())
 			if err != nil {
@@ -2265,7 +2377,7 @@ func TestIncompleteHeadRejectAttribution(t *testing.T) {
 			case <-time.After(2 * time.Second):
 				t.Fatal("handler did not return")
 			}
-			snap := l1metrics.Snapshot()
+			snap := snapMetrics()
 			if tc.connectBad {
 				if len(snap.Rejects) != 1 || snap.Rejects[0] != l1metrics.ReasonRejectBadTarget || len(snap.HTTPRejects) != 0 {
 					t.Fatalf("connect reject rejects=%v http=%v", snap.Rejects, snap.HTTPRejects)
