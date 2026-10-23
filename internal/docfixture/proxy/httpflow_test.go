@@ -1999,7 +1999,7 @@ func TestKeepAliveSameHostGauge(t *testing.T) {
 			if _, err := readOriginRequest(br); err != nil {
 				return
 			}
-			_, _ = io.WriteString(c, "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nok")
+			_, _ = io.WriteString(c, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
 		}
 	})
 	l1 := startL1(t, mapResolver{m: map[string]string{"node-a": gostA}})
@@ -2063,7 +2063,7 @@ func TestStaleKeepAliveRetry(t *testing.T) {
 		if _, err := readOriginRequest(br); err != nil {
 			return
 		}
-		if _, err := io.WriteString(c, "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nok"); err != nil {
+		if _, err := io.WriteString(c, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"); err != nil {
 			return
 		}
 		// Node's default keep-alive idle is 5s: read until that deadline, then close.
@@ -2218,8 +2218,6 @@ func TestBodyAbortAfterStatus(t *testing.T) {
 }
 
 func TestIncompleteHeadRejectAttribution(t *testing.T) {
-	l1 := startL1(t, mapResolver{m: map[string]string{"node-a": gostA}})
-	dials := countDials(t)
 	cases := []struct {
 		name       string
 		raw        string
@@ -2233,7 +2231,21 @@ func TestIncompleteHeadRejectAttribution(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			l1metrics.Reset()
-			c, err := net.Dial("tcp", l1)
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer ln.Close()
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				_ = serveProxyConn(c, mapResolver{m: map[string]string{"node-a": gostA}})
+			}()
+			c, err := net.Dial("tcp", ln.Addr().String())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -2244,8 +2256,15 @@ func TestIncompleteHeadRejectAttribution(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			_ = c.Close()
-			handlers.Wait()
+			if err := c.(*net.TCPConn).CloseWrite(); err != nil {
+				t.Fatal(err)
+			}
+			_, _ = io.ReadAll(c)
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				t.Fatal("handler did not return")
+			}
 			snap := l1metrics.Snapshot()
 			if tc.connectBad {
 				if len(snap.Rejects) != 1 || snap.Rejects[0] != l1metrics.ReasonRejectBadTarget || len(snap.HTTPRejects) != 0 {
@@ -2261,12 +2280,12 @@ func TestIncompleteHeadRejectAttribution(t *testing.T) {
 			} else if !tc.connectBad && len(snap.HTTPRejects) != 0 {
 				t.Fatalf("http rejects %#v", snap.HTTPRejects)
 			}
-			if len(snap.HTTPObserves) != 0 || len(snap.HTTPSetup) != 0 || len(snap.HTTPFails) != 0 {
+			if len(snap.HTTPObserves) != 0 || len(snap.HTTPSetup) != 0 || len(snap.HTTPFails) != 0 || snap.HTTPEntered != 0 {
 				t.Fatalf("incomplete head observed %+v", snap)
 			}
+			if !tc.connectBad && (len(snap.Fails) != 0 || len(snap.Observes) != 0 || snap.Entered != 0) {
+				t.Fatalf("plain HTTP touched CONNECT series: %+v", snap)
+			}
 		})
-	}
-	if dials.Load() != 0 {
-		t.Fatalf("dialed %d", dials.Load())
 	}
 }
