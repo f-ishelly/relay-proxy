@@ -2867,7 +2867,7 @@ func (s *httpSession) stop() {
 }
 ```
 
-临时夹具（不进仓库）把这一段和上面的 CONNECT 片段抽出来，对 gost v3.3.1 跑了 `go vet` 和 `go test`。源站是原始 TCP，用来核对字节而不是用 `net/http` 再解析一遍。覆盖了头顺序和大小写、逐跳头删除、不注入 Via / X-Forwarded-For / User-Agent、chunked 请求和响应、Content-Length、`Expect: 100-continue`、417 时不把正文写入隧道、WebSocket 的 101、同一条连接上换主机和换 node、同一主机的 keep-alive 复用、用户名最后一个 `@`、400 / 407 / 502、空闲超时，以及方案 A 会改写头。CONNECT 隧道另用一份固定 ClientHello，拆成小块写入；源站收到的字节与直连相同，JA3 与 JA4 相同。夹具里的 gost 没有挂 §3 的环回黑名单，否则连不到本机源站；生产配置仍按附录 A.5 拒绝环回和链路本地。
+临时夹具（不进仓库）把这一段和上面的 CONNECT 片段抽出来，对 gost v3.3.1 跑了 `go vet` 和 `go test -race`。源站是原始 TCP，用来核对字节而不是用 `net/http` 再解析一遍。覆盖了头顺序和大小写、逐跳头删除、不注入 Via / X-Forwarded-For / User-Agent、chunked 请求和响应、Content-Length、`Expect: 100-continue`（只在最终状态行记一次 `ok`，`100` 不计）、417 时不把正文写入隧道且记 `ok`、WebSocket 的 101（`ok` 停在状态行，之后的字节进 `proxy_http_bytes_total`）、同一条连接上换主机和换 node、同一主机的 keep-alive 复用（四条请求、三次建隧道、四次 `ok`）、用户名最后一个 `@`、400 / 407 / 502、空闲超时，以及方案 A 会改写头。明文 HTTP 的八个 `result`（`ok`、`dial`、`l2_write`、`l2_deadline`、`l2_response`、`l2_status`、`l2_auth`、`client_gone`）以及四个本地拒绝和 `no_upstream` 都有对应用例。这些请求不调用 `Fail502`、`ObserveConnect` 或 `EnterTunnel`。CONNECT 隧道另用一份固定 ClientHello，拆成小块写入；源站收到的字节与直连相同，JA3 与 JA4 相同。夹具里的 gost 没有挂 §3 的环回黑名单，否则连不到本机源站；生产配置仍按附录 A.5 拒绝环回和链路本地。
 
 
 ---
