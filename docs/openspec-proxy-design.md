@@ -131,7 +131,7 @@ bypasses:
 
 ## 4. 总体架构设计
 
-## 4.1 架构图
+### 4.1 架构图
 
 ```mermaid
 flowchart LR
@@ -345,7 +345,7 @@ Upgrade（含 WebSocket）要同时满足：有非空的 `Upgrade`，并且 `Con
 
 本版不把请求正文收进内存再重放。正文已经从客户端读过就不能重试。只有 POST 的 `stale_tunnel` 在真实流量里明显变高时，才再考虑要不要缓存正文。
 
-后续：仓库里的数据面还在 `internal/docfixture`。生产 L1 二进制接上时，必须走 `LimitsFromConfig` 和同一组命令行（`-tunnel-idle`、`-half-close-idle`、`-l2-response-timeout`、`-header-deadline`、`-retry-put-delete`），不要在进程里另写一套超时默认值。
+后续：仓库里的数据面还在 `internal/docfixture`。生产 L1 二进制接上时，必须走 `LimitsFromConfig` 和同一组命令行（`-proxy-config`、`-tunnel-idle`、`-half-close-idle`、`-l2-response-timeout`、`-header-deadline`、`-retry-put-delete`），不要在进程里另写一套超时默认值。
 
 失败响应带 `Content-Length: 0` 和 `Connection: close`，随后关掉客户端连接。CONNECT 路径的失败响应格式不变。
 
@@ -1325,8 +1325,8 @@ inhibit_rules:
 
 下面每条全局失败率都是「比值 > 0.02，并且分母 >= 100」。`S(x)` 是 `sum(increase(x{node_id!="unknown"}[5m])) or vector(0)`。按节点的 `S` 用上面的 `or (另一侧 * 0)`，不用 `vector(0)`，选择器同样去掉 `unknown`。
 
-- CONNECT。分子 `S(proxy_upstream_fail_total)`，含 `no_upstream`、`dial`、`l2_write`、`l2_deadline`、`l2_response`、`l2_status`、`l2_auth`。分母是该分子加上 `S(proxy_connect_latency_ms_count{result="ok"})`。另有一条 `sum by (node_id)` 的页，阈值相同。
-- 明文 HTTP。分子 `S(proxy_http_upstream_fail_total)`，比 CONNECT 多 `stale_tunnel`。分母加上 `S(proxy_http_request_latency_ms_count{result="ok"})`。成功样本用请求时延的 `ok`，不用 setup 的 `ok`：隧道建成不等于这条请求完成。源站 4xx/5xx 完整写出时就是这个 `ok`。阈值同样是 2%，也有按节点的页。
+- CONNECT。分子 `S(proxy_upstream_fail_total)`，含 `no_upstream`、`dial`、`l2_write`、`l2_deadline`、`l2_response`、`l2_status`、`l2_auth`，也含 `reason="other"`。选择器不按 reason 过滤。分母是该分子加上 `S(proxy_connect_latency_ms_count{result="ok"})`。另有一条 `sum by (node_id)` 的页，阈值相同。
+- 明文 HTTP。分子 `S(proxy_http_upstream_fail_total)`，比 CONNECT 多 `stale_tunnel`，同样含 `reason="other"`。选择器不按 reason 过滤。分母加上 `S(proxy_http_request_latency_ms_count{result="ok"})`。成功样本用请求时延的 `ok`，不用 setup 的 `ok`：隧道建成不等于这条请求完成。源站 4xx/5xx 完整写出时就是这个 `ok`。阈值同样是 2%，也有按节点的页。
 - 两侧加总只上看板，不进规则文件。分子是两个失败 `S` 相加，分母是该分子加上两个 `result="ok"` 的 `S`。不按节点再画一条页。
 - CONNECT 成功建连的 P95 > 200ms，并且这 5 分钟的 `ok` 样本至少 100：`histogram_quantile(0.95, sum by (le) (rate(proxy_connect_latency_ms_bucket{result="ok"}[5m])))`。按节点时 `sum by (le, node_id)`，样本数也按 `node_id` 算。
 - 明文 HTTP 新隧道 setup 的 P95 > 200ms，样本数同样至少 100：`histogram_quantile(0.95, sum by (le) (rate(proxy_http_tunnel_setup_ms_bucket{result="ok"}[5m])))`。时钟与 CONNECT 相同，阈值用同一个 200ms。请求时延不设这条页，也还没有参考线。按节点的页用 `sum by (le, node_id)`。没有把两条 P95 合成一条的页。

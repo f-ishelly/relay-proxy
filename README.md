@@ -23,3 +23,11 @@ err = reg.Stop(ctx)
 ```
 
 完整演示在 [`example/admin`](example/admin)。注册模型、巡检和 L1 发现见 [`docs/openspec-proxy-design.md`](docs/openspec-proxy-design.md) §8。
+
+设计文档 [`docs/openspec-proxy-design.md`](docs/openspec-proxy-design.md) 现为 v0.11。告警范围、明文 HTTP 和计量事件以这一版为准。
+
+文档里的代码块与夹具是否一致，跑 `go test -tags docfixture -race ./internal/docfixture/...`。`GOST_REQUIRED=1` 时缺少 gost 即失败。gost 为 v3.3.1，用 `GOST_BIN` 指定，或自动下载并校验 sha256。
+
+CI 在 amd64 和 arm64 上跑带 `-tags docfixture` 的 `go test`，并用 `promtool check rules` 与 `promtool test rules` 检查告警规则。
+
+`MeterEvent` 的 `client_ip`：含 IP 的原始日志保留 30 天。以后进 ClickHouse 不留原始 IP，或只留 /24。
