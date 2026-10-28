@@ -1,0 +1,5 @@
+go: go version go1.22.2 linux/amd64
+head: 38c203f9adde65eed2bf52325ff00dde9ed68d06
+git status --porcelain:
+
+command: go vet ./... && go vet -tags docfixture ./internal/docfixture/...

@@ -1,10 +1,10 @@
 go: go version go1.22.2 linux/amd64
-head: b9b1af8557b3d707c69f6af5b8c368fb29bff765
+head: 38c203f9adde65eed2bf52325ff00dde9ed68d06
 git status --porcelain:
 
-command: promtool check rules internal/docfixture/prom/sli_rules.yml && promtool test rules internal/docfixture/prom/sli_test.yml
+command: /tmp/prometheus-2.55.1.linux-amd64/promtool check rules internal/docfixture/prom/sli_rules.yml && /tmp/prometheus-2.55.1.linux-amd64/promtool test rules internal/docfixture/prom/sli_test.yml
 Checking internal/docfixture/prom/sli_rules.yml
-  SUCCESS: 10 rules found
+  SUCCESS: 9 rules found
 
   SUCCESS
 
