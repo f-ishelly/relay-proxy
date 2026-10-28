@@ -1,0 +1,47 @@
+name: ci
+
+# ubuntu-24.04-arm is a GitHub-hosted arm64 runner. macos-latest is not used:
+# registrar tests drive iptables, which is not available on the macOS runner.
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            prom_archive: prometheus-2.55.1.linux-amd64.tar.gz
+            prom_sha: 19700bdd42ec31ee162e4079ebda4cd0a44432df4daa637141bdbea4b1cd8927
+          - os: ubuntu-24.04-arm
+            prom_archive: prometheus-2.55.1.linux-arm64.tar.gz
+            prom_sha: af43368bc6379c3c8bd5ac0b82208060bba22267bf01ad3ab5df56ad5725bf88
+    runs-on: ${{ matrix.os }}
+    env:
+      GOST_REQUIRED: "1"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+      - name: race tests
+        run: |
+          pkgs=$(go list ./... | grep -v '/internal/docfixture' || true)
+          if [ -n "$pkgs" ]; then
+            go test -race $pkgs
+          fi
+          go test -tags docfixture -race -count=3 ./internal/docfixture/...
+      - name: promtool
+        run: |
+          curl -fsSL -o /tmp/prometheus.tar.gz "https://github.com/prometheus/prometheus/releases/download/v2.55.1/${{ matrix.prom_archive }}"
+          echo "${{ matrix.prom_sha }}  /tmp/prometheus.tar.gz" | sha256sum -c -
+          tar -C /tmp -xzf /tmp/prometheus.tar.gz
+          dir=/tmp/${{ matrix.prom_archive }}
+          dir=${dir%.tar.gz}
+          "$dir/promtool" check rules internal/docfixture/prom/sli_rules.yml
+          "$dir/promtool" test rules internal/docfixture/prom/sli_test.yml

@@ -1,0 +1,196 @@
+# §7.3. Global S(x) is sum(increase(x[5m])) or vector(0).
+# Every selector drops node_id="unknown": that label is the routing sentinel, not a pageable node.
+# Per-node sums use `or (other * 0)` so a missing side stays labeled with node_id.
+# The denominator must be at least 100 so 1 failure out of 10 does not page.
+# for: 5m keeps a single bad evaluation pending. increase() does not count the value a series already has at first scrape.
+# There is no combined two-protocol page and no combined P95. The blended failure rate is a
+# volume-weighted average of the two protocol rates, so it cannot exceed the higher side.
+# Grafana may still graph it. A routing-table wipe that returns ErrUnknownNode for every id
+# does not page: unknown_node is dashboard-only.
+groups:
+  - name: proxy-sli
+    rules:
+      - alert: ProxyConnectFailureRate
+        expr: |
+          (
+            (sum(increase(proxy_upstream_fail_total{node_id!="unknown"}[5m])) or vector(0))
+            /
+            (
+              (sum(increase(proxy_upstream_fail_total{node_id!="unknown"}[5m])) or vector(0))
+              +
+              (sum(increase(proxy_connect_latency_ms_count{node_id!="unknown",result="ok"}[5m])) or vector(0))
+            )
+          ) > 0.02
+          and
+          (
+            (sum(increase(proxy_upstream_fail_total{node_id!="unknown"}[5m])) or vector(0))
+            +
+            (sum(increase(proxy_connect_latency_ms_count{node_id!="unknown",result="ok"}[5m])) or vector(0))
+          ) >= 100
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: CONNECT failure rate above 2%
+      - alert: ProxyConnectFailureRateByNode
+        expr: |
+          (
+            (
+              sum by (node_id) (increase(proxy_upstream_fail_total{node_id!="unknown"}[5m]))
+              or
+              (sum by (node_id) (increase(proxy_connect_latency_ms_count{node_id!="unknown",result="ok"}[5m])) * 0)
+            )
+            /
+            (
+              (
+                sum by (node_id) (increase(proxy_upstream_fail_total{node_id!="unknown"}[5m]))
+                or
+                (sum by (node_id) (increase(proxy_connect_latency_ms_count{node_id!="unknown",result="ok"}[5m])) * 0)
+              )
+              +
+              (
+                sum by (node_id) (increase(proxy_connect_latency_ms_count{node_id!="unknown",result="ok"}[5m]))
+                or
+                (sum by (node_id) (increase(proxy_upstream_fail_total{node_id!="unknown"}[5m])) * 0)
+              )
+            )
+          ) > 0.02
+          and
+          (
+            (
+              sum by (node_id) (increase(proxy_upstream_fail_total{node_id!="unknown"}[5m]))
+              or
+              (sum by (node_id) (increase(proxy_connect_latency_ms_count{node_id!="unknown",result="ok"}[5m])) * 0)
+            )
+            +
+            (
+              sum by (node_id) (increase(proxy_connect_latency_ms_count{node_id!="unknown",result="ok"}[5m]))
+              or
+              (sum by (node_id) (increase(proxy_upstream_fail_total{node_id!="unknown"}[5m])) * 0)
+            )
+          ) >= 100
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: CONNECT failure rate above 2% on one node
+      - alert: ProxyHTTPFailureRate
+        expr: |
+          (
+            (sum(increase(proxy_http_upstream_fail_total{node_id!="unknown"}[5m])) or vector(0))
+            /
+            (
+              (sum(increase(proxy_http_upstream_fail_total{node_id!="unknown"}[5m])) or vector(0))
+              +
+              (sum(increase(proxy_http_request_latency_ms_count{node_id!="unknown",result="ok"}[5m])) or vector(0))
+            )
+          ) > 0.02
+          and
+          (
+            (sum(increase(proxy_http_upstream_fail_total{node_id!="unknown"}[5m])) or vector(0))
+            +
+            (sum(increase(proxy_http_request_latency_ms_count{node_id!="unknown",result="ok"}[5m])) or vector(0))
+          ) >= 100
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: plain HTTP failure rate above 2%
+      - alert: ProxyHTTPFailureRateByNode
+        expr: |
+          (
+            (
+              sum by (node_id) (increase(proxy_http_upstream_fail_total{node_id!="unknown"}[5m]))
+              or
+              (sum by (node_id) (increase(proxy_http_request_latency_ms_count{node_id!="unknown",result="ok"}[5m])) * 0)
+            )
+            /
+            (
+              (
+                sum by (node_id) (increase(proxy_http_upstream_fail_total{node_id!="unknown"}[5m]))
+                or
+                (sum by (node_id) (increase(proxy_http_request_latency_ms_count{node_id!="unknown",result="ok"}[5m])) * 0)
+              )
+              +
+              (
+                sum by (node_id) (increase(proxy_http_request_latency_ms_count{node_id!="unknown",result="ok"}[5m]))
+                or
+                (sum by (node_id) (increase(proxy_http_upstream_fail_total{node_id!="unknown"}[5m])) * 0)
+              )
+            )
+          ) > 0.02
+          and
+          (
+            (
+              sum by (node_id) (increase(proxy_http_upstream_fail_total{node_id!="unknown"}[5m]))
+              or
+              (sum by (node_id) (increase(proxy_http_request_latency_ms_count{node_id!="unknown",result="ok"}[5m])) * 0)
+            )
+            +
+            (
+              sum by (node_id) (increase(proxy_http_request_latency_ms_count{node_id!="unknown",result="ok"}[5m]))
+              or
+              (sum by (node_id) (increase(proxy_http_upstream_fail_total{node_id!="unknown"}[5m])) * 0)
+            )
+          ) >= 100
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: plain HTTP failure rate above 2% on one node
+      - alert: ProxyConnectLatencyP95
+        expr: |
+          histogram_quantile(0.95, sum by (le) (rate(proxy_connect_latency_ms_bucket{node_id!="unknown",result="ok"}[5m]))) > 200
+          and
+          (sum(increase(proxy_connect_latency_ms_count{node_id!="unknown",result="ok"}[5m])) or vector(0)) >= 100
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: CONNECT P95 above 200ms
+      - alert: ProxyConnectLatencyP95ByNode
+        expr: |
+          histogram_quantile(0.95, sum by (le, node_id) (rate(proxy_connect_latency_ms_bucket{node_id!="unknown",result="ok"}[5m]))) > 200
+          and
+          sum by (node_id) (increase(proxy_connect_latency_ms_count{node_id!="unknown",result="ok"}[5m])) >= 100
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: CONNECT P95 above 200ms on one node
+      - alert: ProxyHTTPTunnelSetupP95
+        expr: |
+          histogram_quantile(0.95, sum by (le) (rate(proxy_http_tunnel_setup_ms_bucket{node_id!="unknown",result="ok"}[5m]))) > 200
+          and
+          (sum(increase(proxy_http_tunnel_setup_ms_count{node_id!="unknown",result="ok"}[5m])) or vector(0)) >= 100
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: plain HTTP tunnel setup P95 above 200ms
+      - alert: ProxyHTTPTunnelSetupP95ByNode
+        expr: |
+          histogram_quantile(0.95, sum by (le, node_id) (rate(proxy_http_tunnel_setup_ms_bucket{node_id!="unknown",result="ok"}[5m]))) > 200
+          and
+          sum by (node_id) (increase(proxy_http_tunnel_setup_ms_count{node_id!="unknown",result="ok"}[5m])) >= 100
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: plain HTTP tunnel setup P95 above 200ms on one node
+      - alert: ProxyResolverUpstream
+        # Server-side resolve failures only: empty_addr and resolver_error, both protocols.
+        # Floor is 10 in 5m. There is no ratio and no healthy-denominator gate.
+        # unknown_node is not here: auth runs before Resolve, so that reason is an
+        # authenticated client naming a node the table does not contain. Dashboard only.
+        expr: |
+          (
+            (sum(increase(proxy_upstream_fail_total{node_id="unknown",reason=~"empty_addr|resolver_error"}[5m])) or vector(0))
+            +
+            (sum(increase(proxy_http_upstream_fail_total{node_id="unknown",reason=~"empty_addr|resolver_error"}[5m])) or vector(0))
+          ) >= 10
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: resolver failures on node_id=unknown
