@@ -43,13 +43,6 @@ tests:
               node_id: n1
             exp_annotations:
               summary: CONNECT failure rate above 2% on one node
-      - eval_time: 15m
-        alertname: ProxyCombinedFailureRate
-        exp_alerts:
-          - exp_labels:
-              severity: page
-            exp_annotations:
-              summary: combined failure rate above 2%
     promql_expr_test:
       - eval_time: 15m
         expr: histogram_quantile(0.95, sum by (le) (rate(proxy_http_tunnel_setup_ms_bucket{result="ok"}[5m])))
@@ -65,9 +58,6 @@ tests:
         alertname: ProxyConnectFailureRate
         exp_alerts: []
       - eval_time: 15m
-        alertname: ProxyCombinedFailureRate
-        exp_alerts: []
-      - eval_time: 15m
         alertname: ProxyHTTPFailureRateByNode
         exp_alerts: []
       - eval_time: 15m
@@ -78,7 +68,8 @@ tests:
         exp_alerts: []
 
   # HTTP has never failed. CONNECT is half failures at a volume that pages.
-  # The combined numerator must still be a number.
+  # The dashboard blend treats the missing HTTP failure counter as 0.
+  # Only the CONNECT page fires. There is no combined alert.
   - interval: 1m
     input_series:
       - series: 'proxy_upstream_fail_total{node_id="n1",reason="l2_response"}'
@@ -95,12 +86,12 @@ tests:
             value: 150
     alert_rule_test:
       - eval_time: 15m
-        alertname: ProxyCombinedFailureRate
+        alertname: ProxyConnectFailureRate
         exp_alerts:
           - exp_labels:
               severity: page
             exp_annotations:
-              summary: combined failure rate above 2%
+              summary: CONNECT failure rate above 2%
       - eval_time: 15m
         alertname: ProxyHTTPFailureRate
         exp_alerts: []
@@ -122,9 +113,6 @@ tests:
         exp_alerts: []
       - eval_time: 15m
         alertname: ProxyHTTPFailureRate
-        exp_alerts: []
-      - eval_time: 15m
-        alertname: ProxyCombinedFailureRate
         exp_alerts: []
 
   # 1 failure per minute and 9 successes. The ratio is 10% but the 5m volume
@@ -404,9 +392,6 @@ tests:
       - eval_time: 6m
         alertname: ProxyConnectFailureRateByNode
         exp_alerts: []
-      - eval_time: 6m
-        alertname: ProxyCombinedFailureRate
-        exp_alerts: []
       - eval_time: 15m
         alertname: ProxyHTTPFailureRate
         exp_alerts:
@@ -421,13 +406,59 @@ tests:
               severity: page
             exp_annotations:
               summary: CONNECT failure rate above 2%
+
+  # Both sides are 1.5% (15 failures and 985 oks in 5m). The blended rate is the
+  # volume-weighted average, so it is also 1.5%. It cannot cross 2% unless at
+  # least one side already has. Neither protocol pages.
+  - interval: 1m
+    input_series:
+      - series: 'proxy_http_upstream_fail_total{node_id="n1",reason="dial"}'
+        values: '0+3x40'
+      - series: 'proxy_http_request_latency_ms_count{node_id="n1",result="ok"}'
+        values: '0+197x40'
+      - series: 'proxy_upstream_fail_total{node_id="n1",reason="dial"}'
+        values: '0+3x40'
+      - series: 'proxy_connect_latency_ms_count{node_id="n1",result="ok"}'
+        values: '0+197x40'
+    promql_expr_test:
       - eval_time: 15m
-        alertname: ProxyCombinedFailureRate
+        expr: ((sum(increase(proxy_upstream_fail_total{node_id!="unknown"}[5m])) or vector(0)) + (sum(increase(proxy_http_upstream_fail_total{node_id!="unknown"}[5m])) or vector(0))) / ((sum(increase(proxy_upstream_fail_total{node_id!="unknown"}[5m])) or vector(0)) + (sum(increase(proxy_http_upstream_fail_total{node_id!="unknown"}[5m])) or vector(0)) + (sum(increase(proxy_connect_latency_ms_count{node_id!="unknown",result="ok"}[5m])) or vector(0)) + (sum(increase(proxy_http_request_latency_ms_count{node_id!="unknown",result="ok"}[5m])) or vector(0)))
+        exp_samples:
+          - labels: '{}'
+            value: 0.015
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: ProxyHTTPFailureRate
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: ProxyConnectFailureRate
+        exp_alerts: []
+
+  # HTTP is a total outage (100 failures, no ok). CONNECT is 10000 oks.
+  # The blend is 100/10100, under 2% and under the HTTP rate. HTTP still pages.
+  - interval: 1m
+    input_series:
+      - series: 'proxy_http_upstream_fail_total{node_id="n1",reason="stale_tunnel"}'
+        values: '0+20x40'
+      - series: 'proxy_connect_latency_ms_count{node_id="n1",result="ok"}'
+        values: '0+2000x40'
+    promql_expr_test:
+      - eval_time: 15m
+        expr: ((sum(increase(proxy_upstream_fail_total{node_id!="unknown"}[5m])) or vector(0)) + (sum(increase(proxy_http_upstream_fail_total{node_id!="unknown"}[5m])) or vector(0))) / ((sum(increase(proxy_upstream_fail_total{node_id!="unknown"}[5m])) or vector(0)) + (sum(increase(proxy_http_upstream_fail_total{node_id!="unknown"}[5m])) or vector(0)) + (sum(increase(proxy_connect_latency_ms_count{node_id!="unknown",result="ok"}[5m])) or vector(0)) + (sum(increase(proxy_http_request_latency_ms_count{node_id!="unknown",result="ok"}[5m])) or vector(0)))
+        exp_samples:
+          - labels: '{}'
+            value: 0.009900990099009901
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: ProxyHTTPFailureRate
         exp_alerts:
           - exp_labels:
               severity: page
             exp_annotations:
-              summary: combined failure rate above 2%
+              summary: plain HTTP failure rate above 2%
+      - eval_time: 15m
+        alertname: ProxyConnectFailureRate
+        exp_alerts: []
 
   # unknown_node is client misconfig after auth. A large volume does not page,
   # and it stays out of the healthy failure rate.

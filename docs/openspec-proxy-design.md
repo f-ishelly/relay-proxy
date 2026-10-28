@@ -1,9 +1,10 @@
 # OpenSpec 设计文档：多级高性能隧道代理（Pro 模式）
 
-- **文档版本**：v0.10（请求头空等、解析失败分页）
-- **日期**：2026-10-23
+- **文档版本**：v0.11（告警范围与计量保留）
+- **日期**：2026-10-28
 - **状态**：Draft / 可进入 PoC
 - **目标**：参考商业隧道代理 Pro 模式，设计“一级代理 + 二级代理”多级转发系统，支持通过 `username` 指定二级节点、TLS 指纹透传、应用层与 eBPF 监控、etcd 自动服务发现。
+- **v0.11 变更**：`proxy_http_request_latency_ms` 只上看板，不设页，也还没有阈值。参考线等上线后 1 到 2 周的真实数据再画。源站 4xx/5xx 只要最终状态行完整写出，仍记 `ok`。`client_gone` 不进失败率。等 L2 时明文 HTTP 的客户端离开记 `l2_response` 并进失败率，看板上单看它占明文尝试的比例，不另设页。翻页的是各协议失败率、各协议 P95（明文用 `proxy_http_tunnel_setup_ms`）和对应的按节点页。5 分钟窗口至少 100 个请求，`for` 5 分钟。没有两侧合成的 P95。两侧失败率加总只上看板：它是按量加权平均，不会高于较高的那一侧；两边各 1.5% 时加总仍是 1.5%，不会越过 2%。`ProxyCombinedFailureRate` 撤掉。`stale_tunnel` 进失败。自动重试并且成功的那一次不记失败。`PUT` / `DELETE` 默认不重试，要打开 `retry_put_delete`。本版不把请求正文收进内存，只有 POST 的 `stale_tunnel` 明显变高时才再考虑缓存。含 `client_ip` 的原始计量日志保留 30 天。以后进 ClickHouse 不留原始 IP，或只留 IPv4 的 /24。附录 B 里 Decodo 用量统计写的 180 天是对方产品的保留期，不是这条原始 IP。路由表整表清掉、每个 id 都回 `ErrUnknownNode` 时仍然没有页，`unknown_node` 只上看板，本版不改。后续：生产 L1 进程还没接上 `LimitsFromConfig` 和同一组命令行时长。§8 未改。
 - **v0.10 变更**：等请求头的第一个字节用 `tunnelIdle`（默认 5 分钟），keep-alive 空等不再被 10s 的 `header_deadline` 切断。读到第一个字节之后才武装 `header_deadline`，绝对截止，后续字节不顺延。v0.9 的 `ProxyUnknownUpstream` 要求这三种失败至少 100 次并且超过全部尝试的一半。那个「一半」就是分母闸，不到一半的 `resolver_error` 和 5 分钟里不足 100 次的全灭都不会翻页；v0.9 里「不要求健康分母」的说法是错的。v0.10 撤掉这条页，改成 `ProxyResolverUpstream`：两条协议上 `empty_addr` 与 `resolver_error` 在 5 分钟里至少 10 次就翻页，没有比例，也没有健康分母。`unknown_node` 只上看板。共享口令在 `Resolve` 之前校验，所以它是已认证客户端写出了路由表没有的 node，不是未认证扫描，也不是 etcd 故障。半关闭一开始就停掉 `tunnelIdle`，这段拆除不记 `idle_timeout`。`Fail502` 和 `FailHTTP` 把集合外的 reason 记成 `other`。JSON 对象后面的多余数据拒绝。`{node_id="unknown",reason="no_upstream"}` 不再增加。计量事件在写入通道前计入未确认数，消费者落盘后调用 `FinishMeter`，`WaitMeterIdle` 才返回；通道变空不等于这行已经记入日志。§8 未改。
 - **v0.9 变更**：`Resolve` 的三种哨兵分开计数：`ErrUnknownNode` 是 `unknown_node`，地址为空是 `empty_addr`，其它解析错误是 `resolver_error`，`node_id` 都是 `unknown`。`ErrNoHealthyAddr` 仍保留原来的 `node_id` 和 `no_upstream`。失败率继续去掉 `unknown`。当时的 `ProxyUnknownUpstream` 要求 5 分钟里这三种失败至少 100 次，并且占全部尝试的一半以上。读请求头用单独的绝对截止 `header_deadline`（默认 10s）。CONNECT 隧道空闲到点记 `proxy_tunnel_abort_total{reason="idle_timeout"}`。`closeWrite` 失败两边都不当成隧道中断。配置拒绝未知字段，并限制时长上限，`half_close_idle` 不得大于 `tunnel_idle`。§8 未改。v0.10 修正了这条告警和请求头空等。
 - **v0.8 变更**：空闲计时到点先记下原因再关连接，读到的 `net.ErrClosed` 记 `idle_timeout`，不再记成 `origin_reset` 或 `client_cancel`。双向拷贝用 `sync.Once` 保留第一个真实错误，忽略自己关掉对端造成的错误。半关闭之后的空闲超时不进 `proxy_http_body_abort_total`。请求头已经读到一部分才超时记 `header_timeout`，一个字节都没有仍不计数。失败率和按节点的页去掉 `node_id="unknown"`。Alertmanager 按 `alertname` 分组，全局页抑制对应的按节点页。`ECONNRESET` 在读和写上都是断管。`retry_put_delete` 来自 JSON 配置或 `-retry-put-delete`，按连接注入。`increase()` 不把序列第一次出现时已经有的值当成增量。gost 夹具按 `GOOS/GOARCH` 校验 v3.3.1 的 sha256，放进用户缓存目录；`GOST_REQUIRED=1` 时拿不到就失败。§8 未改。
@@ -340,7 +341,11 @@ Upgrade（含 WebSocket）要同时满足：有非空的 `Upgrade`，并且 `Con
 
 上面这张表和 §7.1 的明文 HTTP 表是同一套结果。这里写客户端看见什么，§7.1 写进哪条计数。`stale_tunnel` 只出现在明文 HTTP。其余失败字符串与 CONNECT 相同。明文 HTTP 调用 `FailHTTP`、`RejectHTTP`、`AbortHTTP`、`ObserveHTTP`、`ObserveHTTPSetup` 和 `EnterHTTPTunnel`，不调用 `Fail502`、`ObserveConnect` 或 `EnterTunnel`。一条请求只 `ObserveHTTP` 一次。新开的隧道只 `ObserveHTTPSetup` 一次，在 L2 的 CONNECT 出结果时，不在源站状态行上再记。L2 返回 200 时请求还没结束，请求的 `ok` 记在源站最终状态行完整写给客户端的时刻。最终状态行是 code ≥ 200，或 101；`100` 和其他 1xx 不是。明文 HTTP 不向客户端写 L1 自己的 `200`。`proxy_http_tunnel_active` 是容量，不是 SLI：keep-alive 空等也算在里面，最长可到 `tunnelIdleTimeout`（默认 5 分钟）。
 
-`PUT` 和 `DELETE` 不在默认重试里。RFC 9110 把它们标成幂等，但第一次请求可能已经到达源站，很多源站并不是真的幂等。要重试就在 JSON 配置里写 `"retry_put_delete": true`，或在命令行给 `-retry-put-delete=true`。`LimitsFromConfig` 读出一份 `proxyLimits`，传给 `serveProxyConnLimited`，不在请求路径上改包级变量。打开之后仍然只在零个源站字节、且请求头没有写出一部分时重试；读超时和写到一半的头都不重试。`POST` 和其他方法始终不重试。配置示例：`{"retry_put_delete":false,"tunnel_idle":"5m","half_close_idle":"30s","l2_response_timeout":"10s","header_deadline":"10s"}`。未知 JSON 字段拒绝。对象后面再跟另一个值也拒绝。`tunnel_idle` 最长 1 小时，`half_close_idle` 最长 1 小时并且不得大于 `tunnel_idle`，`l2_response_timeout` 最长 2 分钟，`header_deadline` 最长 1 分钟。零或负数拒绝。命令行的时长用同一组上限。
+`PUT` 和 `DELETE` 不在默认重试里。RFC 9110 把它们标成幂等，但第一次请求可能已经到达源站，很多源站并不是真的幂等。要重试就在 JSON 配置里写 `"retry_put_delete": true`，或在命令行给 `-retry-put-delete=true`。`LimitsFromConfig` 读出一份 `proxyLimits`，传给 `serveProxyConnLimited`，不在请求路径上改包级变量。打开之后仍然只在零个源站字节、且请求头没有写出一部分时重试；读超时和写到一半的头都不重试。`POST` 和其他方法始终不重试。能自动重放并且重试成功时，第一次断管不记失败，只记 `proxy_http_reused_conn_retry_total`；最终结果按第二次记。不能重放时记 `stale_tunnel`，这一笔进失败率。配置示例：`{"retry_put_delete":false,"tunnel_idle":"5m","half_close_idle":"30s","l2_response_timeout":"10s","header_deadline":"10s"}`。未知 JSON 字段拒绝。对象后面再跟另一个值也拒绝。`tunnel_idle` 最长 1 小时，`half_close_idle` 最长 1 小时并且不得大于 `tunnel_idle`，`l2_response_timeout` 最长 2 分钟，`header_deadline` 最长 1 分钟。零或负数拒绝。命令行的时长用同一组上限。
+
+本版不把请求正文收进内存再重放。正文已经从客户端读过就不能重试。只有 POST 的 `stale_tunnel` 在真实流量里明显变高时，才再考虑要不要缓存正文。
+
+后续：仓库里的数据面还在 `internal/docfixture`。生产 L1 二进制接上时，必须走 `LimitsFromConfig` 和同一组命令行（`-tunnel-idle`、`-half-close-idle`、`-l2-response-timeout`、`-header-deadline`、`-retry-put-delete`），不要在进程里另写一套超时默认值。
 
 失败响应带 `Content-Length: 0` 和 `Connection: close`，随后关掉客户端连接。CONNECT 路径的失败响应格式不变。
 
@@ -421,7 +426,7 @@ CONNECT 的 `200` 里 gost 会带 `Proxy-Agent`。这行写给 L1，不写进源
 
 L1 在独立的管理监听地址上提供 `/metrics`。管理端口与代理端口分开，不接受 `CONNECT`，也不检查 `Proxy-Authorization`。每个 L1 副本暴露自己的值，集群总量由 Prometheus 聚合。默认 registry 同时导出 client_golang 自带的 Go 运行时和进程指标。
 
-CONNECT 的 SLI 是 `proxy_connect_latency_ms` 和 `proxy_upstream_fail_total`。`proxy_conn_active` 是容量，不是这两条告警的输入：客户端断开后它还会多停半关闭空闲或隧道空闲。明文 HTTP 的 SLI 是 `proxy_http_tunnel_setup_ms` 和 `proxy_http_upstream_fail_total`。`proxy_http_request_latency_ms` 只上看板，不设页：它含客户端上传、源站处理和长轮询，也把新隧道和复用隧道混在一起。`proxy_http_tunnel_active` 同样不是 SLI，keep-alive 空等最长 5 分钟也算在里面。两边的本地拒绝和 `client_gone` 都不进 §7.3 的失败率。时长、字节、重试、正文中断、节点池和计量丢弃用于容量和排障，不单独设 2% / 200ms 告警。
+CONNECT 的 SLI 是 `proxy_connect_latency_ms` 和 `proxy_upstream_fail_total`。`proxy_conn_active` 是容量，不是这两条告警的输入：客户端断开后它还会多停半关闭空闲或隧道空闲。明文 HTTP 的 SLI 是 `proxy_http_tunnel_setup_ms` 和 `proxy_http_upstream_fail_total`。`proxy_http_request_latency_ms` 只上看板，不设页，也还没有阈值：它含客户端上传、源站处理和长轮询，也把新隧道和复用隧道混在一起。参考线等上线后 1 到 2 周的真实数据再画，不先写一个数。`proxy_http_tunnel_active` 同样不是 SLI，keep-alive 空等最长 5 分钟也算在里面。两边的本地拒绝和 `client_gone` 都不进 §7.3 的失败率。时长、字节、重试、正文中断、节点池和计量丢弃用于容量和排障，不单独设 2% / 200ms 告警。
 
 L2 不负责这些指标。gost 自带的 metrics/observer 不在 M1 范围内，见附录 C。CONNECT 与明文 HTTP 分属两套指标名，不在 CONNECT 指标上加 `protocol` 标签。
 
@@ -602,7 +607,7 @@ Prometheus 回答「这个节点现在健不健康」。按用户、按目标域
 | `user` | 最后一个 `@` 之前的那一段。v1 没有独立子账号对象，以后按子账号汇总就用这个字段 |
 | `node_id` | 用户名里请求的那一段，路由表没有也原样保留。Prometheus 的 `node_id` 标签仍然失败关闭 |
 | `target_host` / `target_port` | CONNECT 是 `CONNECT` 的 authority。明文 HTTP 是 absolute-form 里解析出的源站 `host` 和 `port`（缺省端口补成 80），没有路径，没有 scheme，不是 L2 的地址 |
-| `client_ip` | `clientConn.RemoteAddr()`。没有地址就省略 |
+| `client_ip` | `clientConn.RemoteAddr()`。没有地址就省略。含这个字段的原始 JSON 日志保留 30 天。以后进 ClickHouse 时不保留原始 IP，只保留去掉 IP 的行，或只保留 IPv4 的 /24 前缀 |
 | `setup_ms` | 只统计这次事件实际使用的那条隧道的建立，从这次 `dialUpstream` 之前到 L2 的 CONNECT 出结果。CONNECT 就是 `ObserveConnect` 的毫秒数。明文 HTTP 是 `ObserveHTTPSetup` 的毫秒数，复用时没有新隧道，字段省略（0）。重试成功时，事件里只留下第二次隧道的 `setup_ms`；第一次死隧道的 setup 已经在它建成时进过直方图，不写进这一条请求事件。拨号之前的结果没有这个字段。`setup_ms` 不含源站时间，也不含被丢掉的那次尝试 |
 | `request_ms` | 只在明文 HTTP 上有。等于 `ObserveHTTP` 的毫秒数：新隧道从第一次拨号前起算，复用从写出这条请求起算。`ok` 停在源站最终状态行写完。重试不重置 `started`，所以白写的那一次算在同一次 `request_ms` 里，不含在 `setup_ms` 里。CONNECT 不写这个字段 |
 | `tunnel_sec` | 只在 CONNECT 建成隧道时有，与 `proxy_tunnel_duration_seconds` 是同一次测量。明文 HTTP 的隧道可能比这一条请求活得长，事件里留空，时长只看 `proxy_http_tunnel_duration_seconds` |
@@ -630,9 +635,9 @@ v=1 没有 `protocol`，时延字段是 `handshake_ms`。v=2 的 `protocol` 必�
 | --- | --- | --- |
 | Prometheus | 闭合标签上的 SLI、告警、节点并发、节点字节、节点池 | 每加一枚无界标签，序列数随用户或域名涨。4000 节点再乘域名会到百万级，抓取和查询都会坏 |
 | JSON 行，由采集端送进 Loki | 排障、按请求追查。§9.1 已把 Loki 列为可选项，M1 不必先部署新数据库 | 按用户做跨月加总又贵又慢，不拿它当账本 |
-| 同一份 JSON 再进 ClickHouse | 按用户、域名、节点算流量、请求数、成功率、分位时延 | 多一个存储。M1 不部署，只把 schema 定成 `v=2`。读到没有 `protocol` 的 `v=1` 时，协议按 `connect` 计 |
+| 同一份 JSON 再进 ClickHouse | 按用户、域名、节点算流量、请求数、成功率、分位时延 | 多一个存储。M1 不部署，只把 schema 定成 `v=2`。读到没有 `protocol` 的 `v=1` 时，协议按 `connect` 计。表里不留原始 `client_ip`，或只留 IPv4 的 /24 |
 
-M1 先打 JSON 行。仓库查询要按用户或域名出报表时再把同一份事件导入 ClickHouse。事件里可以做的报表：某用户的上下行字节和尝试数、某域名的 `ok` 占比、某节点被哪些域名使用。出口国家或 AZ 用 `node_id` 连接注册信息，不在事件里写一个 L1 推断出来的国家。
+M1 先打 JSON 行。含 `client_ip` 的原始日志保留 30 天，到期删除。仓库查询要按用户或域名出报表时再把同一份事件导入 ClickHouse，那时不保留原始 IP，或只保留 IPv4 的 /24 前缀。附录 B 里 Decodo 用量页写的 180 天是对方产品的用量统计保留期，不是本系统原始客户端 IP 的保留期。事件里可以做的报表：某用户的上下行字节和尝试数、某域名的 `ok` 占比、某节点被哪些域名使用。出口国家或 AZ 用 `node_id` 连接注册信息，不在事件里写一个 L1 推断出来的国家。
 
 | 指标 | 类型 | 标签 | 含义 |
 | --- | --- | --- | --- |
@@ -648,7 +653,7 @@ M1 先打 JSON 行。仓库查询要按用户或域名出报表时再把同一�
 | `proxy_l2_healthy_addrs` | Gauge | 无 | 健康 L2 地址条数 |
 | `proxy_meter_drop_total` | Counter | 无 | 计量队列满而丢弃的事件数 |
 | `proxy_http_tunnel_setup_ms` | Histogram | `node_id`, `result` | 新开的明文隧道，从拨号前到 L2 的 CONNECT 出结果。桶与 `proxy_connect_latency_ms` 相同。result 七个：`ok`、`dial`、`l2_write`、`l2_deadline`、`l2_response`、`l2_status`、`l2_auth`。没有 `client_gone`。复用不观察。P95 页看 `result="ok"` |
-| `proxy_http_request_latency_ms` | Histogram | `node_id`, `result` | 一条明文请求从拨号前（复用则从写出请求起）到结果确定的毫秒数。桶与 CONNECT 相同。`result="ok"` 停在源站最终状态行写完。多一个 `stale_tunnel`。只上看板，不设页 |
+| `proxy_http_request_latency_ms` | Histogram | `node_id`, `result` | 一条明文请求从拨号前（复用则从写出请求起）到结果确定的毫秒数。桶与 CONNECT 相同。`result="ok"` 停在源站最终状态行写完，含源站 4xx/5xx。多一个 `stale_tunnel`。只上看板，不设页，也还没有阈值。参考线等上线后 1 到 2 周的真实数据再画 |
 | `proxy_http_tunnel_active` | Gauge | `node_id` | 明文 HTTP 握住的 L2 隧道数。L2 的 CONNECT 返回 200 时加一，隧道关闭时减一。含 keep-alive 空等，最长 5 分钟。不是 SLI |
 | `proxy_http_tunnel_duration_seconds` | Histogram | `node_id` | 上一条 gauge 对应的存活秒数，含两条请求之间的空等。桶与 CONNECT 的隧道时长相同 |
 | `proxy_http_tunnel_bytes_total` | Counter | `node_id`, `direction` | 与 `proxy_tunnel_bytes_total` 对齐的明文载荷。`up` 不含发往 L2 的 CONNECT，含 101 之后的上行。`down` 含 1xx、最终响应和 101 之后的下行 |
@@ -830,7 +835,7 @@ var (
 
 	proxyHTTPRequestLatency = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "proxy_http_request_latency_ms",
-		Help:    "一条明文 HTTP 请求从拨号前（复用隧道则从写出请求起）到结果确定的毫秒数。result 比建连多 stale_tunnel。ok 停在源站最终状态行写完。只上看板，不设页。",
+		Help:    "一条明文 HTTP 请求从拨号前（复用隧道则从写出请求起）到结果确定的毫秒数。result 比建连多 stale_tunnel。ok 停在源站最终状态行写完。只上看板，不设页，也还没有阈值。参考线等上线后 1 到 2 周的真实数据再画。",
 		Buckets: []float64{5, 10, 25, 50, 100, 200, 500, 1000, 3000, 10000},
 	}, []string{"node_id", "result"})
 
@@ -1275,21 +1280,23 @@ M2 在一级与二级节点部署 eBPF Agent（如 Cilium，或自研 exporter�
 
 ### 7.3 告警建议
 
-应用层（M1）。CONNECT 和明文 HTTP 都算进 SLI。失败率按协议分开，再另给一条两侧加总。P95 也按协议分开，不合成一个。明文 HTTP 的 P95 用 `proxy_http_tunnel_setup_ms`，不用请求时延：请求时延把上传、源站处理、长轮询、新隧道和复用隧道混在一个数里，200ms 解释不了 L1 和 L2 慢不慢。setup 的 `ok` 与 CONNECT 一样停在 L2 返回 `200`。
+应用层（M1）。CONNECT 和明文 HTTP 都算进 SLI。失败率和 P95 都按协议分开，各有按节点的页。没有两侧合成的 P95。明文 HTTP 的 P95 用 `proxy_http_tunnel_setup_ms`，不用请求时延：请求时延把上传、源站处理、长轮询、新隧道和复用隧道混在一个数里，200ms 解释不了 L1 和 L2 慢不慢。setup 的 `ok` 与 CONNECT 一样停在 L2 返回 `200`。`proxy_http_request_latency_ms` 只上看板，不设页，也还没有阈值。参考线等上线后 1 到 2 周的真实数据再画。
 
-失败率只报协议、不报加总时，两边各 1.5% 都不会越过 2% 的页，合在一起已经越线。只报加总、不报协议时，故障集中在一边会被另一边的成功样本稀释。两条协议的失败率都要告警，加总也要告警。
+两侧失败率加总也只上看板，不翻页。它是两条协议失败率的按量加权平均：一侧是 a/A，另一侧是 b/B，加总是 (a+b)/(A+B)。这个数落在两边之间，不会高于较高的那一侧。两边都是 1.5% 时，加总也是 1.5%，不会因为加在一起就越过 2%。一边是 100%、另一边有大量成功时，加总会被成功的那一侧拉低，可以低于 2%，而坏的那一侧自己的页已经响了。所以不存在「两边各自没越线、合在一起越线」这种情形。加总只用来在看板上看整体，不能代替按协议的页。`ProxyCombinedFailureRate` 已撤掉。
 
-`client_gone`、本地拒绝和 `proxy_http_reused_conn_retry_total` 都不进分子，也不进分母。`stale_tunnel` 进分子：客户端收到了 502。不要用未过滤的直方图 `_count` 做分母：拨号之后的失败已经在分子里，再加进分母会算两次，`client_gone` 还会被算进分母。
+`client_gone`、本地拒绝和 `proxy_http_reused_conn_retry_total` 都不进分子，也不进分母。自动重试并且第二次成功时，第一次断管不进分子。`stale_tunnel` 进分子：客户端收到了 502。不能重放的请求才走到这里，包括默认不重试的 `PUT` / `DELETE`，以及正文已经读出或请求头只写出一部分的情况。`POST` 始终不重试。本版不缓存请求正文。不要用未过滤的直方图 `_count` 做分母：拨号之后的失败已经在分子里，再加进分母会算两次，`client_gone` 还会被算进分母。
 
-等 L2 的 CONNECT 状态行时客户端先离开，两边记的结果不一样，这是故意的。CONNECT 有一条并行读泵，读泵先结束记 `client_gone`，不进失败率。明文 HTTP 不能再开一个读端，否则会把还没按帧切开的正文读丢。这段等待里的读超时仍记 `l2_response`，进失败率。客户端在最终状态行之前断开正文，明文 HTTP 才记 `client_gone`。
+等 L2 的 CONNECT 状态行时客户端先离开，两边记的结果不一样，这是故意的。CONNECT 有一条并行读泵，读泵先结束记 `client_gone`，不进失败率。明文 HTTP 不能再开一个读端，否则会把还没按帧切开的正文读丢。这段等待里的读超时仍记 `l2_response`，进失败率。这条计数分不出「客户端已经离开」和「L2 真的没在时限内应答」。看板上单看明文 `l2_response` 占明文尝试的比例，也看它在失败分子里的比例，不另设页。客户端在最终状态行之前断开正文，明文 HTTP 才记 `client_gone`。`client_gone` 的占比同样只上看板。
 
-序列还没出现时，`sum()` 和 `increase()` 是空向量。空向量做加法或除法仍然是空，告警不会响。L1 重启后还没有 `result="ok"` 时，100% 失败就这样漏掉；明文 HTTP 还从没失败过时，加总表达式整条是空的。全局表达式里每段 `sum(...)` 都接 `or vector(0)`。按节点时不能用 `or vector(0)`：它会把整组向量换成一个没有 `node_id` 的 0。一边用 `sum by (node_id)(increase(失败[5m])) or (sum by (node_id)(increase(成功[5m])) * 0)`，另一边对称，缺的那一侧变成带 `node_id` 的 0。`失败 + 成功` 也不会再丢掉只出现在一边的节点。
+序列还没出现时，`sum()` 和 `increase()` 是空向量。空向量做加法或除法仍然是空，告警不会响。L1 重启后还没有 `result="ok"` 时，100% 失败就这样漏掉。全局表达式里每段 `sum(...)` 都接 `or vector(0)`。看板上的两侧加总用同一写法，缺的那一侧是 0，不会把整条变成空。按节点时不能用 `or vector(0)`：它会把整组向量换成一个没有 `node_id` 的 0。一边用 `sum by (node_id)(increase(失败[5m])) or (sum by (node_id)(increase(成功[5m])) * 0)`，另一边对称，缺的那一侧变成带 `node_id` 的 0。`失败 + 成功` 也不会再丢掉只出现在一边的节点。
 
 `increase()` 不把一条序列第一次被抓到时已经有的值算进增量。进程启动前或第一次抓取之前已经累加的失败看不见；序列一出现就是 100、之后不再增加，5 分钟增量为 0，告警保持沉默。之后的每一步增量照常计算：从 100 再每分钟加 30，和从 0 起每分钟加 30，在同一个 5 分钟窗口里都是 150。这是 `increase` 的行为，不改成用当前值减 0，否则一个长期不动的计数器会在每次重启后翻页。
 
 分母至少 100，并且大于 0。5 分钟里 1 次失败加 9 次成功是 10%，但只有 10 个请求，不该翻页。样本已经不少于 100、比值也越过 2%，只要这段条件连续保持不满 5 分钟，`for: 5m` 仍然只让告警停在 pending，不会翻页。`for` 是 5 分钟，单次评估越过阈值只进入 pending。不在启动时预建序列，那会把 §7.1 的上限一次变成实际序列。P95 在没有 `result="ok"` 桶时保持空向量，不另造一个 0 去翻页；这种时候失败率已经会响。P95 同样要这 5 分钟里至少 100 个 `result="ok"` 样本，一个慢请求不翻页。
 
-`node_id="unknown"` 不进失败率的分子，也不进分母，也不进按节点的页，P95 的选择器同样丢掉它。它是路由表没收录时的哨兵，不是一台可以单独处理的节点。用户把自己的节点也命名成 `unknown` 会和这个哨兵撞在一起，这条节点不会单独翻页，这和 §7.1 的上限说明是同一件事。共享口令在 `Resolve` 之前校验。口令不匹配回 `407`，不调用 `Resolve`，也不发计量事件。`unknown_node` 因此只来自已经认证的客户端，用户名里的 node 不在表里。这是客户端配错，只上看板，不翻页。etcd 超时和 watch 中断必须返回 `resolver_error`，地址为空返回 `empty_addr`。把清表实现成对每个 id 都回 `ErrUnknownNode`，看板上会涨，但这条页不会响。
+`node_id="unknown"` 不进失败率的分子，也不进分母，也不进按节点的页，P95 的选择器同样丢掉它。它是路由表没收录时的哨兵，不是一台可以单独处理的节点。用户把自己的节点也命名成 `unknown` 会和这个哨兵撞在一起，这条节点不会单独翻页，这和 §7.1 的上限说明是同一件事。共享口令在 `Resolve` 之前校验。口令不匹配回 `407`，不调用 `Resolve`，也不发计量事件。`unknown_node` 因此只来自已经认证的客户端，用户名里的 node 不在表里。这是客户端配错，只上看板，不翻页。etcd 超时和 watch 中断必须返回 `resolver_error`，地址为空返回 `empty_addr`。
+
+限制（本版不改）：路由表被整表清掉、每个 id 都返回 `ErrUnknownNode` 时，没有页会响。`unknown_node` 只上看板，看板上会涨，`ProxyResolverUpstream` 不看这个 reason。etcd 故障要翻页，必须返回 `resolver_error` 或 `empty_addr`，不能实现成一律 `ErrUnknownNode`。
 
 `ProxyResolverUpstream` 只加 `empty_addr` 和 `resolver_error`，CONNECT 与明文 HTTP 两条计数加在一起。5 分钟里至少 10 次就翻页。没有「占全部尝试的一半」，也没有「健康分母 >= 100」。v0.9 的 `ProxyUnknownUpstream` 两条都有：100 次的量，再加上超过一半这个比例。比例用全部尝试做分母，本身就是闸。不到一半的解析错误、以及 5 分钟里到不了 100 次的小站全灭，都不会翻页。那条页撤掉。新页只有全局，没有按节点的页。`group_by: [alertname]` 把它收成一条。
 
@@ -1319,13 +1326,13 @@ inhibit_rules:
 下面每条全局失败率都是「比值 > 0.02，并且分母 >= 100」。`S(x)` 是 `sum(increase(x{node_id!="unknown"}[5m])) or vector(0)`。按节点的 `S` 用上面的 `or (另一侧 * 0)`，不用 `vector(0)`，选择器同样去掉 `unknown`。
 
 - CONNECT。分子 `S(proxy_upstream_fail_total)`，含 `no_upstream`、`dial`、`l2_write`、`l2_deadline`、`l2_response`、`l2_status`、`l2_auth`。分母是该分子加上 `S(proxy_connect_latency_ms_count{result="ok"})`。另有一条 `sum by (node_id)` 的页，阈值相同。
-- 明文 HTTP。分子 `S(proxy_http_upstream_fail_total)`，比 CONNECT 多 `stale_tunnel`。分母加上 `S(proxy_http_request_latency_ms_count{result="ok"})`。成功样本用请求时延的 `ok`，不用 setup 的 `ok`：隧道建成不等于这条请求完成。阈值同样是 2%，也有按节点的页。
-- 两侧加总。分子是两个失败 `S` 相加，分母是该分子加上两个 `result="ok"` 的 `S`。加总只做全局，不按节点再翻一页。
+- 明文 HTTP。分子 `S(proxy_http_upstream_fail_total)`，比 CONNECT 多 `stale_tunnel`。分母加上 `S(proxy_http_request_latency_ms_count{result="ok"})`。成功样本用请求时延的 `ok`，不用 setup 的 `ok`：隧道建成不等于这条请求完成。源站 4xx/5xx 完整写出时就是这个 `ok`。阈值同样是 2%，也有按节点的页。
+- 两侧加总只上看板，不进规则文件。分子是两个失败 `S` 相加，分母是该分子加上两个 `result="ok"` 的 `S`。不按节点再画一条页。
 - CONNECT 成功建连的 P95 > 200ms，并且这 5 分钟的 `ok` 样本至少 100：`histogram_quantile(0.95, sum by (le) (rate(proxy_connect_latency_ms_bucket{result="ok"}[5m])))`。按节点时 `sum by (le, node_id)`，样本数也按 `node_id` 算。
-- 明文 HTTP 新隧道 setup 的 P95 > 200ms，样本数同样至少 100：`histogram_quantile(0.95, sum by (le) (rate(proxy_http_tunnel_setup_ms_bucket{result="ok"}[5m])))`。时钟与 CONNECT 相同，阈值用同一个 200ms。请求时延不设这条页。按节点的页用 `sum by (le, node_id)`。
-- 解析器故障。`ProxyResolverUpstream`。分子是两条协议上 `node_id="unknown"` 且 reason 为 `empty_addr` 或 `resolver_error` 的 `increase` 之和。至少 10。没有比例，没有健康分母。`unknown_node` 不在分子里。`for` 仍是 5 分钟。
+- 明文 HTTP 新隧道 setup 的 P95 > 200ms，样本数同样至少 100：`histogram_quantile(0.95, sum by (le) (rate(proxy_http_tunnel_setup_ms_bucket{result="ok"}[5m])))`。时钟与 CONNECT 相同，阈值用同一个 200ms。请求时延不设这条页，也还没有参考线。按节点的页用 `sum by (le, node_id)`。没有把两条 P95 合成一条的页。
+- 解析器故障。`ProxyResolverUpstream`。分子是两条协议上 `node_id="unknown"` 且 reason 为 `empty_addr` 或 `resolver_error` 的 `increase` 之和。至少 10。没有比例，没有健康分母。`unknown_node` 不在分子里。`for` 仍是 5 分钟。整表 `ErrUnknownNode` 不进这条页。
 
-每条页的 `for` 都是 5 分钟。可执行的规则在 `internal/docfixture/prom/sli_rules.yml`。`promtool test rules` 覆盖空序列、只有失败没有 `ok`、一侧从未失败时加总仍有数、1 次失败加 9 次成功不翻页、P95 低于 200ms 不翻页，以及样本够多时 CONNECT 和 setup 的 P95 真的翻页（含按节点的那一条）。另外覆盖：序列第一次出现时已经不是 0、评估窗口就从这次出现开始，之后不再增加，告警保持沉默；同一条序列从非 0 开始再增加，窗口同样从出现开始，`increase` 只算后来的增量；样本已经不少于 100 但条件保持不满 5 分钟，告警停在 pending；失败率在 `for` 还没走完时是 pending、走完才翻页；`node_id="unknown"` 不进分子、分母和按节点的页。大量 `unknown_node` 不翻页。大约 20% 的 `resolver_error`（其余是健康 `ok`）让 `ProxyResolverUpstream` 翻页，健康失败率不翻页。低流量、只有 CONNECT 侧 `empty_addr`、5 分钟里 15 次、没有 `ok` 样本，这条页也翻页。两条协议各 5 次加在一起刚好 10，翻页；单独一条协议的 5 次不翻页。少量 `resolver_error`（5 分钟里 5 次）不翻页。
+每条页的 `for` 都是 5 分钟。可执行的规则在 `internal/docfixture/prom/sli_rules.yml`，共 9 条，没有两侧加总，也没有合成 P95。`promtool test rules` 覆盖空序列、只有失败没有 `ok`、一侧从未失败时看板上的加总仍是数、两边各 1.5% 时加总也是 1.5% 且两条协议都不翻页、一边全灭被另一边的成功样本拉到 2% 以下时坏的那一侧仍然翻页、1 次失败加 9 次成功不翻页、P95 低于 200ms 不翻页，以及样本够多时 CONNECT 和 setup 的 P95 真的翻页（含按节点的那一条）。另外覆盖：序列第一次出现时已经不是 0、评估窗口就从这次出现开始，之后不再增加，告警保持沉默；同一条序列从非 0 开始再增加，窗口同样从出现开始，`increase` 只算后来的增量；样本已经不少于 100 但条件保持不满 5 分钟，告警停在 pending；失败率在 `for` 还没走完时是 pending、走完才翻页；`node_id="unknown"` 不进分子、分母和按节点的页。大量 `unknown_node` 不翻页，整表 `ErrUnknownNode` 同样不翻页。大约 20% 的 `resolver_error`（其余是健康 `ok`）让 `ProxyResolverUpstream` 翻页，健康失败率不翻页。低流量、只有 CONNECT 侧 `empty_addr`、5 分钟里 15 次、没有 `ok` 样本，这条页也翻页。两条协议各 5 次加在一起刚好 10，翻页；单独一条协议的 5 次不翻页。少量 `resolver_error`（5 分钟里 5 次）不翻页。
 
 内核（M2，eBPF）：
 
@@ -3746,7 +3753,7 @@ func (s *httpSession) stop() {
 }
 ```
 
-`internal/docfixture` 在构建标签 `docfixture` 下把 §7.1 的 `package l1metrics`、上面的 CONNECT 片段和这一段逐字节抽出来编译。`l1metrics` 用的是 `prometheus/client_golang`，不是另一份 mock。测试核对抽出的文件和文档代码块逐字节相同，并检查直方图有隐含的 `le="+Inf"`、一个标签组合是 13 条序列（10 个显式桶、`+Inf`、`_sum`、`_count`）。`go test -tags docfixture -race` 覆盖这组文件；默认 `go test ./...` 不编译它们。gost 用环境变量 `GOST_BIN`，并要求 `gost -V` 的输出里有单独的字段 `v3.3.1`（`v3.3.10` 不算）。否则按 `GOOS/GOARCH` 下载 linux/darwin 的 amd64 和 arm64 包，校验发行包和二进制的 sha256，写入用户缓存目录（先写临时文件、fsync、再改名）；缓存里的二进制对不上校验和就丢掉重下。不支持的系统写明原因。`GOST_REQUIRED=1` 时拿不到二进制是失败，不是跳过。不依赖写死的 `/tmp/gost`。源站是原始 TCP，用来核对字节而不是用 `net/http` 再解析一遍。覆盖了头顺序和大小写、逐跳头删除、不注入 Via / X-Forwarded-For / User-Agent、chunked 请求和响应、Content-Length、`Expect: 100-continue`（只在最终状态行记一次 `ok`，`100` 不计）、417 时不把正文写入隧道且记 `ok`、WebSocket 的 101（`ok` 停在状态行，之后的字节进 `proxy_http_tunnel_bytes_total`；干净结束不记 `proxy_http_body_abort_total`，截断的响应正文记 `reason="origin_reset"`）、同一条连接上换主机和换 node（三次建隧道）、同一主机的 keep-alive（四条请求 gauge 保持 1，四次请求 `ok`、一次 setup `ok`）、用户名最后一个 `@`、400 / 407 / 502、以及方案 A 会改写头。客户端一个字节都没写，按 `tunnelIdle` 关掉，不记拒绝、不观察、不记失败、不发事件，不按 `header_deadline`。keep-alive 上空等超过 `header_deadline`、短于 `tunnelIdle` 时连接还在，下一条请求仍能完成。下一条请求的头在第一个字节之后往里滴，到 `header_deadline` 切断，记 `header_timeout`。第一条请求同样：已经读到一部分、并且还在往里滴字节，到 `header_deadline` 就切断。正文传输中的空闲到点记 `reason="idle_timeout"`。CONNECT 隧道空闲到点记 `proxy_tunnel_abort_total{reason="idle_timeout"}`。半关闭已经开始时，更短的 `tunnelIdle` 不把这次拆除记成 `idle_timeout`，连接等到 `halfCloseIdle`。`ErrUnknownNode`、空地址和其它解析错误分别记 `unknown_node`、`empty_addr`、`resolver_error`。集合外的失败 reason 记 `other`。半关闭后的空闲不记 body abort。源站在 101 之后 RST，记 `origin_reset`，不记 `client_cancel`。读侧的 `ECONNRESET` 上，GET 重试，PUT 回 502 `stale_tunnel`。每条请求只 `ObserveHTTP` 一次，结果是八个 CONNECT 结果再加 `stale_tunnel`。新隧道另 `ObserveHTTPSetup` 一次，结果是七个 setup 值，没有 `client_gone`。`no_upstream` 不观察。第一条请求的头没读完时：请求行已经是 CONNECT 才记 `proxy_client_reject_total{reason="bad_target"}`，否则记 `proxy_http_client_reject_total{reason="bad_target"}`；一个字节都没有不计数。源站按 Node 的习惯空闲 5 秒关掉连接后，下一条 GET 重开一次并记 `proxy_http_reused_conn_retry_total`，两次请求都是 `ok`。不能重放的 POST，以及默认关闭重试的 PUT，记 `stale_tunnel` 和 502，不重试。请求头只写出一部分就遇到 `EPIPE` 时也不重试。复用隧道上的读超时记 `l2_response`，不重试。这些请求不调用 `Fail502`、`ObserveConnect` 或 `EnterTunnel`。每条隧道关闭时 gauge 和时长各结清一次。CONNECT 隧道另用一份固定 ClientHello，拆成小块写入；源站收到的字节与直连相同，JA3 与 JA4 相同。`internal/docfixture/prom` 的 `promtool test rules` 覆盖失败率在空序列、只有失败、一侧从未失败、样本不足 100，以及 P95 真的越过 200ms 时的表达式。另覆盖：大约 20% 的 `resolver_error` 让 `ProxyResolverUpstream` 翻页；低流量且只有 CONNECT 侧 `empty_addr` 也翻页；两条协议各 5 次加在一起翻页；大量 `unknown_node` 不翻页；5 分钟里 5 次 `resolver_error` 不翻页。夹具里的 gost 没有挂 §3 的环回黑名单，否则连不到本机源站；生产配置仍按附录 A.5 拒绝环回和链路本地。
+`internal/docfixture` 在构建标签 `docfixture` 下把 §7.1 的 `package l1metrics`、上面的 CONNECT 片段和这一段逐字节抽出来编译。`l1metrics` 用的是 `prometheus/client_golang`，不是另一份 mock。测试核对抽出的文件和文档代码块逐字节相同，并检查直方图有隐含的 `le="+Inf"`、一个标签组合是 13 条序列（10 个显式桶、`+Inf`、`_sum`、`_count`）。`go test -tags docfixture -race` 覆盖这组文件；默认 `go test ./...` 不编译它们。gost 用环境变量 `GOST_BIN`，并要求 `gost -V` 的输出里有单独的字段 `v3.3.1`（`v3.3.10` 不算）。否则按 `GOOS/GOARCH` 下载 linux/darwin 的 amd64 和 arm64 包，校验发行包和二进制的 sha256，写入用户缓存目录（先写临时文件、fsync、再改名）；缓存里的二进制对不上校验和就丢掉重下。不支持的系统写明原因。`GOST_REQUIRED=1` 时拿不到二进制是失败，不是跳过。不依赖写死的 `/tmp/gost`。源站是原始 TCP，用来核对字节而不是用 `net/http` 再解析一遍。覆盖了头顺序和大小写、逐跳头删除、不注入 Via / X-Forwarded-For / User-Agent、chunked 请求和响应、Content-Length、`Expect: 100-continue`（只在最终状态行记一次 `ok`，`100` 不计）、417 时不把正文写入隧道且记 `ok`、WebSocket 的 101（`ok` 停在状态行，之后的字节进 `proxy_http_tunnel_bytes_total`；干净结束不记 `proxy_http_body_abort_total`，截断的响应正文记 `reason="origin_reset"`）、同一条连接上换主机和换 node（三次建隧道）、同一主机的 keep-alive（四条请求 gauge 保持 1，四次请求 `ok`、一次 setup `ok`）、用户名最后一个 `@`、400 / 407 / 502、以及方案 A 会改写头。客户端一个字节都没写，按 `tunnelIdle` 关掉，不记拒绝、不观察、不记失败、不发事件，不按 `header_deadline`。keep-alive 上空等超过 `header_deadline`、短于 `tunnelIdle` 时连接还在，下一条请求仍能完成。下一条请求的头在第一个字节之后往里滴，到 `header_deadline` 切断，记 `header_timeout`。第一条请求同样：已经读到一部分、并且还在往里滴字节，到 `header_deadline` 就切断。正文传输中的空闲到点记 `reason="idle_timeout"`。CONNECT 隧道空闲到点记 `proxy_tunnel_abort_total{reason="idle_timeout"}`。半关闭已经开始时，更短的 `tunnelIdle` 不把这次拆除记成 `idle_timeout`，连接等到 `halfCloseIdle`。`ErrUnknownNode`、空地址和其它解析错误分别记 `unknown_node`、`empty_addr`、`resolver_error`。集合外的失败 reason 记 `other`。半关闭后的空闲不记 body abort。源站在 101 之后 RST，记 `origin_reset`，不记 `client_cancel`。读侧的 `ECONNRESET` 上，GET 重试，PUT 回 502 `stale_tunnel`。每条请求只 `ObserveHTTP` 一次，结果是八个 CONNECT 结果再加 `stale_tunnel`。新隧道另 `ObserveHTTPSetup` 一次，结果是七个 setup 值，没有 `client_gone`。`no_upstream` 不观察。第一条请求的头没读完时：请求行已经是 CONNECT 才记 `proxy_client_reject_total{reason="bad_target"}`，否则记 `proxy_http_client_reject_total{reason="bad_target"}`；一个字节都没有不计数。源站按 Node 的习惯空闲 5 秒关掉连接后，下一条 GET 重开一次并记 `proxy_http_reused_conn_retry_total`，两次请求都是 `ok`。不能重放的 POST，以及默认关闭重试的 PUT，记 `stale_tunnel` 和 502，不重试。请求头只写出一部分就遇到 `EPIPE` 时也不重试。复用隧道上的读超时记 `l2_response`，不重试。这些请求不调用 `Fail502`、`ObserveConnect` 或 `EnterTunnel`。每条隧道关闭时 gauge 和时长各结清一次。CONNECT 隧道另用一份固定 ClientHello，拆成小块写入；源站收到的字节与直连相同，JA3 与 JA4 相同。`internal/docfixture/prom` 的 `promtool test rules` 覆盖失败率在空序列、只有失败、一侧从未失败、样本不足 100，以及 P95 真的越过 200ms 时的表达式。另覆盖：两边各 1.5% 时看板上的加总也是 1.5%，两条协议都不翻页；一边全灭被另一边的成功样本拉到 2% 以下时，坏的那一侧仍然翻页，没有两侧加总的页；大约 20% 的 `resolver_error` 让 `ProxyResolverUpstream` 翻页；低流量且只有 CONNECT 侧 `empty_addr` 也翻页；两条协议各 5 次加在一起翻页；大量 `unknown_node` 不翻页；5 分钟里 5 次 `resolver_error` 不翻页。夹具里的 gost 没有挂 §3 的环回黑名单，否则连不到本机源站；生产配置仍按附录 A.5 拒绝环回和链路本地。
 
 
 ---
@@ -3792,7 +3799,7 @@ func (s *httpSession) stop() {
 建议进入 PoC 实施，优先验证三件事：
 1. username 路由稳定性，以及 L2 `200` 之后才向客户端应答；
 2. 客户端与目标侧 ClientHello / JA3 / JA4 一致；
-3. 高并发下连接成功率与时延目标，用 §7.1 的 SLI 核对。CONNECT 与明文 HTTP 分开看，两侧失败率再加总，见 §7.3。
+3. 高并发下连接成功率与时延目标，用 §7.1 的 SLI 核对。CONNECT 与明文 HTTP 分开看失败率和 P95。两侧失败率的加总只上看板，见 §7.3。
 
 ---
 
@@ -3964,7 +3971,7 @@ Oxylabs
 
 Decodo
 
-- 住宅用量页：流量和请求曲线，可按 Location、Proxy User、Target、Protocol 分，可按小时到月聚合，保留 180 天。表有日期、流量、下载、上传、请求数、花费。另有 Top targets、Top countries、Top users。页面写明城市、美国州、ASN、邮编的住宅统计没有：[Usage Statistics](https://help.decodo.com/docs/residential-proxy-statistics)。
+- 住宅用量页：流量和请求曲线，可按 Location、Proxy User、Target、Protocol 分，可按小时到月聚合。页面写的保留期是 180 天，这是 Decodo 自己的用量统计保留期，不是本系统原始客户端 IP 的保留期。本系统含 IP 的原始计量日志保留 30 天，见 §7.1。表有日期、流量、下载、上传、请求数、花费。另有 Top targets、Top countries、Top users。页面写明城市、美国州、ASN、邮编的住宅统计没有：[Usage Statistics](https://help.decodo.com/docs/residential-proxy-statistics)。
 - 同页的 `POST https://api.decodo.com/api/v2/statistics/traffic` 示例里，`metadata.totals` 含 `unsuccessful_requests`、`response_time`、`success_rate`（示例数值为 0），按天的行只有 `rx_bytes`、`tx_bytes`、`requests`。OpenAPI 没逐项解释这些总计字段：[Get traffic](https://help.decodo.com/api-reference/traffic/get-traffic)。`groupBy` 含 `day`、`target`、`country`、`protocol`、`proxy_user`、`hour`、`week`、`month`。
 - 流量口径：上传含请求头、cookie、POST；下载含响应头和 cookie；目标站的 403/404/503 计入；代理自己的 502 和连接错误不计入：[Proxy Traffic](https://help.decodo.com/docs/proxy-traffic)。
 - 子用户流量 `traffic`、`traffic_rx`、`traffic_tx`：[Get sub user traffic](https://help.decodo.com/api-reference/sub-users/get-sub-user-traffic)。

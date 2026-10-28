@@ -138,7 +138,7 @@ var (
 
 	proxyHTTPRequestLatency = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "proxy_http_request_latency_ms",
-		Help:    "一条明文 HTTP 请求从拨号前（复用隧道则从写出请求起）到结果确定的毫秒数。result 比建连多 stale_tunnel。ok 停在源站最终状态行写完。只上看板，不设页。",
+		Help:    "一条明文 HTTP 请求从拨号前（复用隧道则从写出请求起）到结果确定的毫秒数。result 比建连多 stale_tunnel。ok 停在源站最终状态行写完。只上看板，不设页，也还没有阈值。参考线等上线后 1 到 2 周的真实数据再画。",
 		Buckets: []float64{5, 10, 25, 50, 100, 200, 500, 1000, 3000, 10000},
 	}, []string{"node_id", "result"})
 

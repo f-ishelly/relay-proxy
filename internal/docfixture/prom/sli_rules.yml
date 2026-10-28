@@ -3,6 +3,10 @@
 # Per-node sums use `or (other * 0)` so a missing side stays labeled with node_id.
 # The denominator must be at least 100 so 1 failure out of 10 does not page.
 # for: 5m keeps a single bad evaluation pending. increase() does not count the value a series already has at first scrape.
+# There is no combined two-protocol page and no combined P95. The blended failure rate is a
+# volume-weighted average of the two protocol rates, so it cannot exceed the higher side.
+# Grafana may still graph it. A routing-table wipe that returns ErrUnknownNode for every id
+# does not page: unknown_node is dashboard-only.
 groups:
   - name: proxy-sli
     rules:
@@ -134,40 +138,6 @@ groups:
           severity: page
         annotations:
           summary: plain HTTP failure rate above 2% on one node
-      - alert: ProxyCombinedFailureRate
-        expr: |
-          (
-            (
-              (sum(increase(proxy_upstream_fail_total{node_id!="unknown"}[5m])) or vector(0))
-              +
-              (sum(increase(proxy_http_upstream_fail_total{node_id!="unknown"}[5m])) or vector(0))
-            )
-            /
-            (
-              (sum(increase(proxy_upstream_fail_total{node_id!="unknown"}[5m])) or vector(0))
-              +
-              (sum(increase(proxy_http_upstream_fail_total{node_id!="unknown"}[5m])) or vector(0))
-              +
-              (sum(increase(proxy_connect_latency_ms_count{node_id!="unknown",result="ok"}[5m])) or vector(0))
-              +
-              (sum(increase(proxy_http_request_latency_ms_count{node_id!="unknown",result="ok"}[5m])) or vector(0))
-            )
-          ) > 0.02
-          and
-          (
-            (sum(increase(proxy_upstream_fail_total{node_id!="unknown"}[5m])) or vector(0))
-            +
-            (sum(increase(proxy_http_upstream_fail_total{node_id!="unknown"}[5m])) or vector(0))
-            +
-            (sum(increase(proxy_connect_latency_ms_count{node_id!="unknown",result="ok"}[5m])) or vector(0))
-            +
-            (sum(increase(proxy_http_request_latency_ms_count{node_id!="unknown",result="ok"}[5m])) or vector(0))
-          ) >= 100
-        for: 5m
-        labels:
-          severity: page
-        annotations:
-          summary: combined failure rate above 2%
       - alert: ProxyConnectLatencyP95
         expr: |
           histogram_quantile(0.95, sum by (le) (rate(proxy_connect_latency_ms_bucket{node_id!="unknown",result="ok"}[5m]))) > 200
