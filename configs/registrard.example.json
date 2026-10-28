@@ -31,6 +31,6 @@
   "inspection_interval_ms": 60000,
   "ignore_admin_net_check": false,
   "resource_fault_action": "deregister",
-  "drain_attempt_ms": 700,
+  "drain_attempt_ms": 2000,
   "drain_budget_ms": 6000
 }
