@@ -257,7 +257,11 @@ func serveAbsolute(client net.Conn, session *httpSession, mc *modeConn, br *bufi
 		if req.targetErr != nil {
 			l1metrics.RejectHTTP(l1metrics.ReasonRejectBadTarget)
 			try.observe(l1metrics.ReasonRejectBadTarget)
-			writeHTTPError(client, http.StatusBadRequest, "Bad Request", "")
+			if errors.Is(req.targetErr, errHTTPSAbsolute) {
+				writeHTTPErrorBody(client, http.StatusBadRequest, "Bad Request", "", httpsHintBody)
+			} else {
+				writeHTTPError(client, http.StatusBadRequest, "Bad Request", "")
+			}
 			return req.targetErr
 		}
 		if host, port, serr := net.SplitHostPort(req.originTarget); serr == nil {
@@ -360,7 +364,12 @@ func parseAbsolute(head []byte) (*absReq, *httpReject) {
 	}
 	originForm, hostport, terr := parseHTTPAbsolute(rawTarget)
 	if terr != nil {
-		req.targetErr = terr
+		// https:// 与其它坏目标共用 bad_target，但响应要带上 CONNECT 提示正文。
+		if httpsAbsoluteForm(rawTarget) {
+			req.targetErr = errHTTPSAbsolute
+		} else {
+			req.targetErr = terr
+		}
 		return req, nil
 	}
 	req.originTarget = hostport
@@ -525,6 +534,15 @@ func wantsClose(version string, connToks, proxyToks []string) bool {
 		return !(hasToken(connToks, "keep-alive") || hasToken(proxyToks, "keep-alive"))
 	}
 	return false
+}
+
+// errHTTPSAbsolute 表示明文请求的 absolute-form 用了 https scheme。
+// 状态和 reason 与其它坏目标相同，响应正文用 httpsHintBody。
+var errHTTPSAbsolute = errors.New("https absolute-form")
+
+func httpsAbsoluteForm(raw string) bool {
+	scheme, _, ok := strings.Cut(raw, "://")
+	return ok && strings.EqualFold(scheme, "https")
 }
 
 // parseHTTPAbsolute 手工切 absolute-form，不经过 net/url，避免百分号解码和主机名大小写变化。
@@ -1253,7 +1271,15 @@ func upgradeAbortReason(upload, writeFailed bool, err error) string {
 	return l1metrics.ReasonAbortClientCancel
 }
 
+// httpsHintBody 是明文 https:// 请求的 400 正文。reason 仍是 bad_target。
+// 只有这一处明文错误带正文。CONNECT 的 reply 不经过 writeHTTPError。
+const httpsHintBody = "use CONNECT for https:// targets\n"
+
 func writeHTTPError(w io.Writer, status int, reason, header string) {
+	writeHTTPErrorBody(w, status, reason, header, "")
+}
+
+func writeHTTPErrorBody(w io.Writer, status int, reason, header, body string) {
 	var b strings.Builder
 	fmt.Fprintf(&b, "HTTP/1.1 %d %s\r\n", status, reason)
 	if header != "" {
@@ -1262,7 +1288,14 @@ func writeHTTPError(w io.Writer, status int, reason, header string) {
 			b.WriteString("\r\n")
 		}
 	}
-	b.WriteString("Content-Length: 0\r\nConnection: close\r\n\r\n")
+	if body != "" {
+		b.WriteString("Content-Type: text/plain; charset=utf-8\r\n")
+		fmt.Fprintf(&b, "Content-Length: %d\r\n", len(body))
+	} else {
+		b.WriteString("Content-Length: 0\r\n")
+	}
+	b.WriteString("Connection: close\r\n\r\n")
+	b.WriteString(body)
 	_, _ = io.WriteString(w, b.String())
 }
 
@@ -1291,6 +1324,7 @@ func readHTTPHead(r *bufio.Reader) ([]byte, error) {
 	for {
 		line, err := r.ReadSlice('\n')
 		if len(line) > 0 {
+			// 请求行、头行和结尾空行都计入。等于 maxHTTPHead 接受，多一个字节拒绝。
 			if buf.Len()+len(line) > maxHTTPHead {
 				return buf.Bytes(), fmt.Errorf("head too large")
 			}

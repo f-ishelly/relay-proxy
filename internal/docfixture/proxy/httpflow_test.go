@@ -1203,6 +1203,7 @@ func TestLocalRejectsDoNotDial(t *testing.T) {
 		{"no-node", "app", "s3cret", "http://127.0.0.1/a", 400, l1metrics.ReasonRejectNoNode},
 		{"origin-form", "app@node-a", "s3cret", "/a", 400, l1metrics.ReasonRejectBadTarget},
 		{"https", "app@node-a", "s3cret", "https://example.com/a", 400, l1metrics.ReasonRejectBadTarget},
+		{"https-upper", "app@node-a", "s3cret", "HTTPS://example.com/a", 400, l1metrics.ReasonRejectBadTarget},
 	}
 	var dials atomic.Int32
 	lim := defaultLimits()
@@ -1241,8 +1242,177 @@ func TestLocalRejectsDoNotDial(t *testing.T) {
 			if tc.status == 407 && !bytes.Contains(resp, []byte("Proxy-Authenticate:")) {
 				t.Fatalf("missing challenge: %s", resp)
 			}
+			head, body := splitRawMessage(t, resp)
+			if tc.name == "https" || tc.name == "https-upper" {
+				if string(body) != httpsHintBody {
+					t.Fatalf("hint body %s", strconv.Quote(string(body)))
+				}
+				if got := contentLengthOf(t, head); got != len(body) || got != len(httpsHintBody) {
+					t.Fatalf("Content-Length %d body %d hint %d", got, len(body), len(httpsHintBody))
+				}
+				if !bytes.Contains(head, []byte("Content-Type: text/plain; charset=utf-8\r\n")) {
+					t.Fatalf("content-type missing: %s", strconv.Quote(string(head)))
+				}
+				if !bytes.Contains(head, []byte("\r\nConnection: close\r\n")) {
+					t.Fatalf("connection: %s", strconv.Quote(string(head)))
+				}
+			} else {
+				if len(body) != 0 {
+					t.Fatalf("body %s", strconv.Quote(string(body)))
+				}
+				if got := contentLengthOf(t, head); got != 0 {
+					t.Fatalf("Content-Length %d", got)
+				}
+				if !bytes.Contains(head, []byte("\r\nConnection: close\r\n")) {
+					t.Fatalf("connection: %s", strconv.Quote(string(head)))
+				}
+				if bytes.Contains(resp, []byte(httpsHintBody)) {
+					t.Fatalf("hint leaked into %s", tc.name)
+				}
+			}
 		})
 	}
+}
+
+func TestHTTPHeadLimit(t *testing.T) {
+	const target = "http://example/ok"
+	exact := sizedProxyHead(t, target, maxHTTPHead)
+	over := sizedProxyHead(t, target, maxHTTPHead+1)
+	if len(exact) != maxHTTPHead || len(over) != maxHTTPHead+1 {
+		t.Fatalf("sizes exact=%d over=%d limit=%d", len(exact), len(over), maxHTTPHead)
+	}
+
+	t.Run("exact", func(t *testing.T) {
+		resetMetrics()
+		got := make(chan []byte, 1)
+		fake := serveRaw(t, func(c net.Conn) {
+			defer c.Close()
+			_ = c.SetDeadline(time.Now().Add(4 * time.Second))
+			br := bufio.NewReaderSize(c, maxHTTPHead)
+			if _, err := readHTTPHead(br); err != nil {
+				return
+			}
+			if _, err := io.WriteString(c, "HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
+				return
+			}
+			raw, err := readOriginRequest(br)
+			if err != nil {
+				return
+			}
+			got <- raw
+			_, _ = io.WriteString(c, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+		})
+		l1 := startL1(t, mapResolver{m: map[string]string{"node-a": fake}})
+		resp := doRequest(t, l1, exact)
+		mustStatus(t, resp, 200)
+		select {
+		case raw := <-got:
+			if !bytes.HasPrefix(raw, []byte("GET /ok HTTP/1.1\r\n")) {
+				t.Fatalf("origin request %s", strconv.Quote(string(raw[:min(80, len(raw))])))
+			}
+			if !bytes.Contains(raw, []byte("\r\nX-Pad: ")) {
+				t.Fatal("padding header was not forwarded")
+			}
+			if bytes.Contains(raw, []byte("Proxy-Authorization")) {
+				t.Fatal("proxy authorization was forwarded")
+			}
+		default:
+			t.Fatal("exact-limit head was not forwarded")
+		}
+		handlers.Wait()
+		snap := snapMetrics()
+		if len(snap.HTTPRejects) != 0 {
+			t.Fatalf("exact head rejected %#v", snap.HTTPRejects)
+		}
+		if len(snap.HTTPObserves) != 1 || snap.HTTPObserves[0] != l1metrics.ResultOK {
+			t.Fatalf("observes %#v", snap.HTTPObserves)
+		}
+	})
+
+	t.Run("one-over", func(t *testing.T) {
+		resetMetrics()
+		var dials atomic.Int32
+		fake := serveRaw(t, func(c net.Conn) {
+			dials.Add(1)
+			_ = c.Close()
+		})
+		l1 := startL1(t, mapResolver{m: map[string]string{"node-a": fake}})
+		resp := doRequest(t, l1, over)
+		mustStatus(t, resp, 400)
+		head, body := splitRawMessage(t, resp)
+		if len(body) != 0 {
+			t.Fatalf("body %s", strconv.Quote(string(body)))
+		}
+		if got := contentLengthOf(t, head); got != 0 {
+			t.Fatalf("Content-Length %d", got)
+		}
+		if !bytes.Contains(head, []byte("\r\nConnection: close\r\n")) {
+			t.Fatalf("connection: %s", strconv.Quote(string(head)))
+		}
+		if dials.Load() != 0 {
+			t.Fatalf("over-limit head was forwarded, dials=%d", dials.Load())
+		}
+		handlers.Wait()
+		snap := snapMetrics()
+		if len(snap.HTTPRejects) != 1 || snap.HTTPRejects[0] != l1metrics.ReasonRejectBadTarget {
+			t.Fatalf("rejects %#v", snap.HTTPRejects)
+		}
+		if len(snap.Rejects) != 0 || len(snap.HTTPObserves) != 0 || len(snap.HTTPFails) != 0 {
+			t.Fatalf("over-limit counted elsewhere: %+v", snap)
+		}
+	})
+}
+
+// sizedProxyHead builds a plain absolute-form request whose head, including the
+// terminating CRLFCRLF, is exactly n bytes. The padding lives in one X-Pad line.
+func sizedProxyHead(t *testing.T, target string, n int) string {
+	t.Helper()
+	prefix := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: h\r\nProxy-Authorization: Basic %s\r\nX-Pad: ",
+		target, basicToken("app@node-a", "s3cret"))
+	const suffix = "\r\n\r\n"
+	pad := n - len(prefix) - len(suffix)
+	if pad < 1 {
+		t.Fatalf("fixed head %d already exceeds %d", len(prefix)+len(suffix), n)
+	}
+	return prefix + strings.Repeat("a", pad) + suffix
+}
+
+func splitRawMessage(t *testing.T, raw []byte) (head, body []byte) {
+	t.Helper()
+	i := bytes.Index(raw, []byte("\r\n\r\n"))
+	if i < 0 {
+		t.Fatalf("no header terminator: %s", strconv.Quote(string(raw)))
+	}
+	return raw[:i+4], raw[i+4:]
+}
+
+func contentLengthOf(t *testing.T, head []byte) int {
+	t.Helper()
+	_, headers, err := splitHead(head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	n := 0
+	for _, ln := range headers {
+		name, _, ok := headerName(ln)
+		if !ok || !strings.EqualFold(string(name), "Content-Length") {
+			continue
+		}
+		v, err := strconv.Atoi(headerValue(ln))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if found && v != n {
+			t.Fatalf("conflicting content-length in %s", strconv.Quote(string(head)))
+		}
+		found = true
+		n = v
+	}
+	if !found {
+		t.Fatalf("no content-length in %s", strconv.Quote(string(head)))
+	}
+	return n
 }
 
 func TestBadCredentialDoesNotDial(t *testing.T) {
