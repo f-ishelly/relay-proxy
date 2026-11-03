@@ -285,7 +285,7 @@ Connection: close
 
 ### 5.5 改写、逐跳头、复用和正文
 
-请求行从 `METHOD SP absolute-URI SP HTTP/1.1` 改成 `METHOD SP origin-form SP HTTP/1.1`。方法、路径和 query 的字节保留，百分号不解码。没有路径时 origin-form 是 `/`。fragment 和 userinfo 丢掉，既不进入 CONNECT 目标，也不进入 origin-form。scheme 只接受 `http`（大小写不敏感）。以明文代理方式发来的 `https://` 请求（scheme 大小写不敏感）回 400，提示改用 CONNECT。状态行是 `400 Bad Request`，正文是纯文本 `use CONNECT for https:// targets\n`，`Content-Type: text/plain; charset=utf-8`，`Content-Length` 等于这段正文的字节数。`reason` 仍是 `bad_target`。origin-form、`*`、其它 scheme 以及没有 host 的请求也是 400，但不带这段正文。缺端口时 CONNECT 目标用 80。IPv6 保留方括号，例如 `[::1]:80`。
+请求行从 `METHOD SP absolute-URI SP HTTP/1.1` 改成 `METHOD SP origin-form SP HTTP/1.1`。方法、路径和 query 的字节保留，百分号不解码。没有路径时 origin-form 是 `/`。fragment 和 userinfo 丢掉，既不进入 CONNECT 目标，也不进入 origin-form。scheme 只接受 `http`（大小写不敏感）。以明文代理方式发来的 `https://` 请求（scheme 大小写不敏感）回 400，提示改用 CONNECT。状态行是 `400 Bad Request`，正文是纯文本 `use CONNECT for https:// targets\n`，`Content-Type: text/plain; charset=utf-8`，`Content-Length` 等于这段正文的字节数。`reason` 仍是 `bad_target`。不用 RFC 6585 的 431，是为了和已经确认的「坏目标一律 400 / `bad_target`」一致。还没通过口令校验的 `https://` 先回 407，客户端看不到这段提示。origin-form、`*`、其它 scheme 以及没有 host 的请求也是 400，但不带这段正文。缺端口时 CONNECT 目标用 80。IPv6 保留方括号，例如 `[::1]:80`。
 
 拨号用的 host:port 来自请求 URI（absolute-form）里的主机，不来自 Host 头。Host 头原样透传：有就按原字节保留，没有也不补。两者不一致时不改 Host。v0.12 已确认保留。
 
@@ -349,7 +349,7 @@ Upgrade（含 WebSocket）要同时满足：有非空的 `Upgrade`，并且 `Con
 
 后续：仓库里的数据面还在 `internal/docfixture`。生产 L1 二进制接上时，必须走 `LimitsFromConfig` 和同一组命令行（`-proxy-config`、`-tunnel-idle`、`-half-close-idle`、`-l2-response-timeout`、`-header-deadline`、`-retry-put-delete`），不要在进程里另写一套超时默认值。
 
-失败响应带 `Connection: close`，随后关掉客户端连接。没有正文时 `Content-Length: 0`。正文存在时（只有明文 `https://` 的 CONNECT 提示）`Content-Length` 等于正文字节数，并带 `Content-Type: text/plain; charset=utf-8`。CONNECT 路径的失败响应格式不变：状态行和可选头之后直接是空行，不带这两项。v0.12 已确认保留这个差别，v0.13 只给上述提示补上正文。写 L2 失败、设置或清除读截止时间失败时回 502，原因分别记 `l2_write`、`l2_deadline`，已确认保留。已经向客户端写出源站字节之后的写出失败仍只关连接，不再补 502，见上表。
+失败响应带 `Connection: close`。没有正文时 `Content-Length: 0`。正文存在时（只有明文 `https://` 的 CONNECT 提示）`Content-Length` 等于正文字节数，并带 `Content-Type: text/plain; charset=utf-8`。响应刷出之后，连接若支持半关闭就先 `CloseWrite`，再在 500ms 内最多读掉 256KiB 剩余请求字节，然后关闭，避免接收缓冲里还有数据时内核发 RST。CONNECT 路径的失败响应格式不变：状态行和可选头之后直接是空行，不带这两项。v0.12 已确认保留这个差别，v0.13 只给上述提示补上正文。写 L2 失败、设置或清除读截止时间失败时回 502，原因分别记 `l2_write`、`l2_deadline`，已确认保留。已经向客户端写出源站字节之后的写出失败仍只关连接，不再补 502，见上表。
 
 超时不新造数字：
 
@@ -362,7 +362,7 @@ Upgrade（含 WebSocket）要同时满足：有非空的 `Upgrade`，并且 `Con
 
 等 L2 的 200 时，不再像 CONNECT 那样另开一个读端把客户端字节泵进 pipe。明文请求的正文还要按帧切开，多一个读端会把正文读丢。客户端要是在这 10 秒里断开，要等到这次读或写失败才发现，结果记 `l2_response`，不记 `client_gone`。CONNECT 有读泵，同一时刻记的是 `client_gone`。两边故意不一样，见 §7.3。上限仍是拨号 3 秒加上 `l2ResponseTimeout`。
 
-请求头超过 64KiB，或者头没有读完且不是超时，回 400，`reason="bad_target"`。这 64KiB 是 `maxHTTPHead`（`64<<10`，65536 字节）。读头时按行累加，请求行、每一个头行和结尾空行都算，含行尾的 CR/LF。某一行会让累计长度大于 65536 时，这一行不算进已接受的头部，直接 400。正好 65536 字节的完整请求头被接受并转发；65537 字节回 400，`Content-Length: 0`，`Connection: close`。请求正文不计入，暂不设上限，见 §5.5。请求行已经是 `CONNECT` 时进 `proxy_client_reject_total`。请求行还不是 `CONNECT`，包括请求行本身没读全、方法还看不出来，进 `proxy_http_client_reject_total{reason="bad_target"}`，不进 CONNECT 的拒绝计数。绝对的请求头截止到点、且已经读到一部分，记 `header_timeout`。一个字节都没有，包括请求头截止和隧道空闲，不计数。
+请求头超过 64KiB，或者头没有读完且不是超时，回 400，`reason="bad_target"`。这 64KiB 是 `maxHTTPHead`（`64<<10`，65536 字节）。读头时按行累加，请求行、每一个头行和结尾空行都算，含行尾的 CR/LF。某一行会让累计长度大于 65536 时，这一行不算进已接受的头部，直接 400。正好 65536 字节的完整请求头被接受并转发；65537 字节回 400，`Content-Length: 0`，`Connection: close`。单独一行正好 65536 字节且末尾是换行时，后面已经放不下结尾空行，立刻 400；缓冲被塞满且这一行没有换行（`bufio.ErrBufferFull`）同样立刻 400。这两种都是 `bad_target`，不等 `header_deadline`。请求正文不计入，暂不设上限，见 §5.5。请求行已经是 `CONNECT` 时进 `proxy_client_reject_total`。请求行还不是 `CONNECT`，包括请求行本身没读全、方法还看不出来，进 `proxy_http_client_reject_total{reason="bad_target"}`，不进 CONNECT 的拒绝计数。绝对的请求头截止到点、且已经读到一部分，记 `header_timeout`。一个字节都没有，包括请求头截止和隧道空闲，不计数。
 
 
 ## 6. TLS 指纹透传设计
@@ -3415,6 +3415,13 @@ func upgradeAbortReason(upload, writeFailed bool, err error) string {
 // 只有这一处明文错误带正文。CONNECT 的 reply 不经过 writeHTTPError。
 const httpsHintBody = "use CONNECT for https:// targets\n"
 
+// 明文错误关掉连接前，先把剩余请求字节读掉。上限和 net/http 的
+// maxPostHandlerReadBytes、rstAvoidanceDelay 同一量级：多了就不再读，时间到了也不再等。
+const (
+	httpErrorDrainTimeout = 500 * time.Millisecond
+	httpErrorDrainMax     = 256 << 10
+)
+
 func writeHTTPError(w io.Writer, status int, reason, header string) {
 	writeHTTPErrorBody(w, status, reason, header, "")
 }
@@ -3436,7 +3443,59 @@ func writeHTTPErrorBody(w io.Writer, status int, reason, header, body string) {
 	}
 	b.WriteString("Connection: close\r\n\r\n")
 	b.WriteString(body)
-	_, _ = io.WriteString(w, b.String())
+	bw := bufio.NewWriter(w)
+	_, _ = bw.WriteString(b.String())
+	_ = bw.Flush()
+	// 接收缓冲里还有未读请求时，直接 Close 会让内核发 RST，客户端可能丢 400。
+	// 先半关闭写端，限时限量读掉剩余字节，再完全关闭。
+	discardUnreadAfterError(w)
+}
+
+// discardUnreadAfterError 在响应已经写完之后调用。不支持半关闭的连接只读后关闭。
+func discardUnreadAfterError(w io.Writer) {
+	c, ok := w.(net.Conn)
+	if !ok {
+		return
+	}
+	raw := rawConn(c)
+	if cw, ok := raw.(interface{ CloseWrite() error }); ok {
+		_ = cw.CloseWrite()
+	}
+	_ = raw.SetReadDeadline(time.Now().Add(httpErrorDrainTimeout))
+	var n int64
+	buf := make([]byte, 32<<10)
+	for n < httpErrorDrainMax {
+		want := int64(len(buf))
+		if remain := httpErrorDrainMax - n; remain < want {
+			want = remain
+		}
+		nr, err := raw.Read(buf[:want])
+		n += int64(nr)
+		if err != nil || nr == 0 {
+			break
+		}
+	}
+	_ = raw.Close()
+}
+
+// rawConn 剥掉 modeConn / prefixConn，避免 Read 把排空用的短截止时间又改回隧道空闲。
+func rawConn(c net.Conn) net.Conn {
+	for {
+		switch u := c.(type) {
+		case *modeConn:
+			if u == nil || u.Conn == nil {
+				return c
+			}
+			c = u.Conn
+		case *prefixConn:
+			if u == nil || u.Conn == nil {
+				return c
+			}
+			c = u.Conn
+		default:
+			return c
+		}
+	}
 }
 
 // readRequestHead 先等请求头的第一个字节，这段用 tunnelIdle，keep-alive 空等可以到 5 分钟。
@@ -3475,6 +3534,10 @@ func readHTTPHead(r *bufio.Reader) ([]byte, error) {
 		}
 		if err != nil {
 			return buf.Bytes(), err
+		}
+		// 非空行已经用满上限时，结尾空行必然超限。马上拒绝，不等 header_deadline。
+		if buf.Len() == maxHTTPHead && !isBlankLine(line) {
+			return buf.Bytes(), fmt.Errorf("head too large")
 		}
 		if isBlankLine(line) {
 			if buf.Len() == len(line) {
