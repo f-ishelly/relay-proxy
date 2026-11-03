@@ -1,9 +1,10 @@
 # OpenSpec 设计文档：多级高性能隧道代理（Pro 模式）
 
-- **文档版本**：v0.11（告警范围与计量保留）
-- **日期**：2026-10-28
+- **文档版本**：v0.12（明文转发与失败原因确认）
+- **日期**：2026-11-03
 - **状态**：Draft / 可进入 PoC
 - **目标**：参考商业隧道代理 Pro 模式，设计“一级代理 + 二级代理”多级转发系统，支持通过 `username` 指定二级节点、TLS 指纹透传、应用层与 eBPF 监控、etcd 自动服务发现。
+- **v0.12 变更**：h 确认保留 PR #14 第 4–9 条和 PR #10 第 1 条，行为不改。同节点、同 `host:port`、两端都 keep-alive 时复用 L2 隧道。转发目标取 absolute-form 里的主机，Host 头原样透传，缺失也不补。明文方式发来的 `https://` 回 400，提示改用 CONNECT。请求头超过 64KiB 回 400，`reason="bad_target"`；请求正文暂不设上限。明文 HTTP 的错误响应带 `Content-Length: 0` 和 `Connection: close`，CONNECT 的错误格式不变。同一条连接不支持并发管道；响应 trailer 里的逐跳头不删除。写 L2 失败、设置或清除读截止时间失败时回 502，原因分别是 `l2_write`、`l2_deadline`。§7 的 CONNECT reason 列表保留这两个名字。§8 未改。
 - **v0.11 变更**：`proxy_http_request_latency_ms` 只上看板，不设页，也还没有阈值。参考线等上线后 1 到 2 周的真实数据再画。源站 4xx/5xx 只要最终状态行完整写出，仍记 `ok`。`client_gone` 不进失败率。等 L2 时明文 HTTP 的客户端离开记 `l2_response` 并进失败率，看板上单看它占明文尝试的比例，不另设页。翻页的是各协议失败率、各协议 P95（明文用 `proxy_http_tunnel_setup_ms`）和对应的按节点页。5 分钟窗口至少 100 个请求，`for` 5 分钟。没有两侧合成的 P95。两侧失败率加总只上看板：它是按量加权平均，不会高于较高的那一侧；两边各 1.5% 时加总仍是 1.5%，不会越过 2%。`ProxyCombinedFailureRate` 撤掉。`stale_tunnel` 进失败。自动重试并且成功的那一次不记失败。`PUT` / `DELETE` 默认不重试，要打开 `retry_put_delete`。本版不把请求正文收进内存，只有 POST 的 `stale_tunnel` 明显变高时才再考虑缓存。含 `client_ip` 的原始计量日志保留 30 天。以后进 ClickHouse 不留原始 IP，或只留 IPv4 的 /24。附录 B 里 Decodo 用量统计写的 180 天是对方产品的保留期，不是这条原始 IP。路由表整表清掉、每个 id 都回 `ErrUnknownNode` 时仍然没有页，`unknown_node` 只上看板，本版不改。后续：生产 L1 进程还没接上 `LimitsFromConfig` 和同一组命令行时长。§8 未改。
 - **v0.10 变更**：等请求头的第一个字节用 `tunnelIdle`（默认 5 分钟），keep-alive 空等不再被 10s 的 `header_deadline` 切断。读到第一个字节之后才武装 `header_deadline`，绝对截止，后续字节不顺延。v0.9 的 `ProxyUnknownUpstream` 要求这三种失败至少 100 次并且超过全部尝试的一半。那个「一半」就是分母闸，不到一半的 `resolver_error` 和 5 分钟里不足 100 次的全灭都不会翻页；v0.9 里「不要求健康分母」的说法是错的。v0.10 撤掉这条页，改成 `ProxyResolverUpstream`：两条协议上 `empty_addr` 与 `resolver_error` 在 5 分钟里至少 10 次就翻页，没有比例，也没有健康分母。`unknown_node` 只上看板。共享口令在 `Resolve` 之前校验，所以它是已认证客户端写出了路由表没有的 node，不是未认证扫描，也不是 etcd 故障。半关闭一开始就停掉 `tunnelIdle`，这段拆除不记 `idle_timeout`。`Fail502` 和 `FailHTTP` 把集合外的 reason 记成 `other`。JSON 对象后面的多余数据拒绝。`{node_id="unknown",reason="no_upstream"}` 不再增加。计量事件在写入通道前计入未确认数，消费者落盘后调用 `FinishMeter`，`WaitMeterIdle` 才返回；通道变空不等于这行已经记入日志。§8 未改。
 - **v0.9 变更**：`Resolve` 的三种哨兵分开计数：`ErrUnknownNode` 是 `unknown_node`，地址为空是 `empty_addr`，其它解析错误是 `resolver_error`，`node_id` 都是 `unknown`。`ErrNoHealthyAddr` 仍保留原来的 `node_id` 和 `no_upstream`。失败率继续去掉 `unknown`。当时的 `ProxyUnknownUpstream` 要求 5 分钟里这三种失败至少 100 次，并且占全部尝试的一半以上。读请求头用单独的绝对截止 `header_deadline`（默认 10s）。CONNECT 隧道空闲到点记 `proxy_tunnel_abort_total{reason="idle_timeout"}`。`closeWrite` 失败两边都不当成隧道中断。配置拒绝未知字段，并限制时长上限，`half_close_idle` 不得大于 `tunnel_idle`。§8 未改。v0.10 修正了这条告警和请求头空等。
@@ -192,7 +193,7 @@ sequenceDiagram
     T-->>U: TLS ServerHello 及后续记录（经 L2、L1 原样返回）
 ```
 
-L1 必须先收到 L2 的 `200`（L2 已经与目标完成 TCP 握手），再向客户端回 `200`。在此之前客户端不应发出 ClientHello。客户端口令为空或不匹配时，L1 直接回 `407`，不拨 L2，计入 `proxy_client_reject_total{reason="auth"}`。目标不是 `host:port`（缺少端口）回 `400`，`reason="bad_target"`；用户名里没有 `node_id` 回 `400`，`reason="no_node"`。用户名或口令含 CR/LF 也是本地 `400`，`reason="bad_credential"`。这些本地 400/407 都不拨 L2。L2 返回 `407` 时，L1 把 `407` 和 `Proxy-Authenticate` 交给客户端，不改写成 `502`，计入 `proxy_upstream_fail_total{reason="l2_auth"}`。L2 的其他非 2xx、应答超时或拨号失败才转为 `502`，按 §7.1 的 `reason` 计入 `proxy_upstream_fail_total`。等待状态行时的读超时，且客户端读泵尚未结束，是 `reason="l2_response"`。客户端读泵先结束、状态行还没解析出来时记 `client_gone`，不记 `l2_response`。这些失败路径上都不会开始传输隧道字节。建连时延、连接时长和上下行字节的打点见 §7.1。L1→L2 这一跳按 §6 走内网，不加密。明文 HTTP 不向客户端回 `200 Connection Established`，见 §5.3。
+L1 必须先收到 L2 的 `200`（L2 已经与目标完成 TCP 握手），再向客户端回 `200`。在此之前客户端不应发出 ClientHello。客户端口令为空或不匹配时，L1 直接回 `407`，不拨 L2，计入 `proxy_client_reject_total{reason="auth"}`。目标不是 `host:port`（缺少端口）回 `400`，`reason="bad_target"`；用户名里没有 `node_id` 回 `400`，`reason="no_node"`。用户名或口令含 CR/LF 也是本地 `400`，`reason="bad_credential"`。这些本地 400/407 都不拨 L2。L2 返回 `407` 时，L1 把 `407` 和 `Proxy-Authenticate` 交给客户端，不改写成 `502`，计入 `proxy_upstream_fail_total{reason="l2_auth"}`。向 L2 写出 `CONNECT` 失败回 `502`，`reason="l2_write"`。设置或清除读截止时间失败回 `502`，`reason="l2_deadline"`。这两个 reason 已确认保留，见 §7.1。L2 的其他非 2xx、应答超时或拨号失败才转为 `502`，按 §7.1 的 `reason` 计入 `proxy_upstream_fail_total`。等待状态行时的读超时，且客户端读泵尚未结束，是 `reason="l2_response"`。客户端读泵先结束、状态行还没解析出来时记 `client_gone`，不记 `l2_response`。这些失败路径上都不会开始传输隧道字节。建连时延、连接时长和上下行字节的打点见 §7.1。L1→L2 这一跳按 §6 走内网，不加密。明文 HTTP 不向客户端回 `200 Connection Established`，见 §5.3。
 
 ### 5.2 流程图（路由决策）
 
@@ -283,9 +284,9 @@ Connection: close
 
 ### 5.5 改写、逐跳头、复用和正文
 
-请求行从 `METHOD SP absolute-URI SP HTTP/1.1` 改成 `METHOD SP origin-form SP HTTP/1.1`。方法、路径和 query 的字节保留，百分号不解码。没有路径时 origin-form 是 `/`。fragment 和 userinfo 丢掉，既不进入 CONNECT 目标，也不进入 origin-form。scheme 只接受 `http`（大小写不敏感）。`https://` 的明文请求回 400，应当改走 CONNECT。origin-form、`*` 以及没有 host 的请求也是 400。缺端口时 CONNECT 目标用 80。IPv6 保留方括号，例如 `[::1]:80`。
+请求行从 `METHOD SP absolute-URI SP HTTP/1.1` 改成 `METHOD SP origin-form SP HTTP/1.1`。方法、路径和 query 的字节保留，百分号不解码。没有路径时 origin-form 是 `/`。fragment 和 userinfo 丢掉，既不进入 CONNECT 目标，也不进入 origin-form。scheme 只接受 `http`（大小写不敏感）。以明文代理方式发来的 `https://` 请求回 400，提示改用 CONNECT。状态行是 `400 Bad Request`，不另写正文。origin-form、`*` 以及没有 host 的请求也是 400。缺端口时 CONNECT 目标用 80。IPv6 保留方括号，例如 `[::1]:80`。
 
-拨号用的 host:port 来自 absolute-URI，不来自 Host 头。Host 头有就原样保留，没有也不补。两者不一致时不改 Host。
+拨号用的 host:port 来自请求 URI（absolute-form）里的主机，不来自 Host 头。Host 头原样透传：有就按原字节保留，没有也不补。两者不一致时不改 Host。v0.12 已确认保留。
 
 按整行删除的逐跳头（名字大小写不敏感）：
 
@@ -300,16 +301,16 @@ Connection: close
 
 不添加 `Via`、`X-Forwarded-For`、`Forwarded`、`X-Real-IP`、`User-Agent`。客户端自己带了 `X-Forwarded-For` 就原样留下，不追加第二份。
 
-同一条客户端连接上的请求串行处理。上一个响应写完才读下一个，不把管道请求并发打到源站。bufio 里已经读进来的下一个请求留到当前响应结束。
+同一条客户端连接上的请求串行处理。上一个响应写完才读下一个，不把管道请求并发打到源站。bufio 里已经读进来的下一个请求留到当前响应结束。v0.12 已确认：同一连接不支持并发管道。
 
 Keep-alive：
 
 - 客户端一侧：HTTP/1.1 默认保持，除非 `Connection: close` 或 `Proxy-Connection: close`。HTTP/1.0 默认关闭，除非其中一个写了 `keep-alive`。
 - 源站一侧：HTTP/1.1 默认保持，除非 `Connection: close`，或者响应既没有 Content-Length 也没有 chunked（只能读到对端关闭）。HTTP/1.0 只有 `Connection: keep-alive` 才保持。
-- 一条客户端连接至多留一条 L2 隧道。下一条请求的 `node_id` 和 `host:port` 都相同，而且两边都还要保持，就把下一条请求写进同一条隧道，源站看到连接复用。主机或 node 变了，或者任一边要求关闭，就关掉隧道，下一条再发 CONNECT。
+- 一条客户端连接至多留一条 L2 隧道。下一条请求的 `node_id` 和 `host:port` 都相同，而且两边都还要保持，就把下一条请求写进同一条隧道，源站看到连接复用。v0.12 已确认保留此复用，不改成一请求一连接。主机或 node 变了，或者任一边要求关闭，就关掉隧道，下一条再发 CONNECT。
 - 每条请求都重新校验口令并切 `node_id`。同一条连接上可以换 node。
 
-正文按 `Content-Length` 或 chunked 原样转发。两个都没有，则正文为空，不把连接读到关闭。chunk 的 size 行、扩展和 trailer 原样拷贝；trailer 里不做逐跳头删除。HEAD 的响应不读正文。1xx、204、304 没有正文。
+正文按 `Content-Length` 或 chunked 原样转发。请求正文暂不设上限。两个都没有，则正文为空，不把连接读到关闭。chunk 的 size 行、扩展和 trailer 原样拷贝。响应 trailer 里的逐跳头不删除，v0.12 已确认保留。HEAD 的响应不读正文。1xx、204、304 没有正文。
 
 `Expect: 100-continue` 而且确实有正文时，L1 先只把头部写入隧道，不自己回 100。源站的 1xx（含 100）原样交给客户端。看到 100 之后才写正文，然后再读最终响应。源站直接给了最终响应（例如 417）就不写正文，并关掉这条客户端连接，避免还没消费的正文被当成下一个请求。已经向客户端写出过源站的任何字节（包括 100）之后，后续失败只关连接，不再补 502。
 
@@ -347,7 +348,7 @@ Upgrade（含 WebSocket）要同时满足：有非空的 `Upgrade`，并且 `Con
 
 后续：仓库里的数据面还在 `internal/docfixture`。生产 L1 二进制接上时，必须走 `LimitsFromConfig` 和同一组命令行（`-proxy-config`、`-tunnel-idle`、`-half-close-idle`、`-l2-response-timeout`、`-header-deadline`、`-retry-put-delete`），不要在进程里另写一套超时默认值。
 
-失败响应带 `Content-Length: 0` 和 `Connection: close`，随后关掉客户端连接。CONNECT 路径的失败响应格式不变。
+失败响应带 `Content-Length: 0` 和 `Connection: close`，随后关掉客户端连接。CONNECT 路径的失败响应格式不变：状态行和可选头之后直接是空行，不带这两项。v0.12 已确认保留这个差别。写 L2 失败、设置或清除读截止时间失败时回 502，原因分别记 `l2_write`、`l2_deadline`，已确认保留。已经向客户端写出源站字节之后的写出失败仍只关连接，不再补 502，见上表。
 
 超时不新造数字：
 
@@ -360,7 +361,7 @@ Upgrade（含 WebSocket）要同时满足：有非空的 `Upgrade`，并且 `Con
 
 等 L2 的 200 时，不再像 CONNECT 那样另开一个读端把客户端字节泵进 pipe。明文请求的正文还要按帧切开，多一个读端会把正文读丢。客户端要是在这 10 秒里断开，要等到这次读或写失败才发现，结果记 `l2_response`，不记 `client_gone`。CONNECT 有读泵，同一时刻记的是 `client_gone`。两边故意不一样，见 §7.3。上限仍是拨号 3 秒加上 `l2ResponseTimeout`。
 
-请求头超过 64KiB，或者头没有读完且不是超时，回 400，`reason="bad_target"`。请求行已经是 `CONNECT` 时进 `proxy_client_reject_total`。请求行还不是 `CONNECT`，包括请求行本身没读全、方法还看不出来，进 `proxy_http_client_reject_total{reason="bad_target"}`，不进 CONNECT 的拒绝计数。绝对的请求头截止到点、且已经读到一部分，记 `header_timeout`。一个字节都没有，包括请求头截止和隧道空闲，不计数。
+请求头超过 64KiB，或者头没有读完且不是超时，回 400，`reason="bad_target"`。请求正文暂不设上限，见 §5.5。请求行已经是 `CONNECT` 时进 `proxy_client_reject_total`。请求行还不是 `CONNECT`，包括请求行本身没读全、方法还看不出来，进 `proxy_http_client_reject_total{reason="bad_target"}`，不进 CONNECT 的拒绝计数。绝对的请求头截止到点、且已经读到一部分，记 `header_timeout`。一个字节都没有，包括请求头截止和隧道空闲，不计数。
 
 
 ## 6. TLS 指纹透传设计
@@ -434,7 +435,7 @@ L2 不负责这些指标。gost 自带的 metrics/observer 不在 M1 范围内�
 
 - `node_id`：本地路由表中已有的二级节点 ID，包含在表里但当前没有健康地址的节点。用户名里写出、但路由表从未收录的 ID 不进入标签，固定为 `unknown`。`ErrNoHealthyAddr` 保留原来的 ID，reason 是 `no_upstream`。`ErrUnknownNode` 记 `unknown_node`，地址为空记 `empty_addr`，其它解析错误记 `resolver_error`。这三条的 `node_id` 都是 `unknown`，避免把用户名里的任意 ID 写进标签。计量事件里的 `node_id` 是另一条规则，见下文，可以保留请求里的原值。
 - `result`（`proxy_connect_latency_ms`）：`ok`、`dial`、`l2_write`、`l2_deadline`、`l2_response`、`l2_status`、`l2_auth`、`client_gone`。失败值与 `proxy_upstream_fail_total` 的 reason 常量是同一组字符串，另加 `ok` 和 `client_gone`。没有 `no_upstream`，也没有本地拒绝的 reason。`ObserveConnect` 收到集合外的字符串时直接返回，不创建序列。
-- `reason`（`proxy_upstream_fail_total`）：`no_upstream`、`dial`、`l2_write`、`l2_deadline`、`l2_response`、`l2_status`、`l2_auth`，以及只出现在 `node_id="unknown"` 上的 `unknown_node`、`empty_addr`、`resolver_error`。常量导出，§10 在另一个包里按 `l1metrics.ReasonDial` 这种名字使用。`client_gone` 不在这个集合里。写错的字符串记 `reason="other"`，按调用方传入的 `node_id` 计数，不丢掉。
+- `reason`（`proxy_upstream_fail_total`）：`no_upstream`、`dial`、`l2_write`、`l2_deadline`、`l2_response`、`l2_status`、`l2_auth`，以及只出现在 `node_id="unknown"` 上的 `unknown_node`、`empty_addr`、`resolver_error`。常量导出，§10 在另一个包里按 `l1metrics.ReasonDial` 这种名字使用。`l2_write` 与 `l2_deadline` 留在这张 CONNECT 列表里：向 L2 写出失败记 `l2_write`，设置或清除读截止时间失败记 `l2_deadline`，都对客户端回 502。对应常量是 `ReasonL2Write`、`ReasonL2Deadline`。v0.12 已确认保留这两个名字。`client_gone` 不在这个集合里。写错的字符串记 `reason="other"`，按调用方传入的 `node_id` 计数，不丢掉。
 - `reason`（`proxy_client_reject_total`）：`auth`、`no_node`、`bad_target`、`bad_credential`、`header_timeout`。这个计数没有 `node_id`。`header_timeout` 是请求行已经是 `CONNECT`、并且已经读到一部分头才超时。
 - `reason`（`proxy_client_abort_total`）：只有 `client_gone`。其它字符串被 `ClientAbort` 丢掉。
 - `direction`（`proxy_tunnel_bytes_total`）：`up`（客户端 → L2）、`down`（L2 → 客户端）。其它字符串不累加。
@@ -533,8 +534,8 @@ v0.7 把明文 HTTP 算进 SLI，并且单独成指标。不在 `proxy_connect_l
 | `result` | 什么时候 | 失败计数 |
 | --- | --- | --- |
 | `dial` | 这条请求新开隧道，`dialUpstream` 失败 | `proxy_http_upstream_fail_total` |
-| `l2_write` | 向 L2 写出 `CONNECT` 失败，或把请求头、正文写进隧道失败。客户端已经看到源站字节时不再补 502，计数仍然加 | 同上 |
-| `l2_deadline` | 等 L2 的 CONNECT 状态行时 `SetReadDeadline` 失败 | 同上 |
+| `l2_write` | 向 L2 写出 `CONNECT` 失败，或把请求头、正文写进隧道失败。还没向客户端写出源站字节时回 502。已经看到源站字节时不再补 502，计数仍然加。这个 reason 已确认保留 | 同上 |
+| `l2_deadline` | 等 L2 的 CONNECT 状态行时，设置或清除读截止时间失败，回 502。这个 reason 已确认保留 | 同上 |
 | `l2_response` | 读不到 L2 的 CONNECT 状态行；或隧道起来之后、还没向客户端写出任何源站字节时，读不到合法的源站头，并且这次不是可重试的复用断开。等 L2 的 10 秒里客户端已经离开、但没有并行读泵，读超时仍是这个结果，不是 `client_gone`，见 §5.6 和 §7.3 | 同上。已经向客户端写过源站字节（含 `100`）就不再补 502，计数仍然加 |
 | `l2_auth` | L2 的 CONNECT 响应是 407。源站自己的 HTTP 状态不算 | 同上，客户端收到 407 |
 | `l2_status` | L2 的 CONNECT 响应不是 200 也不是 407。源站的 4xx/5xx 不是这个结果 | 同上，客户端收到 502 |
