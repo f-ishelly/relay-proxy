@@ -26,6 +26,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1203,6 +1204,7 @@ func TestLocalRejectsDoNotDial(t *testing.T) {
 		{"no-node", "app", "s3cret", "http://127.0.0.1/a", 400, l1metrics.ReasonRejectNoNode},
 		{"origin-form", "app@node-a", "s3cret", "/a", 400, l1metrics.ReasonRejectBadTarget},
 		{"https", "app@node-a", "s3cret", "https://example.com/a", 400, l1metrics.ReasonRejectBadTarget},
+		{"https-upper", "app@node-a", "s3cret", "HTTPS://example.com/a", 400, l1metrics.ReasonRejectBadTarget},
 	}
 	var dials atomic.Int32
 	lim := defaultLimits()
@@ -1241,8 +1243,379 @@ func TestLocalRejectsDoNotDial(t *testing.T) {
 			if tc.status == 407 && !bytes.Contains(resp, []byte("Proxy-Authenticate:")) {
 				t.Fatalf("missing challenge: %s", resp)
 			}
+			head, body := splitRawMessage(t, resp)
+			if tc.name == "https" || tc.name == "https-upper" {
+				if string(body) != httpsHintBody {
+					t.Fatalf("hint body %s", strconv.Quote(string(body)))
+				}
+				if got := contentLengthOf(t, head); got != len(body) || got != len(httpsHintBody) {
+					t.Fatalf("Content-Length %d body %d hint %d", got, len(body), len(httpsHintBody))
+				}
+				if !bytes.Contains(head, []byte("Content-Type: text/plain; charset=utf-8\r\n")) {
+					t.Fatalf("content-type missing: %s", strconv.Quote(string(head)))
+				}
+				if !bytes.Contains(head, []byte("\r\nConnection: close\r\n")) {
+					t.Fatalf("connection: %s", strconv.Quote(string(head)))
+				}
+			} else {
+				if len(body) != 0 {
+					t.Fatalf("body %s", strconv.Quote(string(body)))
+				}
+				if got := contentLengthOf(t, head); got != 0 {
+					t.Fatalf("Content-Length %d", got)
+				}
+				if !bytes.Contains(head, []byte("\r\nConnection: close\r\n")) {
+					t.Fatalf("connection: %s", strconv.Quote(string(head)))
+				}
+				if bytes.Contains(resp, []byte(httpsHintBody)) {
+					t.Fatalf("hint leaked into %s", tc.name)
+				}
+			}
 		})
 	}
+}
+
+func TestHTTPHeadLimit(t *testing.T) {
+	const target = "http://example/ok"
+	exact := sizedProxyHead(t, target, maxHTTPHead)
+	over := sizedProxyHead(t, target, maxHTTPHead+1)
+	if len(exact) != maxHTTPHead || len(over) != maxHTTPHead+1 {
+		t.Fatalf("sizes exact=%d over=%d limit=%d", len(exact), len(over), maxHTTPHead)
+	}
+
+	t.Run("exact", func(t *testing.T) {
+		resetMetrics()
+		got := make(chan []byte, 1)
+		fake := serveRaw(t, func(c net.Conn) {
+			defer c.Close()
+			_ = c.SetDeadline(time.Now().Add(4 * time.Second))
+			br := bufio.NewReaderSize(c, maxHTTPHead)
+			if _, err := readHTTPHead(br); err != nil {
+				return
+			}
+			if _, err := io.WriteString(c, "HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
+				return
+			}
+			raw, err := readOriginRequest(br)
+			if err != nil {
+				return
+			}
+			got <- raw
+			_, _ = io.WriteString(c, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+		})
+		l1 := startL1(t, mapResolver{m: map[string]string{"node-a": fake}})
+		resp := doRequest(t, l1, exact)
+		mustStatus(t, resp, 200)
+		select {
+		case raw := <-got:
+			if !bytes.HasPrefix(raw, []byte("GET /ok HTTP/1.1\r\n")) {
+				t.Fatalf("origin request %s", strconv.Quote(string(raw[:min(80, len(raw))])))
+			}
+			if !bytes.Contains(raw, []byte("\r\nX-Pad: ")) {
+				t.Fatal("padding header was not forwarded")
+			}
+			if bytes.Contains(raw, []byte("Proxy-Authorization")) {
+				t.Fatal("proxy authorization was forwarded")
+			}
+		default:
+			t.Fatal("exact-limit head was not forwarded")
+		}
+		handlers.Wait()
+		snap := snapMetrics()
+		if len(snap.HTTPRejects) != 0 {
+			t.Fatalf("exact head rejected %#v", snap.HTTPRejects)
+		}
+		if len(snap.HTTPObserves) != 1 || snap.HTTPObserves[0] != l1metrics.ResultOK {
+			t.Fatalf("observes %#v", snap.HTTPObserves)
+		}
+	})
+
+	t.Run("one-over", func(t *testing.T) {
+		resetMetrics()
+		var dials atomic.Int32
+		fake := serveRaw(t, func(c net.Conn) {
+			dials.Add(1)
+			_ = c.Close()
+		})
+		l1 := startL1(t, mapResolver{m: map[string]string{"node-a": fake}})
+		resp := doRequest(t, l1, over)
+		mustStatus(t, resp, 400)
+		head, body := splitRawMessage(t, resp)
+		if len(body) != 0 {
+			t.Fatalf("body %s", strconv.Quote(string(body)))
+		}
+		if got := contentLengthOf(t, head); got != 0 {
+			t.Fatalf("Content-Length %d", got)
+		}
+		if !bytes.Contains(head, []byte("\r\nConnection: close\r\n")) {
+			t.Fatalf("connection: %s", strconv.Quote(string(head)))
+		}
+		if dials.Load() != 0 {
+			t.Fatalf("over-limit head was forwarded, dials=%d", dials.Load())
+		}
+		handlers.Wait()
+		snap := snapMetrics()
+		if len(snap.HTTPRejects) != 1 || snap.HTTPRejects[0] != l1metrics.ReasonRejectBadTarget {
+			t.Fatalf("rejects %#v", snap.HTTPRejects)
+		}
+		if len(snap.Rejects) != 0 || len(snap.HTTPObserves) != 0 || len(snap.HTTPFails) != 0 {
+			t.Fatalf("over-limit counted elsewhere: %+v", snap)
+		}
+	})
+}
+
+func TestRejectDrainsUnreadThenEOF(t *testing.T) {
+	l1 := startL1(t, mapResolver{m: map[string]string{"node-a": "127.0.0.1:9"}})
+	token := basicToken("app@node-a", "s3cret")
+
+	t.Run("https-content-length", func(t *testing.T) {
+		resetMetrics()
+		const payload = "hello"
+		req := fmt.Sprintf("POST https://example.com/a HTTP/1.1\r\nHost: h\r\nContent-Length: %d\r\nProxy-Authorization: Basic %s\r\n\r\n%s",
+			len(payload), token, payload)
+		head, body := writeAndReadEOF(t, l1, []byte(req))
+		mustStatus(t, head, 400)
+		if string(body) != httpsHintBody {
+			t.Fatalf("hint %s", strconv.Quote(string(body)))
+		}
+		if got := contentLengthOf(t, head); got != len(body) {
+			t.Fatalf("Content-Length %d body %d", got, len(body))
+		}
+		handlers.Wait()
+		snap := snapMetrics()
+		if len(snap.HTTPRejects) != 1 || snap.HTTPRejects[0] != l1metrics.ReasonRejectBadTarget {
+			t.Fatalf("rejects %#v", snap.HTTPRejects)
+		}
+	})
+
+	t.Run("https-past-socket-buffer", func(t *testing.T) {
+		resetMetrics()
+		c, err := net.Dial("tcp", l1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		payload := bytes.Repeat([]byte("B"), unreadPastReceiveBuffer(t, c))
+		head := fmt.Sprintf("POST https://example.com/a HTTP/1.1\r\nHost: h\r\nContent-Length: %d\r\nProxy-Authorization: Basic %s\r\n\r\n",
+			len(payload), token)
+		respHead, respBody := writeAndReadEOF(t, "", append([]byte(head), payload...), c)
+		mustStatus(t, respHead, 400)
+		if string(respBody) != httpsHintBody {
+			t.Fatalf("hint %s", strconv.Quote(string(respBody)))
+		}
+		if got := contentLengthOf(t, respHead); got != len(httpsHintBody) || got != len(respBody) {
+			t.Fatalf("Content-Length %d body %d", got, len(respBody))
+		}
+		handlers.Wait()
+		snap := snapMetrics()
+		if len(snap.HTTPRejects) != 1 || snap.HTTPRejects[0] != l1metrics.ReasonRejectBadTarget {
+			t.Fatalf("rejects %#v", snap.HTTPRejects)
+		}
+	})
+
+	t.Run("oversize-head-trailing", func(t *testing.T) {
+		resetMetrics()
+		c, err := net.Dial("tcp", l1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		trailing := bytes.Repeat([]byte("T"), unreadPastReceiveBuffer(t, c))
+		raw := append([]byte(sizedProxyHead(t, "http://example/ok", maxHTTPHead+1)), trailing...)
+		head, body := writeAndReadEOF(t, "", raw, c)
+		mustStatus(t, head, 400)
+		if len(body) != 0 || contentLengthOf(t, head) != 0 {
+			t.Fatalf("want empty 400, body %d cl %d", len(body), contentLengthOf(t, head))
+		}
+		if !bytes.Contains(head, []byte("\r\nConnection: close\r\n")) {
+			t.Fatalf("connection: %s", strconv.Quote(string(head)))
+		}
+		handlers.Wait()
+		snap := snapMetrics()
+		if len(snap.HTTPRejects) != 1 || snap.HTTPRejects[0] != l1metrics.ReasonRejectBadTarget {
+			t.Fatalf("rejects %#v", snap.HTTPRejects)
+		}
+		if len(snap.Rejects) != 0 {
+			t.Fatalf("counted as connect %#v", snap.Rejects)
+		}
+	})
+}
+
+func TestSingleLineHeadLimit(t *testing.T) {
+	lim := defaultLimits()
+	lim.headerDeadline = 300 * time.Millisecond
+	l1 := startL1Limited(t, mapResolver{m: map[string]string{"node-a": "127.0.0.1:9"}}, lim)
+
+	// 正好 65536 且末尾是 \n：bufio 能切出这一行，不会返回 ErrBufferFull。
+	// 这一行已经用满上限，结尾空行放不下，必须马上 bad_target，不能空等 header_deadline。
+	t.Run("exact-with-newline", func(t *testing.T) {
+		resetMetrics()
+		line := bytes.Repeat([]byte("A"), maxHTTPHead)
+		line[len(line)-1] = '\n'
+		copy(line, []byte("GET "))
+		if len(line) != maxHTTPHead || line[len(line)-1] != '\n' {
+			t.Fatalf("line len %d", len(line))
+		}
+		head, body := writeAndReadEOF(t, l1, line)
+		mustStatus(t, head, 400)
+		if len(body) != 0 || contentLengthOf(t, head) != 0 {
+			t.Fatalf("body %d", len(body))
+		}
+		if !bytes.Contains(head, []byte("\r\nConnection: close\r\n")) {
+			t.Fatalf("connection: %s", strconv.Quote(string(head)))
+		}
+		handlers.Wait()
+		snap := snapMetrics()
+		if len(snap.HTTPRejects) != 1 || snap.HTTPRejects[0] != l1metrics.ReasonRejectBadTarget {
+			t.Fatalf("rejects %#v", snap.HTTPRejects)
+		}
+		for _, r := range snap.HTTPRejects {
+			if r == l1metrics.ReasonRejectHeaderTimeout {
+				t.Fatal("exact line counted as header_timeout")
+			}
+		}
+	})
+
+	// 65536 字节且没有换行：ReadSlice 返回 ErrBufferFull，同样是 bad_target。
+	t.Run("buffer-full", func(t *testing.T) {
+		resetMetrics()
+		line := bytes.Repeat([]byte("B"), maxHTTPHead)
+		copy(line, []byte("GET "))
+		if bytes.Contains(line, []byte("\n")) {
+			t.Fatal("line contains newline")
+		}
+		head, body := writeAndReadEOF(t, l1, line)
+		mustStatus(t, head, 400)
+		if len(body) != 0 || contentLengthOf(t, head) != 0 {
+			t.Fatalf("body %d", len(body))
+		}
+		handlers.Wait()
+		snap := snapMetrics()
+		if len(snap.HTTPRejects) != 1 || snap.HTTPRejects[0] != l1metrics.ReasonRejectBadTarget {
+			t.Fatalf("rejects %#v", snap.HTTPRejects)
+		}
+	})
+}
+
+// writeAndReadEOF writes raw and reads one response. The next read must be a
+// clean EOF, which is the server half-close, not ECONNRESET.
+// c may be nil; otherwise it is the already-dialed client (addr is ignored).
+func writeAndReadEOF(t *testing.T, addr string, raw []byte, c ...net.Conn) (head, body []byte) {
+	t.Helper()
+	var conn net.Conn
+	var err error
+	if len(c) > 0 && c[0] != nil {
+		conn = c[0]
+	} else {
+		conn, err = net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+	}
+	_ = conn.SetDeadline(time.Now().Add(4 * time.Second))
+	if _, err := conn.Write(raw); err != nil {
+		t.Fatal(err)
+	}
+	br := bufio.NewReader(conn)
+	head, err = readHTTPHead(br)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	body, err = readMessageBody(br, head, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var extra [8]byte
+	n, err := br.Read(extra[:])
+	if n != 0 || !errors.Is(err, io.EOF) {
+		t.Fatalf("after response want EOF, n=%d err=%v", n, err)
+	}
+	if errors.Is(err, syscall.ECONNRESET) {
+		t.Fatal("ECONNRESET")
+	}
+	return head, body
+}
+
+// unreadPastReceiveBuffer is larger than this socket's advertised receive
+// buffer and still within the server's 256KiB drain cap.
+func unreadPastReceiveBuffer(t *testing.T, c net.Conn) int {
+	t.Helper()
+	tcp, ok := c.(*net.TCPConn)
+	if !ok {
+		t.Fatalf("conn %T", c)
+	}
+	sc, err := tcp.SyscallConn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rcv int
+	ctrlErr := sc.Control(func(fd uintptr) {
+		rcv, err = syscall.GetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF)
+	})
+	if ctrlErr != nil || err != nil {
+		t.Fatal(ctrlErr, err)
+	}
+	n := rcv + 64<<10
+	if n > httpErrorDrainMax {
+		n = httpErrorDrainMax
+	}
+	if n <= rcv {
+		t.Fatalf("drain cap %d does not exceed SO_RCVBUF %d", httpErrorDrainMax, rcv)
+	}
+	return n
+}
+
+// sizedProxyHead builds a plain absolute-form request whose head, including the
+// terminating CRLFCRLF, is exactly n bytes. The padding lives in one X-Pad line.
+func sizedProxyHead(t *testing.T, target string, n int) string {
+	t.Helper()
+	prefix := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: h\r\nProxy-Authorization: Basic %s\r\nX-Pad: ",
+		target, basicToken("app@node-a", "s3cret"))
+	const suffix = "\r\n\r\n"
+	pad := n - len(prefix) - len(suffix)
+	if pad < 1 {
+		t.Fatalf("fixed head %d already exceeds %d", len(prefix)+len(suffix), n)
+	}
+	return prefix + strings.Repeat("a", pad) + suffix
+}
+
+func splitRawMessage(t *testing.T, raw []byte) (head, body []byte) {
+	t.Helper()
+	i := bytes.Index(raw, []byte("\r\n\r\n"))
+	if i < 0 {
+		t.Fatalf("no header terminator: %s", strconv.Quote(string(raw)))
+	}
+	return raw[:i+4], raw[i+4:]
+}
+
+func contentLengthOf(t *testing.T, head []byte) int {
+	t.Helper()
+	_, headers, err := splitHead(head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	n := 0
+	for _, ln := range headers {
+		name, _, ok := headerName(ln)
+		if !ok || !strings.EqualFold(string(name), "Content-Length") {
+			continue
+		}
+		v, err := strconv.Atoi(headerValue(ln))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if found && v != n {
+			t.Fatalf("conflicting content-length in %s", strconv.Quote(string(head)))
+		}
+		found = true
+		n = v
+	}
+	if !found {
+		t.Fatalf("no content-length in %s", strconv.Quote(string(head)))
+	}
+	return n
 }
 
 func TestBadCredentialDoesNotDial(t *testing.T) {

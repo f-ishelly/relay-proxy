@@ -257,7 +257,11 @@ func serveAbsolute(client net.Conn, session *httpSession, mc *modeConn, br *bufi
 		if req.targetErr != nil {
 			l1metrics.RejectHTTP(l1metrics.ReasonRejectBadTarget)
 			try.observe(l1metrics.ReasonRejectBadTarget)
-			writeHTTPError(client, http.StatusBadRequest, "Bad Request", "")
+			if errors.Is(req.targetErr, errHTTPSAbsolute) {
+				writeHTTPErrorBody(client, http.StatusBadRequest, "Bad Request", "", httpsHintBody)
+			} else {
+				writeHTTPError(client, http.StatusBadRequest, "Bad Request", "")
+			}
 			return req.targetErr
 		}
 		if host, port, serr := net.SplitHostPort(req.originTarget); serr == nil {
@@ -360,7 +364,12 @@ func parseAbsolute(head []byte) (*absReq, *httpReject) {
 	}
 	originForm, hostport, terr := parseHTTPAbsolute(rawTarget)
 	if terr != nil {
-		req.targetErr = terr
+		// https:// 与其它坏目标共用 bad_target，但响应要带上 CONNECT 提示正文。
+		if httpsAbsoluteForm(rawTarget) {
+			req.targetErr = errHTTPSAbsolute
+		} else {
+			req.targetErr = terr
+		}
 		return req, nil
 	}
 	req.originTarget = hostport
@@ -525,6 +534,15 @@ func wantsClose(version string, connToks, proxyToks []string) bool {
 		return !(hasToken(connToks, "keep-alive") || hasToken(proxyToks, "keep-alive"))
 	}
 	return false
+}
+
+// errHTTPSAbsolute 表示明文请求的 absolute-form 用了 https scheme。
+// 状态和 reason 与其它坏目标相同，响应正文用 httpsHintBody。
+var errHTTPSAbsolute = errors.New("https absolute-form")
+
+func httpsAbsoluteForm(raw string) bool {
+	scheme, _, ok := strings.Cut(raw, "://")
+	return ok && strings.EqualFold(scheme, "https")
 }
 
 // parseHTTPAbsolute 手工切 absolute-form，不经过 net/url，避免百分号解码和主机名大小写变化。
@@ -1253,7 +1271,22 @@ func upgradeAbortReason(upload, writeFailed bool, err error) string {
 	return l1metrics.ReasonAbortClientCancel
 }
 
+// httpsHintBody 是明文 https:// 请求的 400 正文。reason 仍是 bad_target。
+// 只有这一处明文错误带正文。CONNECT 的 reply 不经过 writeHTTPError。
+const httpsHintBody = "use CONNECT for https:// targets\n"
+
+// 明文错误关掉连接前，先把剩余请求字节读掉。上限和 net/http 的
+// maxPostHandlerReadBytes、rstAvoidanceDelay 同一量级：多了就不再读，时间到了也不再等。
+const (
+	httpErrorDrainTimeout = 500 * time.Millisecond
+	httpErrorDrainMax     = 256 << 10
+)
+
 func writeHTTPError(w io.Writer, status int, reason, header string) {
+	writeHTTPErrorBody(w, status, reason, header, "")
+}
+
+func writeHTTPErrorBody(w io.Writer, status int, reason, header, body string) {
 	var b strings.Builder
 	fmt.Fprintf(&b, "HTTP/1.1 %d %s\r\n", status, reason)
 	if header != "" {
@@ -1262,8 +1295,67 @@ func writeHTTPError(w io.Writer, status int, reason, header string) {
 			b.WriteString("\r\n")
 		}
 	}
-	b.WriteString("Content-Length: 0\r\nConnection: close\r\n\r\n")
-	_, _ = io.WriteString(w, b.String())
+	if body != "" {
+		b.WriteString("Content-Type: text/plain; charset=utf-8\r\n")
+		fmt.Fprintf(&b, "Content-Length: %d\r\n", len(body))
+	} else {
+		b.WriteString("Content-Length: 0\r\n")
+	}
+	b.WriteString("Connection: close\r\n\r\n")
+	b.WriteString(body)
+	bw := bufio.NewWriter(w)
+	_, _ = bw.WriteString(b.String())
+	_ = bw.Flush()
+	// 接收缓冲里还有未读请求时，直接 Close 会让内核发 RST，客户端可能丢 400。
+	// 先半关闭写端，限时限量读掉剩余字节，再完全关闭。
+	discardUnreadAfterError(w)
+}
+
+// discardUnreadAfterError 在响应已经写完之后调用。不支持半关闭的连接只读后关闭。
+func discardUnreadAfterError(w io.Writer) {
+	c, ok := w.(net.Conn)
+	if !ok {
+		return
+	}
+	raw := rawConn(c)
+	if cw, ok := raw.(interface{ CloseWrite() error }); ok {
+		_ = cw.CloseWrite()
+	}
+	_ = raw.SetReadDeadline(time.Now().Add(httpErrorDrainTimeout))
+	var n int64
+	buf := make([]byte, 32<<10)
+	for n < httpErrorDrainMax {
+		want := int64(len(buf))
+		if remain := httpErrorDrainMax - n; remain < want {
+			want = remain
+		}
+		nr, err := raw.Read(buf[:want])
+		n += int64(nr)
+		if err != nil || nr == 0 {
+			break
+		}
+	}
+	_ = raw.Close()
+}
+
+// rawConn 剥掉 modeConn / prefixConn，避免 Read 把排空用的短截止时间又改回隧道空闲。
+func rawConn(c net.Conn) net.Conn {
+	for {
+		switch u := c.(type) {
+		case *modeConn:
+			if u == nil || u.Conn == nil {
+				return c
+			}
+			c = u.Conn
+		case *prefixConn:
+			if u == nil || u.Conn == nil {
+				return c
+			}
+			c = u.Conn
+		default:
+			return c
+		}
+	}
 }
 
 // readRequestHead 先等请求头的第一个字节，这段用 tunnelIdle，keep-alive 空等可以到 5 分钟。
@@ -1291,6 +1383,7 @@ func readHTTPHead(r *bufio.Reader) ([]byte, error) {
 	for {
 		line, err := r.ReadSlice('\n')
 		if len(line) > 0 {
+			// 请求行、头行和结尾空行都计入。等于 maxHTTPHead 接受，多一个字节拒绝。
 			if buf.Len()+len(line) > maxHTTPHead {
 				return buf.Bytes(), fmt.Errorf("head too large")
 			}
@@ -1301,6 +1394,10 @@ func readHTTPHead(r *bufio.Reader) ([]byte, error) {
 		}
 		if err != nil {
 			return buf.Bytes(), err
+		}
+		// 非空行已经用满上限时，结尾空行必然超限。马上拒绝，不等 header_deadline。
+		if buf.Len() == maxHTTPHead && !isBlankLine(line) {
+			return buf.Bytes(), fmt.Errorf("head too large")
 		}
 		if isBlankLine(line) {
 			if buf.Len() == len(line) {

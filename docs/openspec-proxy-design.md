@@ -1,9 +1,10 @@
 # OpenSpec 设计文档：多级高性能隧道代理（Pro 模式）
 
-- **文档版本**：v0.12（明文转发与失败原因确认）
+- **文档版本**：v0.13（明文 https 提示正文）
 - **日期**：2026-11-03
 - **状态**：Draft / 可进入 PoC
 - **目标**：参考商业隧道代理 Pro 模式，设计“一级代理 + 二级代理”多级转发系统，支持通过 `username` 指定二级节点、TLS 指纹透传、应用层与 eBPF 监控、etcd 自动服务发现。
+- **v0.13 变更**：明文（非 CONNECT）请求的 absolute-form 使用 `https://` 时仍回 400，`reason` 仍是 `bad_target`，正文改为 `use CONNECT for https:// targets\n`，`Content-Type: text/plain; charset=utf-8`，`Content-Length` 等于正文字节数，并保留 `Connection: close`。没有正文的明文 HTTP 错误仍是 `Content-Length: 0` 和 `Connection: close`。CONNECT 的错误格式不变。请求头上限仍是 64KiB：请求行、头行和结尾空行都计入，正好 65536 字节接受并转发，多一个字节回 400，`reason="bad_target"`，`Content-Length: 0`。§8 未改。
 - **v0.12 变更**：h 确认保留 PR #14 第 4–9 条和 PR #10 第 1 条，行为不改。同节点、同 `host:port`、两端都 keep-alive 时复用 L2 隧道。转发目标取 absolute-form 里的主机，Host 头原样透传，缺失也不补。明文方式发来的 `https://` 回 400，提示改用 CONNECT。请求头超过 64KiB 回 400，`reason="bad_target"`；请求正文暂不设上限。明文 HTTP 的错误响应带 `Content-Length: 0` 和 `Connection: close`，CONNECT 的错误格式不变。同一条连接不支持并发管道；响应 trailer 里的逐跳头不删除。写 L2 失败、设置或清除读截止时间失败时回 502，原因分别是 `l2_write`、`l2_deadline`。§7 的 CONNECT reason 列表保留这两个名字。§8 未改。
 - **v0.11 变更**：`proxy_http_request_latency_ms` 只上看板，不设页，也还没有阈值。参考线等上线后 1 到 2 周的真实数据再画。源站 4xx/5xx 只要最终状态行完整写出，仍记 `ok`。`client_gone` 不进失败率。等 L2 时明文 HTTP 的客户端离开记 `l2_response` 并进失败率，看板上单看它占明文尝试的比例，不另设页。翻页的是各协议失败率、各协议 P95（明文用 `proxy_http_tunnel_setup_ms`）和对应的按节点页。5 分钟窗口至少 100 个请求，`for` 5 分钟。没有两侧合成的 P95。两侧失败率加总只上看板：它是按量加权平均，不会高于较高的那一侧；两边各 1.5% 时加总仍是 1.5%，不会越过 2%。`ProxyCombinedFailureRate` 撤掉。`stale_tunnel` 进失败。自动重试并且成功的那一次不记失败。`PUT` / `DELETE` 默认不重试，要打开 `retry_put_delete`。本版不把请求正文收进内存，只有 POST 的 `stale_tunnel` 明显变高时才再考虑缓存。含 `client_ip` 的原始计量日志保留 30 天。以后进 ClickHouse 不留原始 IP，或只留 IPv4 的 /24。附录 B 里 Decodo 用量统计写的 180 天是对方产品的保留期，不是这条原始 IP。路由表整表清掉、每个 id 都回 `ErrUnknownNode` 时仍然没有页，`unknown_node` 只上看板，本版不改。后续：生产 L1 进程还没接上 `LimitsFromConfig` 和同一组命令行时长。§8 未改。
 - **v0.10 变更**：等请求头的第一个字节用 `tunnelIdle`（默认 5 分钟），keep-alive 空等不再被 10s 的 `header_deadline` 切断。读到第一个字节之后才武装 `header_deadline`，绝对截止，后续字节不顺延。v0.9 的 `ProxyUnknownUpstream` 要求这三种失败至少 100 次并且超过全部尝试的一半。那个「一半」就是分母闸，不到一半的 `resolver_error` 和 5 分钟里不足 100 次的全灭都不会翻页；v0.9 里「不要求健康分母」的说法是错的。v0.10 撤掉这条页，改成 `ProxyResolverUpstream`：两条协议上 `empty_addr` 与 `resolver_error` 在 5 分钟里至少 10 次就翻页，没有比例，也没有健康分母。`unknown_node` 只上看板。共享口令在 `Resolve` 之前校验，所以它是已认证客户端写出了路由表没有的 node，不是未认证扫描，也不是 etcd 故障。半关闭一开始就停掉 `tunnelIdle`，这段拆除不记 `idle_timeout`。`Fail502` 和 `FailHTTP` 把集合外的 reason 记成 `other`。JSON 对象后面的多余数据拒绝。`{node_id="unknown",reason="no_upstream"}` 不再增加。计量事件在写入通道前计入未确认数，消费者落盘后调用 `FinishMeter`，`WaitMeterIdle` 才返回；通道变空不等于这行已经记入日志。§8 未改。
@@ -284,7 +285,7 @@ Connection: close
 
 ### 5.5 改写、逐跳头、复用和正文
 
-请求行从 `METHOD SP absolute-URI SP HTTP/1.1` 改成 `METHOD SP origin-form SP HTTP/1.1`。方法、路径和 query 的字节保留，百分号不解码。没有路径时 origin-form 是 `/`。fragment 和 userinfo 丢掉，既不进入 CONNECT 目标，也不进入 origin-form。scheme 只接受 `http`（大小写不敏感）。以明文代理方式发来的 `https://` 请求回 400，提示改用 CONNECT。状态行是 `400 Bad Request`，不另写正文。origin-form、`*` 以及没有 host 的请求也是 400。缺端口时 CONNECT 目标用 80。IPv6 保留方括号，例如 `[::1]:80`。
+请求行从 `METHOD SP absolute-URI SP HTTP/1.1` 改成 `METHOD SP origin-form SP HTTP/1.1`。方法、路径和 query 的字节保留，百分号不解码。没有路径时 origin-form 是 `/`。fragment 和 userinfo 丢掉，既不进入 CONNECT 目标，也不进入 origin-form。scheme 只接受 `http`（大小写不敏感）。以明文代理方式发来的 `https://` 请求（scheme 大小写不敏感）回 400，提示改用 CONNECT。状态行是 `400 Bad Request`，正文是纯文本 `use CONNECT for https:// targets\n`，`Content-Type: text/plain; charset=utf-8`，`Content-Length` 等于这段正文的字节数。`reason` 仍是 `bad_target`。不用 RFC 6585 的 431，是为了和已经确认的「坏目标一律 400 / `bad_target`」一致。还没通过口令校验的 `https://` 先回 407，客户端看不到这段提示。origin-form、`*`、其它 scheme 以及没有 host 的请求也是 400，但不带这段正文。缺端口时 CONNECT 目标用 80。IPv6 保留方括号，例如 `[::1]:80`。
 
 拨号用的 host:port 来自请求 URI（absolute-form）里的主机，不来自 Host 头。Host 头原样透传：有就按原字节保留，没有也不补。两者不一致时不改 Host。v0.12 已确认保留。
 
@@ -348,7 +349,7 @@ Upgrade（含 WebSocket）要同时满足：有非空的 `Upgrade`，并且 `Con
 
 后续：仓库里的数据面还在 `internal/docfixture`。生产 L1 二进制接上时，必须走 `LimitsFromConfig` 和同一组命令行（`-proxy-config`、`-tunnel-idle`、`-half-close-idle`、`-l2-response-timeout`、`-header-deadline`、`-retry-put-delete`），不要在进程里另写一套超时默认值。
 
-失败响应带 `Content-Length: 0` 和 `Connection: close`，随后关掉客户端连接。CONNECT 路径的失败响应格式不变：状态行和可选头之后直接是空行，不带这两项。v0.12 已确认保留这个差别。写 L2 失败、设置或清除读截止时间失败时回 502，原因分别记 `l2_write`、`l2_deadline`，已确认保留。已经向客户端写出源站字节之后的写出失败仍只关连接，不再补 502，见上表。
+失败响应带 `Connection: close`。没有正文时 `Content-Length: 0`。正文存在时（只有明文 `https://` 的 CONNECT 提示）`Content-Length` 等于正文字节数，并带 `Content-Type: text/plain; charset=utf-8`。响应刷出之后，连接若支持半关闭就先 `CloseWrite`，再在 500ms 内最多读掉 256KiB 剩余请求字节，然后关闭，避免接收缓冲里还有数据时内核发 RST。CONNECT 路径的失败响应格式不变：状态行和可选头之后直接是空行，不带这两项。v0.12 已确认保留这个差别，v0.13 只给上述提示补上正文。写 L2 失败、设置或清除读截止时间失败时回 502，原因分别记 `l2_write`、`l2_deadline`，已确认保留。已经向客户端写出源站字节之后的写出失败仍只关连接，不再补 502，见上表。
 
 超时不新造数字：
 
@@ -361,7 +362,7 @@ Upgrade（含 WebSocket）要同时满足：有非空的 `Upgrade`，并且 `Con
 
 等 L2 的 200 时，不再像 CONNECT 那样另开一个读端把客户端字节泵进 pipe。明文请求的正文还要按帧切开，多一个读端会把正文读丢。客户端要是在这 10 秒里断开，要等到这次读或写失败才发现，结果记 `l2_response`，不记 `client_gone`。CONNECT 有读泵，同一时刻记的是 `client_gone`。两边故意不一样，见 §7.3。上限仍是拨号 3 秒加上 `l2ResponseTimeout`。
 
-请求头超过 64KiB，或者头没有读完且不是超时，回 400，`reason="bad_target"`。请求正文暂不设上限，见 §5.5。请求行已经是 `CONNECT` 时进 `proxy_client_reject_total`。请求行还不是 `CONNECT`，包括请求行本身没读全、方法还看不出来，进 `proxy_http_client_reject_total{reason="bad_target"}`，不进 CONNECT 的拒绝计数。绝对的请求头截止到点、且已经读到一部分，记 `header_timeout`。一个字节都没有，包括请求头截止和隧道空闲，不计数。
+请求头超过 64KiB，或者头没有读完且不是超时，回 400，`reason="bad_target"`。这 64KiB 是 `maxHTTPHead`（`64<<10`，65536 字节）。读头时按行累加，请求行、每一个头行和结尾空行都算，含行尾的 CR/LF。某一行会让累计长度大于 65536 时，这一行不算进已接受的头部，直接 400。正好 65536 字节的完整请求头被接受并转发；65537 字节回 400，`Content-Length: 0`，`Connection: close`。单独一行正好 65536 字节且末尾是换行时，后面已经放不下结尾空行，立刻 400；缓冲被塞满且这一行没有换行（`bufio.ErrBufferFull`）同样立刻 400。这两种都是 `bad_target`，不等 `header_deadline`。请求正文不计入，暂不设上限，见 §5.5。请求行已经是 `CONNECT` 时进 `proxy_client_reject_total`。请求行还不是 `CONNECT`，包括请求行本身没读全、方法还看不出来，进 `proxy_http_client_reject_total{reason="bad_target"}`，不进 CONNECT 的拒绝计数。绝对的请求头截止到点、且已经读到一部分，记 `header_timeout`。一个字节都没有，包括请求头截止和隧道空闲，不计数。
 
 
 ## 6. TLS 指纹透传设计
@@ -2396,7 +2397,11 @@ func serveAbsolute(client net.Conn, session *httpSession, mc *modeConn, br *bufi
 		if req.targetErr != nil {
 			l1metrics.RejectHTTP(l1metrics.ReasonRejectBadTarget)
 			try.observe(l1metrics.ReasonRejectBadTarget)
-			writeHTTPError(client, http.StatusBadRequest, "Bad Request", "")
+			if errors.Is(req.targetErr, errHTTPSAbsolute) {
+				writeHTTPErrorBody(client, http.StatusBadRequest, "Bad Request", "", httpsHintBody)
+			} else {
+				writeHTTPError(client, http.StatusBadRequest, "Bad Request", "")
+			}
 			return req.targetErr
 		}
 		if host, port, serr := net.SplitHostPort(req.originTarget); serr == nil {
@@ -2499,7 +2504,12 @@ func parseAbsolute(head []byte) (*absReq, *httpReject) {
 	}
 	originForm, hostport, terr := parseHTTPAbsolute(rawTarget)
 	if terr != nil {
-		req.targetErr = terr
+		// https:// 与其它坏目标共用 bad_target，但响应要带上 CONNECT 提示正文。
+		if httpsAbsoluteForm(rawTarget) {
+			req.targetErr = errHTTPSAbsolute
+		} else {
+			req.targetErr = terr
+		}
 		return req, nil
 	}
 	req.originTarget = hostport
@@ -2664,6 +2674,15 @@ func wantsClose(version string, connToks, proxyToks []string) bool {
 		return !(hasToken(connToks, "keep-alive") || hasToken(proxyToks, "keep-alive"))
 	}
 	return false
+}
+
+// errHTTPSAbsolute 表示明文请求的 absolute-form 用了 https scheme。
+// 状态和 reason 与其它坏目标相同，响应正文用 httpsHintBody。
+var errHTTPSAbsolute = errors.New("https absolute-form")
+
+func httpsAbsoluteForm(raw string) bool {
+	scheme, _, ok := strings.Cut(raw, "://")
+	return ok && strings.EqualFold(scheme, "https")
 }
 
 // parseHTTPAbsolute 手工切 absolute-form，不经过 net/url，避免百分号解码和主机名大小写变化。
@@ -3392,7 +3411,22 @@ func upgradeAbortReason(upload, writeFailed bool, err error) string {
 	return l1metrics.ReasonAbortClientCancel
 }
 
+// httpsHintBody 是明文 https:// 请求的 400 正文。reason 仍是 bad_target。
+// 只有这一处明文错误带正文。CONNECT 的 reply 不经过 writeHTTPError。
+const httpsHintBody = "use CONNECT for https:// targets\n"
+
+// 明文错误关掉连接前，先把剩余请求字节读掉。上限和 net/http 的
+// maxPostHandlerReadBytes、rstAvoidanceDelay 同一量级：多了就不再读，时间到了也不再等。
+const (
+	httpErrorDrainTimeout = 500 * time.Millisecond
+	httpErrorDrainMax     = 256 << 10
+)
+
 func writeHTTPError(w io.Writer, status int, reason, header string) {
+	writeHTTPErrorBody(w, status, reason, header, "")
+}
+
+func writeHTTPErrorBody(w io.Writer, status int, reason, header, body string) {
 	var b strings.Builder
 	fmt.Fprintf(&b, "HTTP/1.1 %d %s\r\n", status, reason)
 	if header != "" {
@@ -3401,8 +3435,67 @@ func writeHTTPError(w io.Writer, status int, reason, header string) {
 			b.WriteString("\r\n")
 		}
 	}
-	b.WriteString("Content-Length: 0\r\nConnection: close\r\n\r\n")
-	_, _ = io.WriteString(w, b.String())
+	if body != "" {
+		b.WriteString("Content-Type: text/plain; charset=utf-8\r\n")
+		fmt.Fprintf(&b, "Content-Length: %d\r\n", len(body))
+	} else {
+		b.WriteString("Content-Length: 0\r\n")
+	}
+	b.WriteString("Connection: close\r\n\r\n")
+	b.WriteString(body)
+	bw := bufio.NewWriter(w)
+	_, _ = bw.WriteString(b.String())
+	_ = bw.Flush()
+	// 接收缓冲里还有未读请求时，直接 Close 会让内核发 RST，客户端可能丢 400。
+	// 先半关闭写端，限时限量读掉剩余字节，再完全关闭。
+	discardUnreadAfterError(w)
+}
+
+// discardUnreadAfterError 在响应已经写完之后调用。不支持半关闭的连接只读后关闭。
+func discardUnreadAfterError(w io.Writer) {
+	c, ok := w.(net.Conn)
+	if !ok {
+		return
+	}
+	raw := rawConn(c)
+	if cw, ok := raw.(interface{ CloseWrite() error }); ok {
+		_ = cw.CloseWrite()
+	}
+	_ = raw.SetReadDeadline(time.Now().Add(httpErrorDrainTimeout))
+	var n int64
+	buf := make([]byte, 32<<10)
+	for n < httpErrorDrainMax {
+		want := int64(len(buf))
+		if remain := httpErrorDrainMax - n; remain < want {
+			want = remain
+		}
+		nr, err := raw.Read(buf[:want])
+		n += int64(nr)
+		if err != nil || nr == 0 {
+			break
+		}
+	}
+	_ = raw.Close()
+}
+
+// rawConn 剥掉 modeConn / prefixConn，避免 Read 把排空用的短截止时间又改回隧道空闲。
+func rawConn(c net.Conn) net.Conn {
+	for {
+		switch u := c.(type) {
+		case *modeConn:
+			if u == nil || u.Conn == nil {
+				return c
+			}
+			c = u.Conn
+		case *prefixConn:
+			if u == nil || u.Conn == nil {
+				return c
+			}
+			c = u.Conn
+		default:
+			return c
+		}
+	}
 }
 
 // readRequestHead 先等请求头的第一个字节，这段用 tunnelIdle，keep-alive 空等可以到 5 分钟。
@@ -3430,6 +3523,7 @@ func readHTTPHead(r *bufio.Reader) ([]byte, error) {
 	for {
 		line, err := r.ReadSlice('\n')
 		if len(line) > 0 {
+			// 请求行、头行和结尾空行都计入。等于 maxHTTPHead 接受，多一个字节拒绝。
 			if buf.Len()+len(line) > maxHTTPHead {
 				return buf.Bytes(), fmt.Errorf("head too large")
 			}
@@ -3440,6 +3534,10 @@ func readHTTPHead(r *bufio.Reader) ([]byte, error) {
 		}
 		if err != nil {
 			return buf.Bytes(), err
+		}
+		// 非空行已经用满上限时，结尾空行必然超限。马上拒绝，不等 header_deadline。
+		if buf.Len() == maxHTTPHead && !isBlankLine(line) {
+			return buf.Bytes(), fmt.Errorf("head too large")
 		}
 		if isBlankLine(line) {
 			if buf.Len() == len(line) {
