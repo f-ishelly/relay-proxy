@@ -437,6 +437,8 @@ func scanHeaders(headers [][]byte) (connToks, proxyToks []string, chunked bool, 
 // rewriteHead 把请求行改成 origin-form，删掉逐跳头，其余头行按原字节顺序和大小写保留。
 // 不添加 Via、X-Forwarded-For、Forwarded、User-Agent。
 // Connection 是唯一可能改值的头：只删掉那些指向已被删除头的 token。token 集合没变时整行不动。
+// Host 不在可删除的集合里。Connection 点名 host（大小写不敏感）时保留 Host 行，
+// 因此 host 这个 token 也留在 Connection 里。
 func rewriteHead(method, originForm, version string, headers [][]byte, chunked, upgrade bool, connToks []string) []byte {
 	drop := map[string]bool{
 		"proxy-authorization": true,
@@ -450,16 +452,18 @@ func rewriteHead(method, originForm, version string, headers [][]byte, chunked, 
 		// 同时带 Content-Length 和 chunked 时删掉 Content-Length，避免请求走私。
 		drop["content-length"] = true
 	}
+	// Connection 点名的头按名字删除，但 Host 除外（大小写不敏感）。
 	for _, t := range connToks {
 		lt := strings.ToLower(t)
 		switch lt {
-		case "close", "keep-alive", "upgrade", "transfer-encoding":
+		case "close", "keep-alive", "upgrade", "transfer-encoding", "host":
 			continue
 		default:
 			drop[lt] = true
 		}
 	}
 	delete(drop, "transfer-encoding")
+	delete(drop, "host")
 	if upgrade {
 		delete(drop, "upgrade")
 	}

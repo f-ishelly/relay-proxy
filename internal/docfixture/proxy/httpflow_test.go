@@ -1935,6 +1935,101 @@ func TestAbsoluteFormMutations(t *testing.T) {
 	}
 }
 
+func TestConnectionListedHostSurvives(t *testing.T) {
+	cases := []struct {
+		name    string
+		headers string
+		want    string
+	}{
+		{
+			name:    "host-token",
+			headers: "hOsT: KeepMe.Example\r\nConnection: host\r\n",
+			want:    "GET /h HTTP/1.1\r\nhOsT: KeepMe.Example\r\nConnection: host\r\n\r\n",
+		},
+		{
+			name:    "mixed-case-with-other-hop",
+			headers: "hOsT: KeepMe.Example\r\nConnection: Host, x-hop\r\nx-hop: secret\r\nX-Keep: yes\r\n",
+			want:    "GET /h HTTP/1.1\r\nhOsT: KeepMe.Example\r\nConnection: Host\r\nX-Keep: yes\r\n\r\n",
+		},
+		{
+			name:    "upper-token",
+			headers: "Host: KeepMe.Example\r\nConnection: HOST, X-Hop\r\nX-Hop: secret\r\n",
+			want:    "GET /h HTTP/1.1\r\nHost: KeepMe.Example\r\nConnection: HOST\r\n\r\n",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gotCh := make(chan []byte, 1)
+			fake := serveRaw(t, func(c net.Conn) {
+				defer c.Close()
+				_ = c.SetDeadline(time.Now().Add(3 * time.Second))
+				br := bufio.NewReader(c)
+				if _, err := readHTTPHead(br); err != nil {
+					return
+				}
+				if _, err := io.WriteString(c, "HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
+					return
+				}
+				raw, err := readOriginRequest(br)
+				if err != nil {
+					return
+				}
+				gotCh <- raw
+				_, _ = io.WriteString(c, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+			})
+			l1 := startL1(t, mapResolver{m: map[string]string{"node-a": fake}})
+			req := fmt.Sprintf("GET http://%s/h HTTP/1.1\r\n%sProxy-Authorization: Basic %s\r\n\r\n",
+				fake, tc.headers, basicToken("app@node-a", "s3cret"))
+			resp := doRequest(t, l1, req)
+			mustStatus(t, resp, 200)
+			select {
+			case got := <-gotCh:
+				if string(got) != tc.want {
+					t.Fatalf("origin head\n got %s\nwant %s", strconv.Quote(string(got)), strconv.Quote(tc.want))
+				}
+				if bytes.Contains(bytes.ToLower(got), []byte("\r\nx-hop:")) {
+					t.Fatalf("connection-listed hop survived: %s", strconv.Quote(string(got)))
+				}
+			default:
+				t.Fatal("fake l2 saw no origin request")
+			}
+		})
+	}
+}
+
+func TestUnauthenticatedHTTPSHasNoConnectHint(t *testing.T) {
+	resetMetrics()
+	var dials atomic.Int32
+	lim := defaultLimits()
+	lim.dial = countingDial(&dials)
+	l1 := startL1Limited(t, mapResolver{m: map[string]string{"node-a": "127.0.0.1:9"}}, lim)
+	req := "GET https://example.com/a HTTP/1.1\r\nHost: example.com\r\n\r\n"
+	resp := doRequest(t, l1, req)
+	mustStatus(t, resp, http.StatusProxyAuthRequired)
+	if bytes.Contains(resp, []byte(httpsHintBody)) {
+		t.Fatalf("hint leaked: %s", strconv.Quote(string(resp)))
+	}
+	head, body := splitRawMessage(t, resp)
+	if len(body) != 0 {
+		t.Fatalf("body %s", strconv.Quote(string(body)))
+	}
+	if got := contentLengthOf(t, head); got != 0 {
+		t.Fatalf("Content-Length %d", got)
+	}
+	if !bytes.Contains(head, []byte("Proxy-Authenticate:")) {
+		t.Fatalf("missing challenge: %s", strconv.Quote(string(head)))
+	}
+	if dials.Load() != 0 {
+		t.Fatalf("dialed %d", dials.Load())
+	}
+	handlers.Wait()
+	snap := snapMetrics()
+	if len(snap.HTTPRejects) != 1 || snap.HTTPRejects[0] != l1metrics.ReasonRejectAuth {
+		t.Fatalf("rejects %#v", snap.HTTPRejects)
+	}
+	assertNoConnectMetrics(t, snap)
+}
+
 func TestHopHeaderStripAndHEAD(t *testing.T) {
 	requireGost(t)
 	gotCh := make(chan []byte, 1)

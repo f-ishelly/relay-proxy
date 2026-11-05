@@ -1,9 +1,10 @@
 # OpenSpec 设计文档：多级高性能隧道代理（Pro 模式）
 
-- **文档版本**：v0.13（明文 https 提示正文）
-- **日期**：2026-11-03
+- **文档版本**：v0.14（Host 不因 Connection 删除）
+- **日期**：2026-11-05
 - **状态**：Draft / 可进入 PoC
 - **目标**：参考商业隧道代理 Pro 模式，设计“一级代理 + 二级代理”多级转发系统，支持通过 `username` 指定二级节点、TLS 指纹透传、应用层与 eBPF 监控、etcd 自动服务发现。
+- **v0.14 变更**：`Connection` 里的 `host`（大小写不敏感）不再让 Host 头被逐跳删除。Host 行按原字节留下，`host` 这个 token 也留在 `Connection` 里，因为只去掉指向已删除头的 token。其它被 `Connection` 点名的头仍然删除。请求和响应两个方向的 chunk trailer 都原样拷贝，不改字节，也不删 trailer 里的逐跳头。明文 `https://` 在口令未通过时仍先回 407、不带 CONNECT 提示；用户名切不出 `node_id` 时先回 400（`no_node`），同样不带这段提示。请求头超过 64KiB 仍回 400 / `bad_target`，不用 RFC 6585 的 431；这条理由写在请求头上限一节。§8 未改。
 - **v0.13 变更**：明文（非 CONNECT）请求的 absolute-form 使用 `https://` 时仍回 400，`reason` 仍是 `bad_target`，正文改为 `use CONNECT for https:// targets\n`，`Content-Type: text/plain; charset=utf-8`，`Content-Length` 等于正文字节数，并保留 `Connection: close`。没有正文的明文 HTTP 错误仍是 `Content-Length: 0` 和 `Connection: close`。CONNECT 的错误格式不变。请求头上限仍是 64KiB：请求行、头行和结尾空行都计入，正好 65536 字节接受并转发，多一个字节回 400，`reason="bad_target"`，`Content-Length: 0`。§8 未改。
 - **v0.12 变更**：h 确认保留 PR #14 第 4–9 条和 PR #10 第 1 条，行为不改。同节点、同 `host:port`、两端都 keep-alive 时复用 L2 隧道。转发目标取 absolute-form 里的主机，Host 头原样透传，缺失也不补。明文方式发来的 `https://` 回 400，提示改用 CONNECT。请求头超过 64KiB 回 400，`reason="bad_target"`；请求正文暂不设上限。明文 HTTP 的错误响应带 `Content-Length: 0` 和 `Connection: close`，CONNECT 的错误格式不变。同一条连接不支持并发管道；响应 trailer 里的逐跳头不删除。写 L2 失败、设置或清除读截止时间失败时回 502，原因分别是 `l2_write`、`l2_deadline`。§7 的 CONNECT reason 列表保留这两个名字。§8 未改。
 - **v0.11 变更**：`proxy_http_request_latency_ms` 只上看板，不设页，也还没有阈值。参考线等上线后 1 到 2 周的真实数据再画。源站 4xx/5xx 只要最终状态行完整写出，仍记 `ok`。`client_gone` 不进失败率。等 L2 时明文 HTTP 的客户端离开记 `l2_response` 并进失败率，看板上单看它占明文尝试的比例，不另设页。翻页的是各协议失败率、各协议 P95（明文用 `proxy_http_tunnel_setup_ms`）和对应的按节点页。5 分钟窗口至少 100 个请求，`for` 5 分钟。没有两侧合成的 P95。两侧失败率加总只上看板：它是按量加权平均，不会高于较高的那一侧；两边各 1.5% 时加总仍是 1.5%，不会越过 2%。`ProxyCombinedFailureRate` 撤掉。`stale_tunnel` 进失败。自动重试并且成功的那一次不记失败。`PUT` / `DELETE` 默认不重试，要打开 `retry_put_delete`。本版不把请求正文收进内存，只有 POST 的 `stale_tunnel` 明显变高时才再考虑缓存。含 `client_ip` 的原始计量日志保留 30 天。以后进 ClickHouse 不留原始 IP，或只留 IPv4 的 /24。附录 B 里 Decodo 用量统计写的 180 天是对方产品的保留期，不是这条原始 IP。路由表整表清掉、每个 id 都回 `ErrUnknownNode` 时仍然没有页，`unknown_node` 只上看板，本版不改。后续：生产 L1 进程还没接上 `LimitsFromConfig` 和同一组命令行时长。§8 未改。
@@ -285,14 +286,14 @@ Connection: close
 
 ### 5.5 改写、逐跳头、复用和正文
 
-请求行从 `METHOD SP absolute-URI SP HTTP/1.1` 改成 `METHOD SP origin-form SP HTTP/1.1`。方法、路径和 query 的字节保留，百分号不解码。没有路径时 origin-form 是 `/`。fragment 和 userinfo 丢掉，既不进入 CONNECT 目标，也不进入 origin-form。scheme 只接受 `http`（大小写不敏感）。以明文代理方式发来的 `https://` 请求（scheme 大小写不敏感）回 400，提示改用 CONNECT。状态行是 `400 Bad Request`，正文是纯文本 `use CONNECT for https:// targets\n`，`Content-Type: text/plain; charset=utf-8`，`Content-Length` 等于这段正文的字节数。`reason` 仍是 `bad_target`。不用 RFC 6585 的 431，是为了和已经确认的「坏目标一律 400 / `bad_target`」一致。还没通过口令校验的 `https://` 先回 407，客户端看不到这段提示。origin-form、`*`、其它 scheme 以及没有 host 的请求也是 400，但不带这段正文。缺端口时 CONNECT 目标用 80。IPv6 保留方括号，例如 `[::1]:80`。
+请求行从 `METHOD SP absolute-URI SP HTTP/1.1` 改成 `METHOD SP origin-form SP HTTP/1.1`。方法、路径和 query 的字节保留，百分号不解码。没有路径时 origin-form 是 `/`。fragment 和 userinfo 丢掉，既不进入 CONNECT 目标，也不进入 origin-form。scheme 只接受 `http`（大小写不敏感）。以明文代理方式发来的 `https://` 请求（scheme 大小写不敏感）回 400，提示改用 CONNECT。状态行是 `400 Bad Request`，正文是纯文本 `use CONNECT for https:// targets\n`，`Content-Type: text/plain; charset=utf-8`，`Content-Length` 等于这段正文的字节数。`reason` 仍是 `bad_target`。还没通过口令校验的 `https://` 先回 407，客户端看不到这段提示。用户名切不出 `node_id` 时先回 400，`reason` 是 `no_node`，也不带这段 CONNECT 提示。origin-form、`*`、其它 scheme 以及没有 host 的请求也是 400，但不带这段正文。缺端口时 CONNECT 目标用 80。IPv6 保留方括号，例如 `[::1]:80`。
 
-拨号用的 host:port 来自请求 URI（absolute-form）里的主机，不来自 Host 头。Host 头原样透传：有就按原字节保留，没有也不补。两者不一致时不改 Host。v0.12 已确认保留。
+拨号用的 host:port 来自请求 URI（absolute-form）里的主机，不来自 Host 头。Host 头原样透传：有就按原字节保留，没有也不补。两者不一致时不改 Host。v0.12 已确认保留。`Connection` 点名 `host`（大小写不敏感，例如 `Connection: host` 或 `Connection: Host`）时也不删除 Host 行。`host` 没有指向一个被删掉的头，所以这个 token 留在 `Connection` 里；token 集合因此没变时，这一行连空格都保持原样。其它被 `Connection` 点名的头仍然按行删除，对应 token 也去掉。
 
 按整行删除的逐跳头（名字大小写不敏感）：
 
 - `Proxy-Authorization`、`Proxy-Connection`、`Keep-Alive`、`TE`、`Trailer`、`Proxy-Authenticate`
-- `Connection` 里点名的头。`close`、`keep-alive`、`upgrade`、`transfer-encoding` 这四个是指令，不按头名删除
+- `Connection` 里点名的头。`close`、`keep-alive`、`upgrade`、`transfer-encoding` 这四个是指令，不按头名删除。`host`（大小写不敏感）同样不按头名删除
 
 `Transfer-Encoding` 保留。正文按客户端的 chunked 帧原样拷贝，不解码再编码。同时带有 `Transfer-Encoding: chunked` 和 `Content-Length` 时删掉 `Content-Length`，避免请求走私。
 
@@ -311,7 +312,7 @@ Keep-alive：
 - 一条客户端连接至多留一条 L2 隧道。下一条请求的 `node_id` 和 `host:port` 都相同，而且两边都还要保持，就把下一条请求写进同一条隧道，源站看到连接复用。v0.12 已确认保留此复用，不改成一请求一连接。主机或 node 变了，或者任一边要求关闭，就关掉隧道，下一条再发 CONNECT。
 - 每条请求都重新校验口令并切 `node_id`。同一条连接上可以换 node。
 
-正文按 `Content-Length` 或 chunked 原样转发。请求正文暂不设上限。两个都没有，则正文为空，不把连接读到关闭。chunk 的 size 行、扩展和 trailer 原样拷贝。响应 trailer 里的逐跳头不删除，v0.12 已确认保留。HEAD 的响应不读正文。1xx、204、304 没有正文。
+正文按 `Content-Length` 或 chunked 原样转发。请求正文暂不设上限。两个都没有，则正文为空，不把连接读到关闭。chunk 的 size 行、扩展和 trailer 原样拷贝：请求正文和响应正文两个方向都按读到的字节转发，不改 trailer 行，也不删除 trailer 里的逐跳头。v0.12 已确认响应侧不删 trailer 里的逐跳头；请求侧走同一段拷贝。这里说的是 chunk 帧后面的 trailer 块。请求头里的 `Trailer` 字段仍按逐跳头删除。HEAD 的响应不读正文。1xx、204、304 没有正文。
 
 `Expect: 100-continue` 而且确实有正文时，L1 先只把头部写入隧道，不自己回 100。源站的 1xx（含 100）原样交给客户端。看到 100 之后才写正文，然后再读最终响应。源站直接给了最终响应（例如 417）就不写正文，并关掉这条客户端连接，避免还没消费的正文被当成下一个请求。已经向客户端写出过源站的任何字节（包括 100）之后，后续失败只关连接，不再补 502。
 
@@ -362,7 +363,7 @@ Upgrade（含 WebSocket）要同时满足：有非空的 `Upgrade`，并且 `Con
 
 等 L2 的 200 时，不再像 CONNECT 那样另开一个读端把客户端字节泵进 pipe。明文请求的正文还要按帧切开，多一个读端会把正文读丢。客户端要是在这 10 秒里断开，要等到这次读或写失败才发现，结果记 `l2_response`，不记 `client_gone`。CONNECT 有读泵，同一时刻记的是 `client_gone`。两边故意不一样，见 §7.3。上限仍是拨号 3 秒加上 `l2ResponseTimeout`。
 
-请求头超过 64KiB，或者头没有读完且不是超时，回 400，`reason="bad_target"`。这 64KiB 是 `maxHTTPHead`（`64<<10`，65536 字节）。读头时按行累加，请求行、每一个头行和结尾空行都算，含行尾的 CR/LF。某一行会让累计长度大于 65536 时，这一行不算进已接受的头部，直接 400。正好 65536 字节的完整请求头被接受并转发；65537 字节回 400，`Content-Length: 0`，`Connection: close`。单独一行正好 65536 字节且末尾是换行时，后面已经放不下结尾空行，立刻 400；缓冲被塞满且这一行没有换行（`bufio.ErrBufferFull`）同样立刻 400。这两种都是 `bad_target`，不等 `header_deadline`。请求正文不计入，暂不设上限，见 §5.5。请求行已经是 `CONNECT` 时进 `proxy_client_reject_total`。请求行还不是 `CONNECT`，包括请求行本身没读全、方法还看不出来，进 `proxy_http_client_reject_total{reason="bad_target"}`，不进 CONNECT 的拒绝计数。绝对的请求头截止到点、且已经读到一部分，记 `header_timeout`。一个字节都没有，包括请求头截止和隧道空闲，不计数。
+请求头超过 64KiB，或者头没有读完且不是超时，回 400，`reason="bad_target"`。不用 RFC 6585 的 431，是为了和已经确认的「坏目标一律 400 / `bad_target`」一致。这 64KiB 是 `maxHTTPHead`（`64<<10`，65536 字节）。读头时按行累加，请求行、每一个头行和结尾空行都算，含行尾的 CR/LF。某一行会让累计长度大于 65536 时，这一行不算进已接受的头部，直接 400。正好 65536 字节的完整请求头被接受并转发；65537 字节回 400，`Content-Length: 0`，`Connection: close`。单独一行正好 65536 字节且末尾是换行时，后面已经放不下结尾空行，立刻 400；缓冲被塞满且这一行没有换行（`bufio.ErrBufferFull`）同样立刻 400。这两种都是 `bad_target`，不等 `header_deadline`。请求正文不计入，暂不设上限，见 §5.5。请求行已经是 `CONNECT` 时进 `proxy_client_reject_total`。请求行还不是 `CONNECT`，包括请求行本身没读全、方法还看不出来，进 `proxy_http_client_reject_total{reason="bad_target"}`，不进 CONNECT 的拒绝计数。绝对的请求头截止到点、且已经读到一部分，记 `header_timeout`。一个字节都没有，包括请求头截止和隧道空闲，不计数。
 
 
 ## 6. TLS 指纹透传设计
@@ -2577,6 +2578,8 @@ func scanHeaders(headers [][]byte) (connToks, proxyToks []string, chunked bool, 
 // rewriteHead 把请求行改成 origin-form，删掉逐跳头，其余头行按原字节顺序和大小写保留。
 // 不添加 Via、X-Forwarded-For、Forwarded、User-Agent。
 // Connection 是唯一可能改值的头：只删掉那些指向已被删除头的 token。token 集合没变时整行不动。
+// Host 不在可删除的集合里。Connection 点名 host（大小写不敏感）时保留 Host 行，
+// 因此 host 这个 token 也留在 Connection 里。
 func rewriteHead(method, originForm, version string, headers [][]byte, chunked, upgrade bool, connToks []string) []byte {
 	drop := map[string]bool{
 		"proxy-authorization": true,
@@ -2590,16 +2593,18 @@ func rewriteHead(method, originForm, version string, headers [][]byte, chunked, 
 		// 同时带 Content-Length 和 chunked 时删掉 Content-Length，避免请求走私。
 		drop["content-length"] = true
 	}
+	// Connection 点名的头按名字删除，但 Host 除外（大小写不敏感）。
 	for _, t := range connToks {
 		lt := strings.ToLower(t)
 		switch lt {
-		case "close", "keep-alive", "upgrade", "transfer-encoding":
+		case "close", "keep-alive", "upgrade", "transfer-encoding", "host":
 			continue
 		default:
 			drop[lt] = true
 		}
 	}
 	delete(drop, "transfer-encoding")
+	delete(drop, "host")
 	if upgrade {
 		delete(drop, "upgrade")
 	}
