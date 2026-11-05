@@ -24,10 +24,18 @@ err = reg.Stop(ctx)
 
 完整演示在 [`example/admin`](example/admin)。注册模型、巡检和 L1 发现见 [`docs/openspec-proxy-design.md`](docs/openspec-proxy-design.md) §8。
 
-设计文档 [`docs/openspec-proxy-design.md`](docs/openspec-proxy-design.md) 现为 v0.11。告警范围、明文 HTTP 和计量事件以这一版为准。
+设计文档 [`docs/openspec-proxy-design.md`](docs/openspec-proxy-design.md) 现为 v0.14。告警范围、明文 HTTP 和计量事件以这一版为准。
+
+明文 HTTP 目前只在 `internal/docfixture` 里实现，构建标签是 `docfixture`。生产 L1 还没接上这套数据面。
 
 文档里的代码块与夹具是否一致，跑 `go test -tags docfixture -race ./internal/docfixture/...`。`GOST_REQUIRED=1` 时缺少 gost 即失败。gost 为 v3.3.1，用 `GOST_BIN` 指定，或自动下载并校验 sha256。
 
-CI 在 amd64 和 arm64 上跑带 `-tags docfixture` 的 `go test`，并用 `promtool check rules` 与 `promtool test rules` 检查告警规则。
+CI 在 `push` 和 `pull_request` 上跑。矩阵是 `ubuntu-latest`（amd64）和 `ubuntu-24.04-arm`（arm64），每个 job 的环境变量是 `GOST_REQUIRED=1`。每个 job 依次执行：
 
-`MeterEvent` 的 `client_ip`：含 IP 的原始日志保留 30 天。以后进 ClickHouse 不留原始 IP，或只留 /24。
+1. `go vet ./...`
+2. `go vet -tags docfixture ./...`
+3. `go list ./...` 去掉路径含 `/internal/docfixture` 的包；若还剩包，就对这些包执行 `go test -race`
+4. `go test -tags docfixture -race -count=3 ./internal/docfixture/...`
+5. 下载 Prometheus v2.55.1 里与该架构对应的归档（amd64 或 arm64）并校验 sha256，然后执行 `promtool check rules internal/docfixture/prom/sli_rules.yml` 和 `promtool test rules internal/docfixture/prom/sli_test.yml`
+
+`MeterEvent` 的 `client_ip`：含 IP 的原始日志保留 30 天。以后进 ClickHouse 不留原始 IP，或只留 /24。附录 B 里 Decodo 用量统计写的 180 天是对方产品的用量统计保留期，不是原始 `client_ip` 的保留期。
