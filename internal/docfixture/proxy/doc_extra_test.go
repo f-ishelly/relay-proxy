@@ -49,9 +49,8 @@ func TestDocFencesMatchSources(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantMetrics := append([]byte("//go:build docfixture\n\n"), fences[0]...)
-	if !bytes.Equal(metrics, wantMetrics) {
-		t.Fatalf("l1metrics/metrics.go is not the §7 fence byte-for-byte (%d vs %d)", len(metrics), len(wantMetrics))
+	if !bytes.Equal(metrics, fences[0]) {
+		t.Fatalf("l1metrics/metrics.go is not the §7 fence byte-for-byte (%d vs %d)", len(metrics), len(fences[0]))
 	}
 	matchTail(t, filepath.Join(root, "internal", "docfixture", "proxy", "sec10_gen.go"), []byte("// ErrUnknownNode"), fences[1])
 	matchTail(t, filepath.Join(root, "internal", "docfixture", "proxy", "httpflow.go"), []byte("// maxHTTPHead"), fences[2])

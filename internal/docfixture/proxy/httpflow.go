@@ -1,5 +1,3 @@
-//go:build docfixture
-
 package proxy
 
 import (

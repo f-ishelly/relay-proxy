@@ -24,9 +24,9 @@ err = reg.Stop(ctx)
 
 完整演示在 [`example/admin`](example/admin)。注册模型、巡检和 L1 发现见 [`docs/openspec-proxy-design.md`](docs/openspec-proxy-design.md) §8。
 
-设计文档 [`docs/openspec-proxy-design.md`](docs/openspec-proxy-design.md) 现为 v0.14。告警范围、明文 HTTP 和计量事件以这一版为准。
+设计文档 [`docs/openspec-proxy-design.md`](docs/openspec-proxy-design.md) 现为 v0.15。告警范围、明文 HTTP 和计量事件以这一版为准。
 
-明文 HTTP 目前只在 `internal/docfixture` 里实现，构建标签是 `docfixture`。生产 L1 还没接上这套数据面。
+生产 L1 是 [`cmd/l1`](cmd/l1)。超时和 `retry_put_delete` 只走 `LimitsFromConfig`：`-proxy-config` 的 JSON，以及 `-tunnel-idle`、`-half-close-idle`、`-l2-response-timeout`、`-header-deadline`、`-retry-put-delete`。没写就用文档默认值（5 分钟、30 秒、10 秒、10 秒，PUT/DELETE 不重试）。不合法则进程退出，不监听。示例见 [`configs/l1.example.json`](configs/l1.example.json)。`-listen` 默认 `:8080`，`-metrics` 默认 `127.0.0.1:9090`（`-metrics=` 关掉），`-routes` 是另一份 node 到 L2 地址的 JSON。数据面源码仍在 `internal/docfixture`，与设计文档代码块逐字节相同。带 gost 的测试仍要构建标签 `docfixture`。
 
 文档里的代码块与夹具是否一致，跑 `go test -tags docfixture -race ./internal/docfixture/...`。`GOST_REQUIRED=1` 时缺少 gost 即失败。gost 为 v3.3.1，用 `GOST_BIN` 指定，或自动下载并校验 sha256。
 

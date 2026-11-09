@@ -1,0 +1,7 @@
+{
+  "retry_put_delete": false,
+  "tunnel_idle": "5m",
+  "half_close_idle": "30s",
+  "l2_response_timeout": "10s",
+  "header_deadline": "10s"
+}
