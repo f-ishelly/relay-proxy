@@ -34,9 +34,9 @@ CI 在 `push` 和 `pull_request` 上跑。矩阵是 `ubuntu-latest`（amd64）�
 
 1. `go vet ./...`
 2. `go vet -tags docfixture ./...`
-3. 从 `https://github.com/go-gost/gost/releases/download/v3.3.1/` 下载本架构的 gost v3.3.1 归档。5xx 或超时最多试 5 次，间隔 1s、2s、4s、8s。校验归档和抽出的二进制 sha256，确认 `gost -V` 里有单独的字段 `v3.3.1`，再把路径写进 `GOST_BIN`
+3. 从 `https://github.com/go-gost/gost/releases/download/v3.3.1/` 下载本架构的 gost v3.3.1 归档。跟随重定向，只看最终状态。最终 5xx 或超时最多试 5 次，间隔 1s、2s、4s、8s。校验归档和抽出的二进制 sha256，确认 `gost -V` 里有单独的字段 `v3.3.1`，再把路径写进 `GOST_BIN`
 4. `go list ./...` 去掉路径含 `/internal/docfixture` 的包；若还剩包，就对这些包执行 `go test -race`
 5. `go test -tags docfixture -race -count=3 ./internal/docfixture/...`
-6. 下载 Prometheus v2.55.1 里与该架构对应的归档（amd64 或 arm64）并校验 sha256，然后执行 `promtool check rules internal/docfixture/prom/sli_rules.yml` 和 `promtool test rules internal/docfixture/prom/sli_test.yml`
+6. 下载 Prometheus v2.55.1 里与该架构对应的归档（amd64 或 arm64）。跟随重定向，最终 5xx 或超时最多试 5 次。校验 sha256，然后执行 `promtool check rules internal/docfixture/prom/sli_rules.yml` 和 `promtool test rules internal/docfixture/prom/sli_test.yml`
 
 `MeterEvent` 的 `client_ip`：含 IP 的原始日志保留 30 天。以后进 ClickHouse 不留原始 IP，或只留 /24。附录 B 里 Decodo 用量统计写的 180 天是对方产品的用量统计保留期，不是原始 `client_ip` 的保留期。

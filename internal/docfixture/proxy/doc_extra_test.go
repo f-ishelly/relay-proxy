@@ -869,6 +869,76 @@ func TestGostDownloadRetries504AndTimeout(t *testing.T) {
 	}
 }
 
+func TestGostDownloadFollows302(t *testing.T) {
+	asset, ok := gostAssets[runtime.GOOS+"/"+runtime.GOARCH]
+	if !ok {
+		t.Fatalf("no pinned gost asset for %s/%s", runtime.GOOS, runtime.GOARCH)
+	}
+	oldGet := gostGet
+	oldDelay := gostRetryDelay
+	t.Cleanup(func() {
+		gostGet = oldGet
+		gostRetryDelay = oldDelay
+	})
+	gostRetryDelay = 0
+	dest := filepath.Join(t.TempDir(), "gost")
+	release := gostReleaseBase + asset.archive
+	cdn := "https://cdn.example/gost.tar.gz"
+
+	var calls int
+	gostGet = func(rawURL string) (*http.Response, error) {
+		calls++
+		if rawURL == release {
+			hdr := make(http.Header)
+			hdr.Set("Location", cdn)
+			return &http.Response{
+				Status:     "302 Found",
+				StatusCode: http.StatusFound,
+				Header:     hdr,
+				Body:       io.NopCloser(strings.NewReader("")),
+			}, nil
+		}
+		if rawURL != cdn {
+			t.Errorf("url %s", rawURL)
+		}
+		return &http.Response{
+			Status:     "200 OK",
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader("not-a-gost-archive")),
+		}, nil
+	}
+	err := downloadGost(asset, dest)
+	if err == nil || calls != 2 || !strings.Contains(err.Error(), "archive sha256") || strings.Contains(err.Error(), "302") {
+		t.Fatalf("302 followed: calls %d err %v", calls, err)
+	}
+
+	calls = 0
+	gostGet = func(rawURL string) (*http.Response, error) {
+		calls++
+		if rawURL == release {
+			hdr := make(http.Header)
+			hdr.Set("Location", cdn)
+			return &http.Response{
+				Status:     "302 Found",
+				StatusCode: http.StatusFound,
+				Header:     hdr,
+				Body:       io.NopCloser(strings.NewReader("")),
+			}, nil
+		}
+		return &http.Response{
+			Status:     "504 Gateway Timeout",
+			StatusCode: http.StatusGatewayTimeout,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader("")),
+		}, nil
+	}
+	err = downloadGost(asset, dest)
+	if err == nil || calls != gostDownloadAttempts*2 || !strings.Contains(err.Error(), "504") || strings.Contains(err.Error(), "302") {
+		t.Fatalf("final 504: calls %d err %v", calls, err)
+	}
+}
+
 func TestPrepareGostUsesBinOverride(t *testing.T) {
 	bin := filepath.Join(t.TempDir(), "gost")
 	if err := os.WriteFile(bin, []byte("#!/bin/sh\necho 'gost v3.3.1'\n"), 0o755); err != nil {
