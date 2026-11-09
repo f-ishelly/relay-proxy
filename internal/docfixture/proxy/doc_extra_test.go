@@ -795,6 +795,98 @@ func TestCachedGostRejectsBadHash(t *testing.T) {
 	}
 }
 
+func TestGostDownloadRetries504AndTimeout(t *testing.T) {
+	asset, ok := gostAssets[runtime.GOOS+"/"+runtime.GOARCH]
+	if !ok {
+		t.Fatalf("no pinned gost asset for %s/%s", runtime.GOOS, runtime.GOARCH)
+	}
+	oldGet := gostGet
+	oldDelay := gostRetryDelay
+	t.Cleanup(func() {
+		gostGet = oldGet
+		gostRetryDelay = oldDelay
+	})
+	gostRetryDelay = 0
+	dest := filepath.Join(t.TempDir(), "gost")
+
+	var calls int
+	gostGet = func(url string) (*http.Response, error) {
+		calls++
+		if url != gostReleaseBase+asset.archive {
+			t.Errorf("url %s", url)
+		}
+		if calls <= 2 {
+			return &http.Response{
+				Status:     "504 Gateway Timeout",
+				StatusCode: http.StatusGatewayTimeout,
+				Body:       io.NopCloser(strings.NewReader("")),
+				Header:     make(http.Header),
+			}, nil
+		}
+		return nil, &net.DNSError{Err: "i/o timeout", Name: "github.com", IsTimeout: true}
+	}
+	err := downloadGost(asset, dest)
+	if err == nil || calls != gostDownloadAttempts || !strings.Contains(err.Error(), "timeout") {
+		t.Fatalf("calls %d err %v", calls, err)
+	}
+
+	calls = 0
+	gostGet = func(string) (*http.Response, error) {
+		calls++
+		return &http.Response{
+			Status:     "404 Not Found",
+			StatusCode: http.StatusNotFound,
+			Body:       io.NopCloser(strings.NewReader("")),
+			Header:     make(http.Header),
+		}, nil
+	}
+	err = downloadGost(asset, dest)
+	if err == nil || calls != 1 || !strings.Contains(err.Error(), "404") {
+		t.Fatalf("404 calls %d err %v", calls, err)
+	}
+
+	calls = 0
+	gostGet = func(string) (*http.Response, error) {
+		calls++
+		if calls == 1 {
+			return &http.Response{
+				Status:     "504 Gateway Timeout",
+				StatusCode: http.StatusGatewayTimeout,
+				Body:       io.NopCloser(strings.NewReader("")),
+				Header:     make(http.Header),
+			}, nil
+		}
+		return &http.Response{
+			Status:     "200 OK",
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader("not-a-gost-archive")),
+			Header:     make(http.Header),
+		}, nil
+	}
+	err = downloadGost(asset, dest)
+	if err == nil || calls != 2 || !strings.Contains(err.Error(), "archive sha256") {
+		t.Fatalf("checksum after 504: calls %d err %v", calls, err)
+	}
+}
+
+func TestPrepareGostUsesBinOverride(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "gost")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\necho 'gost v3.3.1'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOST_BIN", bin)
+	oldGet := gostGet
+	gostGet = func(string) (*http.Response, error) {
+		t.Fatal("downloaded despite GOST_BIN")
+		return nil, nil
+	}
+	t.Cleanup(func() { gostGet = oldGet })
+	got, err := prepareGost()
+	if err != nil || got != bin {
+		t.Fatalf("got %s err %v", got, err)
+	}
+}
+
 func TestResolveReasonLabelsConnect(t *testing.T) {
 	cases := []struct {
 		name   string

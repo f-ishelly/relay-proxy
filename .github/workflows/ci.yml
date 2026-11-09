@@ -18,9 +18,15 @@ jobs:
           - os: ubuntu-latest
             prom_archive: prometheus-2.55.1.linux-amd64.tar.gz
             prom_sha: 19700bdd42ec31ee162e4079ebda4cd0a44432df4daa637141bdbea4b1cd8927
+            gost_archive: gost_3.3.1_linux_amd64.tar.gz
+            gost_archive_sha: e0e3a2c9116e2f025e962bba340749f80696bda318613d45e5ae96dd0bcae37c
+            gost_binary_sha: 327720a6dba0e816dbd761f2211140108f579e886bf88075f73da2d5fba5dfc1
           - os: ubuntu-24.04-arm
             prom_archive: prometheus-2.55.1.linux-arm64.tar.gz
             prom_sha: af43368bc6379c3c8bd5ac0b82208060bba22267bf01ad3ab5df56ad5725bf88
+            gost_archive: gost_3.3.1_linux_arm64.tar.gz
+            gost_archive_sha: c58af4a74362a95caa7f580817ad624497d192dfeb60468dc8a4c70c293c6b01
+            gost_binary_sha: 37da362d2870c3f4e83aab848b6dcf4508f44e4334e6f0675e571e926f3c666f
     runs-on: ${{ matrix.os }}
     env:
       GOST_REQUIRED: "1"
@@ -33,6 +39,52 @@ jobs:
         run: |
           go vet ./...
           go vet -tags docfixture ./...
+      - name: gost
+        run: |
+          set -euo pipefail
+          # Same v3.3.1 asset URL and hashes as downloadGost in internal/docfixture/proxy.
+          url="https://github.com/go-gost/gost/releases/download/v3.3.1/${{ matrix.gost_archive }}"
+          tmp="$(mktemp)"
+          ok=0
+          for attempt in 1 2 3 4 5; do
+            # 5xx and curl failures (timeout, dropped connection) retry.
+            # Any other HTTP status stops. Same v3.3.1 URL as the test helper.
+            if code="$(curl -sS -o "$tmp" -w '%{http_code}' --max-time 120 "$url")"; then
+              if [ "$code" = "200" ]; then
+                ok=1
+                break
+              fi
+              case "$code" in
+                5*) ;;
+                *)
+                  echo "gost v3.3.1 download returned $code; set GOST_BIN to a gost v3.3.1 binary" >&2
+                  exit 1
+                  ;;
+              esac
+            fi
+            if [ "$attempt" -lt 5 ]; then
+              sleep $((2 ** (attempt - 1)))
+            fi
+          done
+          if [ "$ok" -ne 1 ]; then
+            echo "gost v3.3.1 download failed after 5 attempts; set GOST_BIN to a gost v3.3.1 binary" >&2
+            exit 1
+          fi
+          echo "${{ matrix.gost_archive_sha }}  $tmp" | sha256sum -c -
+          dir="${RUNNER_TEMP}/gost-v3.3.1"
+          rm -rf "$dir"
+          mkdir -p "$dir"
+          tar -C "$dir" -xzf "$tmp"
+          bin="$(find "$dir" -type f -name gost -print -quit)"
+          if [ -z "$bin" ]; then
+            echo "gost v3.3.1 archive had no gost binary" >&2
+            exit 1
+          fi
+          chmod +x "$bin"
+          echo "${{ matrix.gost_binary_sha }}  $bin" | sha256sum -c -
+          out="$("$bin" -V 2>&1)"
+          printf '%s\n' "$out" | tr -s '[:space:]' '\n' | grep -qx 'v3.3.1'
+          echo "GOST_BIN=$bin" >> "$GITHUB_ENV"
       - name: race tests
         run: |
           pkgs=$(go list ./... | grep -v '/internal/docfixture' || true)

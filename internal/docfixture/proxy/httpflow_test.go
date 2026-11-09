@@ -40,8 +40,22 @@ var (
 	gostBin       string
 	gostSkip      string
 	gostCacheRoot string
-	gostGet       = http.Get
+	gostGet       = defaultGostGet
 )
+
+// 发行包只有这一处。CI 用同一个 v3.3.1 URL，不要换版本。
+const (
+	gostReleaseBase      = "https://github.com/go-gost/gost/releases/download/v3.3.1/"
+	gostDownloadAttempts = 5
+	gostDownloadTimeout  = 2 * time.Minute
+)
+
+// gostRetryDelay 是第一次失败后的等待。之后每次翻倍。测试把它设成 0。
+var gostRetryDelay = time.Second
+
+func defaultGostGet(url string) (*http.Response, error) {
+	return (&http.Client{Timeout: gostDownloadTimeout}).Get(url)
+}
 
 func TestMain(m *testing.M) {
 	go consumeMeters()
@@ -214,18 +228,62 @@ func gostVersionToken(text, ver string) bool {
 	return false
 }
 
+// retryableGostError 是 5xx 或超时。校验和不对、4xx 不包这一层，不重试。
+type retryableGostError struct{ err error }
+
+func (e *retryableGostError) Error() string { return e.err.Error() }
+func (e *retryableGostError) Unwrap() error { return e.err }
+
+func gostTimeout(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
+}
+
+func gostBackoff(attempt int) time.Duration {
+	d := gostRetryDelay
+	for i := 1; i < attempt; i++ {
+		d *= 2
+	}
+	return d
+}
+
 func downloadGost(asset gostAsset, dest string) error {
+	var last error
+	for attempt := 1; attempt <= gostDownloadAttempts; attempt++ {
+		err := downloadGostOnce(asset, dest)
+		if err == nil {
+			return nil
+		}
+		last = err
+		var retry *retryableGostError
+		if !errors.As(err, &retry) || attempt == gostDownloadAttempts {
+			return err
+		}
+		time.Sleep(gostBackoff(attempt))
+	}
+	return last
+}
+
+func downloadGostOnce(asset gostAsset, dest string) error {
 	dir := filepath.Dir(dest)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	resp, err := gostGet("https://github.com/go-gost/gost/releases/download/v3.3.1/" + asset.archive)
+	resp, err := gostGet(gostReleaseBase + asset.archive)
 	if err != nil {
-		return fmt.Errorf("gost v3.3.1 download failed: %v; set GOST_BIN to a gost v3.3.1 binary", err)
+		msg := fmt.Errorf("gost v3.3.1 download failed: %v; set GOST_BIN to a gost v3.3.1 binary", err)
+		if gostTimeout(err) {
+			return &retryableGostError{err: msg}
+		}
+		return msg
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("gost v3.3.1 download returned %s; set GOST_BIN to a gost v3.3.1 binary", resp.Status)
+		msg := fmt.Errorf("gost v3.3.1 download returned %s; set GOST_BIN to a gost v3.3.1 binary", resp.Status)
+		if resp.StatusCode >= 500 && resp.StatusCode <= 599 {
+			return &retryableGostError{err: msg}
+		}
+		return msg
 	}
 	arc, err := os.CreateTemp(dir, ".gost-archive-*")
 	if err != nil {
@@ -236,6 +294,10 @@ func downloadGost(asset gostAsset, dest string) error {
 	ah := sha256.New()
 	if _, err := io.Copy(io.MultiWriter(arc, ah), resp.Body); err != nil {
 		arc.Close()
+		msg := fmt.Errorf("gost v3.3.1 download failed: %v; set GOST_BIN to a gost v3.3.1 binary", err)
+		if gostTimeout(err) {
+			return &retryableGostError{err: msg}
+		}
 		return fmt.Errorf("gost v3.3.1 download: %w", err)
 	}
 	if err := arc.Sync(); err != nil {
