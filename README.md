@@ -24,9 +24,9 @@ err = reg.Stop(ctx)
 
 完整演示在 [`example/admin`](example/admin)。注册模型、巡检和 L1 发现见 [`docs/openspec-proxy-design.md`](docs/openspec-proxy-design.md) §8。
 
-设计文档 [`docs/openspec-proxy-design.md`](docs/openspec-proxy-design.md) 现为 v0.14。告警范围、明文 HTTP 和计量事件以这一版为准。
+设计文档 [`docs/openspec-proxy-design.md`](docs/openspec-proxy-design.md) 现为 v0.15。告警范围、明文 HTTP 和计量事件以这一版为准。
 
-明文 HTTP 目前只在 `internal/docfixture` 里实现，构建标签是 `docfixture`。生产 L1 还没接上这套数据面。
+生产 L1 是 [`cmd/l1`](cmd/l1)。超时和 `retry_put_delete` 只走 `LimitsFromConfig`：`-proxy-config` 的 JSON，以及 `-tunnel-idle`、`-half-close-idle`、`-l2-response-timeout`、`-header-deadline`、`-retry-put-delete`。没写就用文档默认值（5 分钟、30 秒、10 秒、10 秒，PUT/DELETE 不重试）。不合法则进程退出，不监听。示例见 [`configs/l1.example.json`](configs/l1.example.json)。`-listen` 默认 `:8080`，`-metrics` 默认 `127.0.0.1:9090`（`-metrics=` 关掉），`-routes` 是另一份 node 到 L2 地址的 JSON。数据面源码仍在 `internal/docfixture`，与设计文档代码块逐字节相同。带 gost 的测试仍要构建标签 `docfixture`。
 
 文档里的代码块与夹具是否一致，跑 `go test -tags docfixture -race ./internal/docfixture/...`。`GOST_REQUIRED=1` 时缺少 gost 即失败。gost 为 v3.3.1，用 `GOST_BIN` 指定，或自动下载并校验 sha256。
 
@@ -34,8 +34,9 @@ CI 在 `push` 和 `pull_request` 上跑。矩阵是 `ubuntu-latest`（amd64）�
 
 1. `go vet ./...`
 2. `go vet -tags docfixture ./...`
-3. `go list ./...` 去掉路径含 `/internal/docfixture` 的包；若还剩包，就对这些包执行 `go test -race`
-4. `go test -tags docfixture -race -count=3 ./internal/docfixture/...`
-5. 下载 Prometheus v2.55.1 里与该架构对应的归档（amd64 或 arm64）并校验 sha256，然后执行 `promtool check rules internal/docfixture/prom/sli_rules.yml` 和 `promtool test rules internal/docfixture/prom/sli_test.yml`
+3. 从 `https://github.com/go-gost/gost/releases/download/v3.3.1/` 下载本架构的 gost v3.3.1 归档。跟随重定向，只看最终状态。最终 5xx 或超时最多试 5 次，间隔 1s、2s、4s、8s。校验归档和抽出的二进制 sha256，确认 `gost -V` 里有单独的字段 `v3.3.1`，再把路径写进 `GOST_BIN`
+4. `go list ./...` 去掉路径含 `/internal/docfixture` 的包；若还剩包，就对这些包执行 `go test -race`
+5. `go test -tags docfixture -race -count=3 ./internal/docfixture/...`
+6. 下载 Prometheus v2.55.1 里与该架构对应的归档（amd64 或 arm64）。跟随重定向，最终 5xx 或超时最多试 5 次。校验 sha256，然后执行 `promtool check rules internal/docfixture/prom/sli_rules.yml` 和 `promtool test rules internal/docfixture/prom/sli_test.yml`
 
 `MeterEvent` 的 `client_ip`：含 IP 的原始日志保留 30 天。以后进 ClickHouse 不留原始 IP，或只留 /24。附录 B 里 Decodo 用量统计写的 180 天是对方产品的用量统计保留期，不是原始 `client_ip` 的保留期。
